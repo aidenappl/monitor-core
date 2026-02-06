@@ -120,6 +120,100 @@ Each event must be a JSON object on its own line with these fields:
 | `level`      | string           | No       | Log level (info, warn, error, debug)          |
 | `data`       | object           | No       | Additional event data                         |
 
+### Query Events
+
+Query events with filters (Grafana-style):
+
+```bash
+curl "http://localhost:8080/v1/events?service=users&level=error&limit=50" \
+  -H "X-Api-Key: your-secret-key"
+```
+
+**Query Parameters:**
+
+| Parameter    | Description                                    |
+| ------------ | ---------------------------------------------- |
+| `service`    | Filter by service name                         |
+| `env`        | Filter by environment                          |
+| `job_id`     | Filter by job ID                               |
+| `request_id` | Filter by request ID                           |
+| `trace_id`   | Filter by trace ID                             |
+| `name`       | Filter by event name                           |
+| `level`      | Filter by log level                            |
+| `from`       | Start time (RFC3339 or Unix timestamp)         |
+| `to`         | End time (RFC3339 or Unix timestamp)           |
+| `data.<key>` | Filter by data field (e.g., `data.user_id=42`) |
+| `limit`      | Results per page (default: 100, max: 1000)     |
+| `offset`     | Pagination offset                              |
+
+Response:
+
+```json
+{
+  "success": true,
+  "message": "request was successful",
+  "pagination": { "count": 150, "next": "/v1/events?offset=100&limit=100", "previous": "" },
+  "data": [{ "timestamp": "...", "service": "users", ... }]
+}
+```
+
+### Label Autocomplete
+
+Get distinct values for a label (service, env, name, level):
+
+```bash
+curl "http://localhost:8080/v1/labels/service/values" \
+  -H "X-Api-Key: your-secret-key"
+```
+
+Response:
+
+```json
+{
+  "success": true,
+  "message": "request was successful",
+  "data": ["users", "orders", "payments"]
+}
+```
+
+### Data Keys Autocomplete
+
+Get available keys from the `data` JSON column:
+
+```bash
+curl "http://localhost:8080/v1/data/keys?service=users" \
+  -H "X-Api-Key: your-secret-key"
+```
+
+Response:
+
+```json
+{
+  "success": true,
+  "message": "request was successful",
+  "data": ["client_ip", "host", "method", "path", "user_agent"]
+}
+```
+
+### Data Values Autocomplete
+
+Get values for a specific data key:
+
+```bash
+curl "http://localhost:8080/v1/data/values?key=method&service=users" \
+  -H "X-Api-Key: your-secret-key"
+```
+
+Response:
+
+```json
+{
+  "success": true,
+  "message": "request was successful",
+  "data": ["GET", "POST", "PUT", "DELETE"]
+}
+```
+
 ## Configuration
 
 | Environment Variable  | Default          | Description                                   |
@@ -167,11 +261,15 @@ monitor-core/
     env.go                    # Environment configuration
   middleware/
     auth.go                   # API key authentication middleware
+  responder/
+    responder.go              # Standardized JSON response utilities
   routes/
     events.go                 # Event ingestion handler
+    query.go                  # Event query and autocomplete handlers
   services/
     queue.go                  # Buffered event queue
     batcher.go                # Batch collection and flushing
+    query.go                  # Query building and execution
   structs/
     event.go                  # Event struct and validation
   migrations/

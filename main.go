@@ -57,6 +57,10 @@ func main() {
 	v1.Use(middleware.AuthMiddleware)
 
 	v1.HandleFunc("/events", routes.IngestEventsHandler).Methods(http.MethodPost)
+	v1.HandleFunc("/events", routes.QueryEventsHandler).Methods(http.MethodGet)
+	v1.HandleFunc("/labels/{label}/values", routes.GetLabelValuesHandler).Methods(http.MethodGet)
+	v1.HandleFunc("/data/keys", routes.GetDataKeysHandler).Methods(http.MethodGet)
+	v1.HandleFunc("/data/values", routes.GetDataValuesHandler).Methods(http.MethodGet)
 
 	// Launch Server
 	fmt.Printf("✅ monitor-core running on port %s\n", env.Port)
