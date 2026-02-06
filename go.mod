@@ -5,6 +5,7 @@ go 1.25.5
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.43.0
 	github.com/gorilla/mux v1.8.1
+	github.com/rs/cors v1.11.1
 )
 
 require (

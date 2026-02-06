@@ -16,6 +16,7 @@ import (
 	"github.com/aidenappl/monitor-core/routes"
 	"github.com/aidenappl/monitor-core/services"
 	"github.com/gorilla/mux"
+	"github.com/rs/cors"
 )
 
 func main() {
@@ -62,13 +63,21 @@ func main() {
 	v1.HandleFunc("/data/keys", routes.GetDataKeysHandler).Methods(http.MethodGet)
 	v1.HandleFunc("/data/values", routes.GetDataValuesHandler).Methods(http.MethodGet)
 
+	// CORS Middleware
+	corsMiddleware := cors.New(cors.Options{
+		AllowedOrigins:   []string{"*"},
+		AllowCredentials: true,
+		AllowedHeaders:   []string{"X-Requested-With", "Content-Type", "Origin", "Authorization", "Accept", "X-Api-Key"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+	})
+
 	// Launch Server
 	fmt.Printf("✅ monitor-core running on port %s\n", env.Port)
 	fmt.Println()
 
 	server := &http.Server{
 		Addr:         ":" + env.Port,
-		Handler:      r,
+		Handler:      corsMiddleware.Handler(r),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
