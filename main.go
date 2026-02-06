@@ -1,7 +1,96 @@
 package main
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/aidenappl/monitor-ingest/db"
+	"github.com/aidenappl/monitor-ingest/env"
+	"github.com/aidenappl/monitor-ingest/middleware"
+	"github.com/aidenappl/monitor-ingest/routes"
+	"github.com/aidenappl/monitor-ingest/services"
+	"github.com/gorilla/mux"
+)
 
 func main() {
-	fmt.Println("hello!")
+	// Validate configuration
+	if env.APIKey == "" {
+		log.Println("WARNING: API_KEY is not set, authentication is disabled")
+	}
+
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle shutdown signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Connect to ClickHouse
+	if err := db.Connect(ctx, env.ClickHouseAddr, env.ClickHouseDatabase, env.ClickHouseUsername, env.ClickHousePassword); err != nil {
+		log.Fatalf("❌ failed to connect to ClickHouse: %v", err)
+	}
+	defer db.Close()
+
+	// Create event queue
+	queue := services.NewQueue(env.QueueSize)
+	routes.Queue = queue
+
+	// Create and start batcher
+	writer := &db.Writer{}
+	batcher := services.NewBatcher(queue, writer, env.BatchSize, env.FlushInterval)
+	go batcher.Run(ctx)
+
+	// Setup router
+	r := mux.NewRouter()
+
+	r.HandleFunc("/health", routes.HealthHandler).Methods(http.MethodGet)
+
+	// V1 API routes (with auth middleware)
+	v1 := r.PathPrefix("/v1").Subrouter()
+	v1.Use(middleware.AuthMiddleware)
+
+	v1.HandleFunc("/events", routes.IngestEventsHandler).Methods(http.MethodPost)
+
+	// Launch Server
+	fmt.Printf("✅ monitor-ingest running on port %s\n", env.Port)
+	fmt.Println()
+
+	server := &http.Server{
+		Addr:         ":" + env.Port,
+		Handler:      r,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+
+	// Wait for shutdown signal
+	<-sigChan
+	log.Println("shutting down...")
+
+	// Graceful shutdown
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP server shutdown error: %v", err)
+	}
+
+	cancel()
+	queue.Close()
+	time.Sleep(2 * time.Second)
+
+	log.Println("shutdown complete")
 }
