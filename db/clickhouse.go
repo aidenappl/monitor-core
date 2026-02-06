@@ -58,10 +58,12 @@ func WriteBatch(ctx context.Context, events []*structs.Event) error {
 		INSERT INTO %s.events (
 			timestamp,
 			service,
+			env,
 			job_id,
 			request_id,
 			trace_id,
 			name,
+			level,
 			data
 		)
 	`, Database))
@@ -73,10 +75,12 @@ func WriteBatch(ctx context.Context, events []*structs.Event) error {
 		err := batch.Append(
 			event.Timestamp,
 			event.Service,
+			event.Env,
 			event.JobID,
 			event.RequestID,
 			event.TraceID,
 			event.Name,
+			event.Level,
 			event.DataJSON(),
 		)
 		if err != nil {

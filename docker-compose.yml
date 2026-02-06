@@ -1,0 +1,77 @@
+version: "3.8"
+
+services:
+  monitor-ingest:
+    image: registry.appleby.cloud/monitor-ingest:latest
+    container_name: monitor-ingest
+    ports:
+      - "8030:8080"
+    environment:
+      HTTP_PORT: "8080"
+      CLICKHOUSE_ADDR: "clickhouse:9000"
+      CLICKHOUSE_DATABASE: "monitor"
+      CLICKHOUSE_USERNAME: ${CLICKHOUSE_USERNAME:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      API_KEY: ${MONITOR_API_KEY}
+      BATCH_SIZE: ${BATCH_SIZE:-1000}
+      FLUSH_INTERVAL: ${FLUSH_INTERVAL:-5s}
+      QUEUE_SIZE: ${QUEUE_SIZE:-100000}
+    restart: unless-stopped
+    networks:
+      - monitor-network
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "curl -f http://localhost:8080/health || exit 1"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    labels:
+      - "com.docker.compose.project=monitor-ingest"
+      - "traefik.enable=false"
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: monitor-clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9000:9000"   # Native protocol
+    environment:
+      CLICKHOUSE_DB: monitor
+      CLICKHOUSE_USER: ${CLICKHOUSE_USERNAME:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    restart: unless-stopped
+    networks:
+      - monitor-network
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    labels:
+      - "com.docker.compose.project=monitor-ingest"
+      - "traefik.enable=false"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+networks:
+  monitor-network:
+    driver: bridge
+
+volumes:
+  clickhouse-data:
+  clickhouse-logs:

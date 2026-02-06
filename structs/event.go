@@ -10,10 +10,12 @@ import (
 type Event struct {
 	Timestamp time.Time              `json:"timestamp"`
 	Service   string                 `json:"service"`
+	Env       string                 `json:"env"`
 	JobID     string                 `json:"job_id"`
 	RequestID string                 `json:"request_id"`
 	TraceID   string                 `json:"trace_id"`
 	Name      string                 `json:"name"`
+	Level     string                 `json:"level"`
 	Data      map[string]interface{} `json:"data"`
 }
 
