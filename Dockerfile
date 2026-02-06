@@ -21,7 +21,7 @@ COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -ldflags="-w -s" -o /app/monitor-ingest .
+    go build -ldflags="-w -s" -o /app/monitor-core .
 
 # ---- Runtime Stage ----
 FROM alpine:3.19 AS runner
@@ -34,7 +34,7 @@ RUN apk add --no-cache ca-certificates curl && rm -rf /var/cache/apk/*
 RUN addgroup -g 1001 -S appgroup && adduser -S appuser -u 1001 -G appgroup
 
 # Copy binary from builder
-COPY --from=builder /app/monitor-ingest /app/monitor-ingest
+COPY --from=builder /app/monitor-core /app/monitor-core
 
 # Copy migrations (optional, for running schema setup)
 COPY --from=builder /app/migrations /app/migrations
@@ -49,4 +49,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
-CMD ["/app/monitor-ingest"]
+CMD ["/app/monitor-core"]

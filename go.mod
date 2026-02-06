@@ -1,4 +1,4 @@
-module github.com/aidenappl/monitor-ingest
+module github.com/aidenappl/monitor-core
 
 go 1.25.5
 

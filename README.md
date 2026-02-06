@@ -1,4 +1,4 @@
-# monitor-ingest
+# monitor-core
 
 A high-performance event ingestion service that receives monitoring events via HTTP and writes them to ClickHouse in batches.
 
@@ -7,7 +7,7 @@ A high-performance event ingestion service that receives monitoring events via H
 ```
 go services
   ↓ (batched NDJSON over HTTP)
-monitor-ingest
+monitor-core
   ↓ (batched inserts)
 ClickHouse
 ```
@@ -54,8 +54,8 @@ go run .
 Or build and run:
 
 ```bash
-go build -o bin/monitor-ingest .
-./bin/monitor-ingest
+go build -o bin/monitor-core .
+./bin/monitor-core
 ```
 
 ### Docker
@@ -140,7 +140,7 @@ Each event must be a JSON object on its own line with these fields:
 ## Project Structure
 
 ```
-monitor-ingest/
+monitor-core/
   main.go                     # Entry point with routes
   Dockerfile                  # Multi-stage production build
   docker-compose.yml          # Production stack

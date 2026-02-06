@@ -8,7 +8,7 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
-	"github.com/aidenappl/monitor-ingest/structs"
+	"github.com/aidenappl/monitor-core/structs"
 )
 
 // Conn is the global ClickHouse connection

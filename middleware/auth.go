@@ -3,7 +3,7 @@ package middleware
 import (
 	"net/http"
 
-	"github.com/aidenappl/monitor-ingest/env"
+	"github.com/aidenappl/monitor-core/env"
 )
 
 // AuthMiddleware checks the X-Api-Key header

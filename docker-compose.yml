@@ -1,9 +1,9 @@
 version: "3.8"
 
 services:
-  monitor-ingest:
-    image: registry.appleby.cloud/monitor-ingest:latest
-    container_name: monitor-ingest
+  monitor-core:
+    image: registry.appleby.cloud/monitor-core:latest
+    container_name: monitor-core
     ports:
       - "8030:8080"
     environment:
@@ -31,7 +31,7 @@ services:
       clickhouse:
         condition: service_healthy
     labels:
-      - "com.docker.compose.project=monitor-ingest"
+      - "com.docker.compose.project=monitor-core"
       - "traefik.enable=false"
 
   clickhouse:
@@ -61,7 +61,7 @@ services:
       retries: 5
       start_period: 30s
     labels:
-      - "com.docker.compose.project=monitor-ingest"
+      - "com.docker.compose.project=monitor-core"
       - "traefik.enable=false"
     ulimits:
       nofile:

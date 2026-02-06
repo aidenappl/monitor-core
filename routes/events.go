@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/aidenappl/monitor-ingest/services"
-	"github.com/aidenappl/monitor-ingest/structs"
+	"github.com/aidenappl/monitor-core/services"
+	"github.com/aidenappl/monitor-core/structs"
 )
 
 // MaxRequestBodySize limits request body to 10MB

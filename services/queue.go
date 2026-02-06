@@ -4,7 +4,7 @@ import (
 	"log"
 	"sync/atomic"
 
-	"github.com/aidenappl/monitor-ingest/structs"
+	"github.com/aidenappl/monitor-core/structs"
 )
 
 // Queue is a buffered channel for events

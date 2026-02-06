@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/aidenappl/monitor-ingest/structs"
+	"github.com/aidenappl/monitor-core/structs"
 )
 
 // Writer is the interface for writing event batches

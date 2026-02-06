@@ -10,11 +10,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aidenappl/monitor-ingest/db"
-	"github.com/aidenappl/monitor-ingest/env"
-	"github.com/aidenappl/monitor-ingest/middleware"
-	"github.com/aidenappl/monitor-ingest/routes"
-	"github.com/aidenappl/monitor-ingest/services"
+	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/env"
+	"github.com/aidenappl/monitor-core/middleware"
+	"github.com/aidenappl/monitor-core/routes"
+	"github.com/aidenappl/monitor-core/services"
 	"github.com/gorilla/mux"
 )
 
@@ -59,7 +59,7 @@ func main() {
 	v1.HandleFunc("/events", routes.IngestEventsHandler).Methods(http.MethodPost)
 
 	// Launch Server
-	fmt.Printf("✅ monitor-ingest running on port %s\n", env.Port)
+	fmt.Printf("✅ monitor-core running on port %s\n", env.Port)
 	fmt.Println()
 
 	server := &http.Server{
