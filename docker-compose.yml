@@ -55,10 +55,10 @@ services:
     healthcheck:
       test:
         - "CMD-SHELL"
-        - "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"
-      interval: 30s
-      timeout: 10s
-      retries: 3
+        - "clickhouse-client --query 'SELECT 1' || exit 1"
+      interval: 10s
+      timeout: 5s
+      retries: 5
       start_period: 30s
     labels:
       - "com.docker.compose.project=monitor-ingest"
