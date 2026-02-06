@@ -174,7 +174,7 @@ func QueryEvents(ctx context.Context, params QueryParams) (*QueryResult, error) 
 	}
 
 	// Data query
-	queryBuilder := sq.Select("timestamp", "service", "env", "job_id", "request_id", "trace_id", "name", "level", "data").
+	queryBuilder := sq.Select("timestamp", "service", "env", "job_id", "request_id", "trace_id", "user_id", "name", "level", "data").
 		From(eventsTable()).
 		OrderBy("timestamp DESC").
 		Limit(uint64(params.Limit)).
@@ -197,7 +197,7 @@ func QueryEvents(ctx context.Context, params QueryParams) (*QueryResult, error) 
 	for rows.Next() {
 		var e structs.Event
 		var dataStr string
-		if err := rows.Scan(&e.Timestamp, &e.Service, &e.Env, &e.JobID, &e.RequestID, &e.TraceID, &e.Name, &e.Level, &dataStr); err != nil {
+		if err := rows.Scan(&e.Timestamp, &e.Service, &e.Env, &e.JobID, &e.RequestID, &e.TraceID, &e.UserID, &e.Name, &e.Level, &dataStr); err != nil {
 			return nil, fmt.Errorf("scan failed: %w", err)
 		}
 		if dataStr != "" && dataStr != "{}" {
