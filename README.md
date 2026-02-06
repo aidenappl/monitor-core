@@ -23,32 +23,42 @@ ClickHouse
 
 ## Quick Start
 
-### 1. Set up ClickHouse
+### 1. Start local ClickHouse
 
-Run the migration to create the database and table:
+```bash
+dev up
+```
+
+Or manually:
+
+```bash
+docker-compose -f docker-compose.dev.yml up -d
+```
+
+### 2. Run schema migrations
+
+```bash
+dev migrate
+```
+
+Or manually:
 
 ```bash
 clickhouse-client < migrations/001_schema.sql
 ```
 
-### 2. Configure environment
+### 3. Configure environment (optional)
 
 ```bash
-export CLICKHOUSE_ADDR="localhost:9000"
-export CLICKHOUSE_DATABASE="monitor"
-export CLICKHOUSE_USERNAME="default"
-export CLICKHOUSE_PASSWORD=""
 export API_KEY="your-secret-key"
-export HTTP_PORT="8080"
-export BATCH_SIZE="1000"
-export FLUSH_INTERVAL="5s"
-export QUEUE_SIZE="100000"
 ```
 
-### 3. Run the service
+All other defaults work with `dev up`.
+
+### 4. Run the service
 
 ```bash
-go run .
+dev run
 ```
 
 Or build and run:
@@ -58,15 +68,7 @@ go build -o bin/monitor-core .
 ./bin/monitor-core
 ```
 
-### Docker
-
-Local development with ClickHouse:
-
-```bash
-docker-compose -f docker-compose.dev.yml up -d
-```
-
-Production deployment:
+### Docker (Production)
 
 ```bash
 docker-compose up -d
@@ -135,13 +137,27 @@ Each event must be a JSON object on its own line with these fields:
 ## Limits
 
 - **Request body size**: 10 MB maximum
-- **ClickHouse connection retry**: 10 attempts with exponential backoff (1s to 5min)
+- **ClickHouse connection retry**: 10 attempts with linear backoff (1s, 2s, ... 10s)
+
+## Development
+
+Use the `dev` CLI for common tasks:
+
+```bash
+dev help                  # List available commands
+dev up                    # Start local ClickHouse
+dev migrate               # Run schema migrations
+dev run                   # Run the application
+dev check                 # Format, vet, and test
+dev down                  # Stop local ClickHouse
+```
 
 ## Project Structure
 
 ```
 monitor-core/
   main.go                     # Entry point with routes
+  Devfile.yaml                # Dev CLI commands
   Dockerfile                  # Multi-stage production build
   docker-compose.yml          # Production stack
   docker-compose.dev.yml      # Local development with ClickHouse
