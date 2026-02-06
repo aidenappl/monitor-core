@@ -123,7 +123,7 @@ func applyColumnFilter(builder sq.SelectBuilder, f Filter) sq.SelectBuilder {
 
 func applyDataFilter(builder sq.SelectBuilder, f Filter) sq.SelectBuilder {
 	extractStr := fmt.Sprintf("JSONExtractString(data, '%s')", f.Field)
-	extractNum := fmt.Sprintf("JSONExtractFloat64(data, '%s')", f.Field)
+	extractNum := fmt.Sprintf("toFloat64OrNull(JSONExtractRaw(data, '%s'))", f.Field)
 
 	switch f.Operator {
 	case OpEq, "":
@@ -326,19 +326,19 @@ func GetDataValues(ctx context.Context, key string, params QueryParams) (*LabelV
 
 	builder := sq.Select("DISTINCT JSONExtractString(data, ?) AS value").
 		From(eventsTable()).
+		Where("JSONExtractString(data, ?) != ''").
 		OrderBy("value").
 		Limit(1000).
 		PlaceholderFormat(sq.Question)
 	builder = applyFilters(builder, params)
-	builder = builder.Suffix("HAVING value != ''")
 
 	querySQL, queryArgs, err := builder.ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build query: %w", err)
 	}
 
-	// Prepend the key argument for JSONExtractString
-	queryArgs = append([]interface{}{key}, queryArgs...)
+	// Prepend the key arguments for JSONExtractString (SELECT and WHERE)
+	queryArgs = append([]interface{}{key, key}, queryArgs...)
 
 	rows, err := db.Conn.Query(ctx, querySQL, queryArgs...)
 	if err != nil {
