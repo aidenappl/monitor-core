@@ -50,6 +50,8 @@ func main() {
 
 	// Setup router
 	r := mux.NewRouter()
+	r.Use(middleware.RequestIDMiddleware)
+	r.Use(middleware.LoggingMiddleware)
 
 	r.HandleFunc("/health", routes.HealthHandler).Methods(http.MethodGet)
 
