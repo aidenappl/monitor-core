@@ -33,10 +33,11 @@ var validGroupByColumns = map[string]bool{
 }
 
 // buildAggregationExpr builds the SQL aggregation expression
+// All expressions are wrapped in toFloat64() for consistent Go scanning
 func buildAggregationExpr(agg structs.AggregationType, field string) (string, error) {
 	switch agg {
 	case structs.AggCount:
-		return "count()", nil
+		return "toFloat64(count())", nil
 	case structs.AggCountUnique:
 		if field == "" {
 			return "", fmt.Errorf("field is required for count_unique aggregation")
@@ -45,7 +46,7 @@ func buildAggregationExpr(agg structs.AggregationType, field string) (string, er
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("uniq(%s)", col), nil
+		return fmt.Sprintf("toFloat64(uniq(%s))", col), nil
 	case structs.AggSum:
 		if field == "" {
 			return "", fmt.Errorf("field is required for sum aggregation")
@@ -54,7 +55,7 @@ func buildAggregationExpr(agg structs.AggregationType, field string) (string, er
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("sum(%s)", col), nil
+		return fmt.Sprintf("toFloat64(sum(%s))", col), nil
 	case structs.AggAvg:
 		if field == "" {
 			return "", fmt.Errorf("field is required for avg aggregation")
@@ -63,7 +64,7 @@ func buildAggregationExpr(agg structs.AggregationType, field string) (string, er
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("avg(%s)", col), nil
+		return fmt.Sprintf("toFloat64(avg(%s))", col), nil
 	case structs.AggMin:
 		if field == "" {
 			return "", fmt.Errorf("field is required for min aggregation")
@@ -72,7 +73,7 @@ func buildAggregationExpr(agg structs.AggregationType, field string) (string, er
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("min(%s)", col), nil
+		return fmt.Sprintf("toFloat64(min(%s))", col), nil
 	case structs.AggMax:
 		if field == "" {
 			return "", fmt.Errorf("field is required for max aggregation")
@@ -81,7 +82,7 @@ func buildAggregationExpr(agg structs.AggregationType, field string) (string, er
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("max(%s)", col), nil
+		return fmt.Sprintf("toFloat64(max(%s))", col), nil
 	case structs.AggP50:
 		if field == "" {
 			return "", fmt.Errorf("field is required for p50 aggregation")
@@ -90,7 +91,7 @@ func buildAggregationExpr(agg structs.AggregationType, field string) (string, er
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("quantile(0.5)(%s)", col), nil
+		return fmt.Sprintf("toFloat64(quantile(0.5)(%s))", col), nil
 	case structs.AggP90:
 		if field == "" {
 			return "", fmt.Errorf("field is required for p90 aggregation")
@@ -99,7 +100,7 @@ func buildAggregationExpr(agg structs.AggregationType, field string) (string, er
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("quantile(0.9)(%s)", col), nil
+		return fmt.Sprintf("toFloat64(quantile(0.9)(%s))", col), nil
 	case structs.AggP95:
 		if field == "" {
 			return "", fmt.Errorf("field is required for p95 aggregation")
@@ -108,7 +109,7 @@ func buildAggregationExpr(agg structs.AggregationType, field string) (string, er
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("quantile(0.95)(%s)", col), nil
+		return fmt.Sprintf("toFloat64(quantile(0.95)(%s))", col), nil
 	case structs.AggP99:
 		if field == "" {
 			return "", fmt.Errorf("field is required for p99 aggregation")
@@ -117,7 +118,7 @@ func buildAggregationExpr(agg structs.AggregationType, field string) (string, er
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("quantile(0.99)(%s)", col), nil
+		return fmt.Sprintf("toFloat64(quantile(0.99)(%s))", col), nil
 	default:
 		return "", fmt.Errorf("unsupported aggregation type: %s", agg)
 	}
