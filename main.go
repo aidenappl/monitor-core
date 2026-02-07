@@ -52,6 +52,7 @@ func main() {
 	r := mux.NewRouter()
 	r.Use(middleware.RequestIDMiddleware)
 	r.Use(middleware.LoggingMiddleware)
+	r.Use(middleware.MuxHeaderMiddleware)
 
 	r.HandleFunc("/health", routes.HealthHandler).Methods(http.MethodGet)
 
@@ -65,11 +66,20 @@ func main() {
 	v1.HandleFunc("/data/keys", routes.GetDataKeysHandler).Methods(http.MethodGet)
 	v1.HandleFunc("/data/values", routes.GetDataValuesHandler).Methods(http.MethodGet)
 
+	// Analytics routes (Grafana-compatible)
+	v1.HandleFunc("/analytics", routes.AnalyticsHandler).Methods(http.MethodPost)
+	v1.HandleFunc("/analytics", routes.AnalyticsQueryHandler).Methods(http.MethodGet)
+	v1.HandleFunc("/timeseries", routes.TimeSeriesHandler).Methods(http.MethodPost)
+	v1.HandleFunc("/timeseries", routes.TimeSeriesQueryHandler).Methods(http.MethodGet)
+	v1.HandleFunc("/topn", routes.TopNHandler).Methods(http.MethodPost)
+	v1.HandleFunc("/gauge", routes.GaugeHandler).Methods(http.MethodPost)
+	v1.HandleFunc("/compare", routes.CompareHandler).Methods(http.MethodPost)
+
 	// CORS Middleware
 	corsMiddleware := cors.New(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowCredentials: true,
-		AllowedHeaders:   []string{"X-Requested-With", "Content-Type", "Origin", "Authorization", "Accept", "X-Api-Key"},
+		AllowedHeaders:   []string{"X-Requested-With", "Content-Type", "Origin", "Authorization", "Accept", "X-Api-Key", "Referer", "Dnt", "User-Agent"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 	})
 
