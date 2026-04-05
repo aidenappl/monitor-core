@@ -66,20 +66,41 @@ func (b *Batcher) Run(ctx context.Context) {
 	}
 }
 
+const (
+	maxFlushRetries    = 5
+	flushRetryBaseWait = 2 * time.Second
+)
+
 func (b *Batcher) flush(ctx context.Context) {
 	if len(b.batch) == 0 {
 		return
 	}
 
-	start := time.Now()
-	err := b.writer.WriteBatch(ctx, b.batch)
-	duration := time.Since(start)
+	var err error
+	for attempt := 1; attempt <= maxFlushRetries; attempt++ {
+		start := time.Now()
+		err = b.writer.WriteBatch(ctx, b.batch)
+		duration := time.Since(start)
 
-	if err != nil {
-		log.Printf("failed to write batch of %d events: %v", len(b.batch), err)
-	} else {
-		log.Printf("flushed %d events in %v", len(b.batch), duration)
+		if err == nil {
+			log.Printf("flushed %d events in %v", len(b.batch), duration)
+			b.batch = b.batch[:0]
+			return
+		}
+
+		wait := flushRetryBaseWait * time.Duration(attempt)
+		log.Printf("failed to write batch of %d events (attempt %d/%d): %v — retrying in %v",
+			len(b.batch), attempt, maxFlushRetries, err, wait)
+
+		select {
+		case <-ctx.Done():
+			log.Printf("context cancelled, dropping batch of %d events after %d failed attempt(s)", len(b.batch), attempt)
+			b.batch = b.batch[:0]
+			return
+		case <-time.After(wait):
+		}
 	}
 
+	log.Printf("permanently dropping batch of %d events after %d failed attempts: %v", len(b.batch), maxFlushRetries, err)
 	b.batch = b.batch[:0]
 }
