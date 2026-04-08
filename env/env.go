@@ -12,25 +12,54 @@ var (
 	ClickHouseDatabase string
 	ClickHouseUsername string
 	ClickHousePassword string
-	APIKey             string
+	IngestKey          string
 	BatchSize          int
 	FlushInterval      time.Duration
 	QueueSize          int
+
+	// Forta OAuth2 authentication
+	FortaAppDomain          string
+	FortaAPIDomain          string
+	FortaLoginDomain        string
+	FortaClientID           string
+	FortaClientSecret       string
+	FortaCallbackURL        string
+	FortaJWTSigningKey      string
+	FortaPostLoginRedirect  string
+	FortaPostLogoutRedirect string
+	FortaCookieDomain       string
+	FortaCookieInsecure     bool
+	FortaFetchUserOnProtect bool
+	FortaDisableAutoRefresh bool
 )
 
 // Load reads all configuration from environment variables.
 // Call this after injecting secrets (e.g. via go-keyring) so that
 // any Keyring-provided values are present in os.Getenv before this runs.
 func Load() {
-	Port               = getEnv("HTTP_PORT", "8080")
-	ClickHouseAddr     = getEnv("CLICKHOUSE_ADDR", "localhost:9000")
+	Port = getEnv("HTTP_PORT", "8080")
+	ClickHouseAddr = getEnv("CLICKHOUSE_ADDRs", "sandbox.onprem.appleby.cloud:9000")
 	ClickHouseDatabase = getEnv("CLICKHOUSE_DATABASE", "monitor")
 	ClickHouseUsername = getEnv("CLICKHOUSE_USERNAME", "default")
 	ClickHousePassword = getEnv("CLICKHOUSE_PASSWORD", "")
-	APIKey             = getEnv("API_KEY", "")
-	BatchSize          = getEnvInt("BATCH_SIZE", 1000)
-	FlushInterval      = getEnvDuration("FLUSH_INTERVAL", 5*time.Second)
-	QueueSize          = getEnvInt("QUEUE_SIZE", 100000)
+	IngestKey = getEnv("MONITOR_API_KEY", "")
+	BatchSize = getEnvInt("BATCH_SIZE", 1000)
+	FlushInterval = getEnvDuration("FLUSH_INTERVAL", 5*time.Second)
+	QueueSize = getEnvInt("QUEUE_SIZE", 100000)
+
+	FortaAppDomain = getEnv("MON_FORTA_APP_DOMAIN", "")
+	FortaAPIDomain = getEnv("FORTA_API_DOMAIN", "")
+	FortaLoginDomain = getEnv("FORTA_LOGIN_DOMAIN", "")
+	FortaClientID = getEnv("MON_FORTA_CLIENT_ID", "")
+	FortaClientSecret = getEnv("MON_FORTA_CLIENT_SECRET", "")
+	FortaCallbackURL = getEnv("FORTA_CALLBACK_URL", "")
+	FortaJWTSigningKey = getEnv("FORTA_JWT_SIGNING_KEY", "")
+	FortaPostLoginRedirect = getEnv("FORTA_POST_LOGIN_REDIRECT", "/")
+	FortaPostLogoutRedirect = getEnv("FORTA_POST_LOGOUT_REDIRECT", "/")
+	FortaCookieDomain = getEnv("FORTA_COOKIE_DOMAIN", "")
+	FortaCookieInsecure = getEnv("FORTA_COOKIE_INSECURE", "false") == "true"
+	FortaFetchUserOnProtect = getEnv("FORTA_FETCH_USER_ON_PROTECT", "true") == "true"
+	FortaDisableAutoRefresh = getEnv("FORTA_DISABLE_AUTO_REFRESH", "false") == "true"
 }
 
 func getEnv(key, defaultVal string) string {

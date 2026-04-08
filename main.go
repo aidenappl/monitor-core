@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aidenappl/go-keyring"
+	forta "github.com/aidenappl/go-forta"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/middleware"
@@ -37,9 +38,32 @@ func main() {
 	// Load configuration (picks up any values injected by Keyring above).
 	env.Load()
 
-	// Validate configuration
-	if env.APIKey == "" {
-		log.Println("WARNING: API_KEY is not set, authentication is disabled")
+	// Set up Forta OAuth2 authentication (optional — skipped if credentials are absent).
+	if env.FortaClientID != "" && env.FortaClientSecret != "" {
+		fmt.Print("Connecting to Forta... ")
+		if err := forta.Setup(forta.Config{
+			AppDomain:          env.FortaAppDomain,
+			APIDomain:          env.FortaAPIDomain,
+			LoginDomain:        env.FortaLoginDomain,
+			ClientID:           env.FortaClientID,
+			ClientSecret:       env.FortaClientSecret,
+			CallbackURL:        env.FortaCallbackURL,
+			JWTSigningKey:      env.FortaJWTSigningKey,
+			PostLoginRedirect:  env.FortaPostLoginRedirect,
+			PostLogoutRedirect: env.FortaPostLogoutRedirect,
+			CookieDomain:       env.FortaCookieDomain,
+			CookieInsecure:     env.FortaCookieInsecure,
+			FetchUserOnProtect: env.FortaFetchUserOnProtect,
+			DisableAutoRefresh: env.FortaDisableAutoRefresh,
+		}); err != nil {
+			log.Printf("WARNING: forta setup failed: %v", err)
+		} else if err := forta.Ping(); err != nil {
+			log.Printf("WARNING: forta unreachable: %v", err)
+		} else {
+			fmt.Println("✅ Done")
+		}
+	} else {
+		log.Println("WARNING: FORTA_CLIENT_ID / FORTA_CLIENT_SECRET not set, Forta auth disabled")
 	}
 
 	// Handle shutdown signals
@@ -69,11 +93,23 @@ func main() {
 
 	r.HandleFunc("/health", routes.HealthHandler).Methods(http.MethodGet)
 
-	// V1 API routes (with auth middleware)
-	v1 := r.PathPrefix("/v1").Subrouter()
-	v1.Use(middleware.AuthMiddleware)
+	// Forta OAuth2 routes (unprotected — browser navigates here directly)
+	r.HandleFunc("/forta/login",    forta.LoginHandler).Methods(http.MethodGet)
+	r.HandleFunc("/forta/callback", forta.CallbackHandler).Methods(http.MethodGet)
+	r.HandleFunc("/forta/logout",   forta.LogoutHandler).Methods(http.MethodGet)
 
-	v1.HandleFunc("/events", routes.IngestEventsHandler).Methods(http.MethodPost)
+	// Authenticated self endpoint — returns the current Forta user
+	r.HandleFunc("/self", forta.Protected(routes.HandleGetSelf)).Methods(http.MethodGet)
+
+	// Event ingestion — authenticated by X-Ingest-Key (used by go-monitor)
+	r.HandleFunc("/v1/events", middleware.IngestAuthMiddleware(routes.IngestEventsHandler)).Methods(http.MethodPost)
+
+	// V1 API routes — protected by Forta JWT validation
+	v1 := r.PathPrefix("/v1").Subrouter()
+	v1.Use(func(next http.Handler) http.Handler {
+		return forta.Protected(next.ServeHTTP)
+	})
+
 	v1.HandleFunc("/events", routes.QueryEventsHandler).Methods(http.MethodGet)
 	v1.HandleFunc("/labels/{label}/values", routes.GetLabelValuesHandler).Methods(http.MethodGet)
 	v1.HandleFunc("/data/keys", routes.GetDataKeysHandler).Methods(http.MethodGet)
@@ -92,7 +128,7 @@ func main() {
 	corsMiddleware := cors.New(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowCredentials: true,
-		AllowedHeaders:   []string{"X-Requested-With", "Content-Type", "Origin", "Authorization", "Accept", "X-Api-Key", "Referer", "Dnt", "User-Agent"},
+		AllowedHeaders:   []string{"X-Requested-With", "Content-Type", "Origin", "Authorization", "Accept", "Referer", "Dnt", "User-Agent"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 	})
 
