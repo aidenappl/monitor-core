@@ -38,7 +38,7 @@ var (
 // any Keyring-provided values are present in os.Getenv before this runs.
 func Load() {
 	Port = getEnv("HTTP_PORT", "8080")
-	ClickHouseAddr = getEnv("CLICKHOUSE_ADDRs", "sandbox.onprem.appleby.cloud:9000")
+	ClickHouseAddr = getEnv("CLICKHOUSE_ADDR", "localhost:9000")
 	ClickHouseDatabase = getEnv("CLICKHOUSE_DATABASE", "monitor")
 	ClickHouseUsername = getEnv("CLICKHOUSE_USERNAME", "default")
 	ClickHousePassword = getEnv("CLICKHOUSE_PASSWORD", "")
