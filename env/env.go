@@ -7,6 +7,21 @@ import (
 )
 
 var (
+	Port               string
+	ClickHouseAddr     string
+	ClickHouseDatabase string
+	ClickHouseUsername string
+	ClickHousePassword string
+	APIKey             string
+	BatchSize          int
+	FlushInterval      time.Duration
+	QueueSize          int
+)
+
+// Load reads all configuration from environment variables.
+// Call this after injecting secrets (e.g. via go-keyring) so that
+// any Keyring-provided values are present in os.Getenv before this runs.
+func Load() {
 	Port               = getEnv("HTTP_PORT", "8080")
 	ClickHouseAddr     = getEnv("CLICKHOUSE_ADDR", "localhost:9000")
 	ClickHouseDatabase = getEnv("CLICKHOUSE_DATABASE", "monitor")
@@ -16,7 +31,7 @@ var (
 	BatchSize          = getEnvInt("BATCH_SIZE", 1000)
 	FlushInterval      = getEnvDuration("FLUSH_INTERVAL", 5*time.Second)
 	QueueSize          = getEnvInt("QUEUE_SIZE", 100000)
-)
+}
 
 func getEnv(key, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {

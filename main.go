@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aidenappl/go-keyring"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/middleware"
@@ -20,14 +21,26 @@ import (
 )
 
 func main() {
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Optionally load secrets from Keyring before reading env vars.
+	// Requires KEYRING_URL, KEYRING_ACCESS_KEY_ID, and KEYRING_SECRET_ACCESS_KEY
+	// to be set in the environment. Silently skipped if they are absent.
+	if client, err := keyring.New(); err == nil {
+		if err := client.InjectEnv(ctx); err != nil {
+			log.Printf("keyring: failed to inject secrets: %v", err)
+		}
+	}
+
+	// Load configuration (picks up any values injected by Keyring above).
+	env.Load()
+
 	// Validate configuration
 	if env.APIKey == "" {
 		log.Println("WARNING: API_KEY is not set, authentication is disabled")
 	}
-
-	// Create context for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Handle shutdown signals
 	sigChan := make(chan os.Signal, 1)
