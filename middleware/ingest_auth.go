@@ -11,7 +11,7 @@ import (
 // If no INGEST_KEY is configured, all requests are allowed (development mode).
 func IngestAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if env.IngestKey != "" && r.Header.Get("X-Ingest-Key") != env.IngestKey {
+		if env.IngestKey != "" && r.Header.Get("X-Api-Key") != env.IngestKey {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
