@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aidenappl/go-keyring"
 	forta "github.com/aidenappl/go-forta"
+	"github.com/aidenappl/go-keyring"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/middleware"
@@ -94,9 +94,9 @@ func main() {
 	r.HandleFunc("/health", routes.HealthHandler).Methods(http.MethodGet)
 
 	// Forta OAuth2 routes (unprotected — browser navigates here directly)
-	r.HandleFunc("/forta/login",    forta.LoginHandler).Methods(http.MethodGet)
+	r.HandleFunc("/forta/login", forta.LoginHandler).Methods(http.MethodGet)
 	r.HandleFunc("/forta/callback", forta.CallbackHandler).Methods(http.MethodGet)
-	r.HandleFunc("/forta/logout",   forta.LogoutHandler).Methods(http.MethodGet)
+	r.HandleFunc("/forta/logout", forta.LogoutHandler).Methods(http.MethodGet)
 
 	// Authenticated self endpoint — returns the current Forta user
 	r.HandleFunc("/self", forta.Protected(routes.HandleGetSelf)).Methods(http.MethodGet)
@@ -126,7 +126,10 @@ func main() {
 
 	// CORS Middleware
 	corsMiddleware := cors.New(cors.Options{
-		AllowedOrigins:   []string{"*"},
+		AllowedOrigins: []string{
+			"https://monitor.local.appleby.cloud:3020",
+			"https://monitor.appleby.cloud",
+		},
 		AllowCredentials: true,
 		AllowedHeaders:   []string{"X-Requested-With", "Content-Type", "Origin", "Authorization", "Accept", "Referer", "Dnt", "User-Agent"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
