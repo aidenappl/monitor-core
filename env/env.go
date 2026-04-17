@@ -61,7 +61,7 @@ func Load() {
 	FortaCookieInsecure = getEnv("FORTA_COOKIE_INSECURE", "false") == "true"
 	FortaFetchUserOnProtect = getEnv("FORTA_FETCH_USER_ON_PROTECT", "true") == "true"
 	FortaDisableAutoRefresh = getEnv("FORTA_DISABLE_AUTO_REFRESH", "false") == "true"
-	FortaEnforceGrants = getEnv("FORTA_ENFORCE_GRANTS", "false") == "true"
+	FortaEnforceGrants = getEnv("FORTA_ENFORCE_GRANTS", "true") == "true"
 }
 
 func getEnv(key, defaultVal string) string {
