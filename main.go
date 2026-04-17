@@ -55,6 +55,7 @@ func main() {
 			CookieInsecure:     env.FortaCookieInsecure,
 			FetchUserOnProtect: env.FortaFetchUserOnProtect,
 			DisableAutoRefresh: env.FortaDisableAutoRefresh,
+			EnforceGrants:      env.FortaEnforceGrants,
 		}); err != nil {
 			log.Printf("WARNING: forta setup failed: %v", err)
 		} else if err := forta.Ping(); err != nil {
