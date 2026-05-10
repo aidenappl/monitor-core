@@ -43,6 +43,10 @@ func main() {
 	// Load configuration (picks up any values injected by Keyring above).
 	env.Load()
 
+	if env.IngestKey == "" {
+		log.Fatal("FATAL: MONITOR_API_KEY must be set — refusing to start without ingest authentication")
+	}
+
 	// Set up Forta OAuth2 authentication (optional — skipped if credentials are absent).
 	if env.FortaClientID != "" && env.FortaClientSecret != "" {
 		fmt.Print("Connecting to Forta... ")
@@ -220,9 +224,12 @@ func main() {
 		AllowedOrigins: []string{
 			"https://monitor.local.appleby.cloud:3020",
 			"https://monitor.appleby.cloud",
+			"https://*.trailblaze.to",
+			"https://*.appleby.cloud",
+			"http://localhost:*",
 		},
 		AllowCredentials: true,
-		AllowedHeaders:   []string{"X-Requested-With", "Content-Type", "Origin", "Authorization", "Accept", "Referer", "Dnt", "User-Agent"},
+		AllowedHeaders:   []string{"X-Requested-With", "Content-Type", "Origin", "Authorization", "Accept", "Referer", "Dnt", "User-Agent", "X-Api-Key"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 	})
 

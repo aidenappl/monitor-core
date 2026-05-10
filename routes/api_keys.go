@@ -23,7 +23,8 @@ func HandleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 
 func HandleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name string `json:"name"`
+		Name  string `json:"name"`
+		Scope string `json:"scope"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
@@ -34,7 +35,12 @@ func HandleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := apikeys.Create(r.Context(), body.Name)
+	scope := apikeys.Scope(body.Scope)
+	if scope == "" {
+		scope = apikeys.ScopeAdmin
+	}
+
+	result, err := apikeys.Create(r.Context(), body.Name, scope)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to create api key", err)
 		return
