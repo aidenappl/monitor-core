@@ -224,6 +224,7 @@ func main() {
 		AllowedOrigins: []string{
 			"https://monitor.local.appleby.cloud:3020",
 			"https://monitor.appleby.cloud",
+			"https://trailblaze.to",
 			"https://*.trailblaze.to",
 			"https://*.appleby.cloud",
 			"http://localhost:*",
