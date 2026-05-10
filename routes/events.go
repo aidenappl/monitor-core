@@ -3,6 +3,7 @@ package routes
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/aidenappl/monitor-core/issues"
 	"github.com/aidenappl/monitor-core/services"
 	"github.com/aidenappl/monitor-core/structs"
 )
@@ -97,6 +99,17 @@ func parseAndEnqueue(reader io.Reader) (int, error) {
 		}
 
 		Queue.Enqueue(&event)
+
+		// Publish to SSE hub for live streaming
+		if EventHub != nil {
+			EventHub.Publish(&event)
+		}
+
+		// Track errors as issues
+		if event.Level == "error" || event.Level == "fatal" {
+			go issues.TrackError(context.Background(), &event)
+		}
+
 		count++
 	}
 

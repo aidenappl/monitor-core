@@ -12,12 +12,16 @@ import (
 
 	forta "github.com/aidenappl/go-forta"
 	"github.com/aidenappl/go-keyring"
+	"github.com/aidenappl/monitor-core/alerts"
 	"github.com/aidenappl/monitor-core/apikeys"
+	"github.com/aidenappl/monitor-core/dashboards"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
+	"github.com/aidenappl/monitor-core/issues"
 	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/routes"
 	"github.com/aidenappl/monitor-core/services"
+	"github.com/aidenappl/monitor-core/views"
 	"github.com/gorilla/mux"
 	"github.com/rs/cors"
 )
@@ -83,6 +87,30 @@ func main() {
 		log.Printf("WARNING: failed to initialize api keys: %v", err)
 	}
 
+	// Initialize dashboards
+	if err := dashboards.Init(ctx); err != nil {
+		log.Printf("WARNING: failed to initialize dashboards: %v", err)
+	}
+
+	// Initialize saved views
+	if err := views.Init(ctx); err != nil {
+		log.Printf("WARNING: failed to initialize views: %v", err)
+	}
+
+	// Initialize alerts
+	if err := alerts.Init(ctx); err != nil {
+		log.Printf("WARNING: failed to initialize alerts: %v", err)
+	}
+
+	// Initialize issues
+	if err := issues.Init(ctx); err != nil {
+		log.Printf("WARNING: failed to initialize issues: %v", err)
+	}
+
+	// Create SSE hub
+	hub := services.NewHub(env.MaxSSESubscribers)
+	routes.EventHub = hub
+
 	// Create event queue
 	queue := services.NewQueue(env.QueueSize)
 	routes.Queue = queue
@@ -90,7 +118,25 @@ func main() {
 	// Create and start batcher
 	writer := &db.Writer{}
 	batcher := services.NewBatcher(queue, writer, env.BatchSize, env.FlushInterval)
-	go batcher.Run(ctx)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC in batcher: %v", r)
+			}
+		}()
+		batcher.Run(ctx)
+	}()
+
+	// Start alert evaluator
+	evaluator := alerts.NewEvaluator()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC in alert evaluator: %v", r)
+			}
+		}()
+		evaluator.Run(ctx)
+	}()
 
 	// Setup router
 	r := mux.NewRouter()
@@ -116,6 +162,7 @@ func main() {
 	v1.Use(middleware.QueryAuthMiddleware)
 
 	v1.HandleFunc("/events", routes.QueryEventsHandler).Methods(http.MethodGet)
+	v1.HandleFunc("/events/stream", routes.StreamEventsHandler).Methods(http.MethodGet)
 	v1.HandleFunc("/labels/{label}/values", routes.GetLabelValuesHandler).Methods(http.MethodGet)
 	v1.HandleFunc("/data/keys", routes.GetDataKeysHandler).Methods(http.MethodGet)
 	v1.HandleFunc("/data/values", routes.GetDataValuesHandler).Methods(http.MethodGet)
@@ -133,6 +180,40 @@ func main() {
 	v1.HandleFunc("/api-keys", routes.HandleListAPIKeys).Methods(http.MethodGet)
 	v1.HandleFunc("/api-keys", routes.HandleCreateAPIKey).Methods(http.MethodPost)
 	v1.HandleFunc("/api-keys/{id}", routes.HandleDeleteAPIKey).Methods(http.MethodDelete)
+
+	// Dashboard persistence
+	v1.HandleFunc("/dashboards", routes.HandleListDashboards).Methods(http.MethodGet)
+	v1.HandleFunc("/dashboards", routes.HandleCreateDashboard).Methods(http.MethodPost)
+	v1.HandleFunc("/dashboards/{id}", routes.HandleGetDashboard).Methods(http.MethodGet)
+	v1.HandleFunc("/dashboards/{id}", routes.HandleUpdateDashboard).Methods(http.MethodPut)
+	v1.HandleFunc("/dashboards/{id}", routes.HandleDeleteDashboard).Methods(http.MethodDelete)
+
+	// Saved views
+	v1.HandleFunc("/views", routes.HandleListViews).Methods(http.MethodGet)
+	v1.HandleFunc("/views", routes.HandleCreateView).Methods(http.MethodPost)
+	v1.HandleFunc("/views/{id}", routes.HandleDeleteView).Methods(http.MethodDelete)
+
+	// Alert rules
+	v1.HandleFunc("/alert-rules", routes.HandleListAlertRules).Methods(http.MethodGet)
+	v1.HandleFunc("/alert-rules", routes.HandleCreateAlertRule).Methods(http.MethodPost)
+	v1.HandleFunc("/alert-rules/{id}", routes.HandleGetAlertRule).Methods(http.MethodGet)
+	v1.HandleFunc("/alert-rules/{id}", routes.HandleUpdateAlertRule).Methods(http.MethodPut)
+	v1.HandleFunc("/alert-rules/{id}", routes.HandleDeleteAlertRule).Methods(http.MethodDelete)
+	v1.HandleFunc("/alert-rules/{id}/test", routes.HandleTestAlertRule).Methods(http.MethodPost)
+
+	// Alert history
+	v1.HandleFunc("/alert-history", routes.HandleListAlertHistory).Methods(http.MethodGet)
+
+	// Notification channels
+	v1.HandleFunc("/notification-channels", routes.HandleListNotificationChannels).Methods(http.MethodGet)
+	v1.HandleFunc("/notification-channels", routes.HandleCreateNotificationChannel).Methods(http.MethodPost)
+	v1.HandleFunc("/notification-channels/{id}", routes.HandleDeleteNotificationChannel).Methods(http.MethodDelete)
+
+	// Issue tracking
+	v1.HandleFunc("/issues", routes.HandleListIssues).Methods(http.MethodGet)
+	v1.HandleFunc("/issues/{id}", routes.HandleGetIssue).Methods(http.MethodGet)
+	v1.HandleFunc("/issues/{id}", routes.HandleUpdateIssue).Methods(http.MethodPut)
+	v1.HandleFunc("/issues/{id}/events", routes.HandleGetIssueEvents).Methods(http.MethodGet)
 
 	// CORS Middleware
 	corsMiddleware := cors.New(cors.Options{

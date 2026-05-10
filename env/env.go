@@ -17,6 +17,9 @@ var (
 	FlushInterval      time.Duration
 	QueueSize          int
 
+	// SSE
+	MaxSSESubscribers int
+
 	// Forta OAuth2 authentication
 	FortaAppDomain          string
 	FortaAPIDomain          string
@@ -47,6 +50,8 @@ func Load() {
 	BatchSize = getEnvInt("BATCH_SIZE", 1000)
 	FlushInterval = getEnvDuration("FLUSH_INTERVAL", 5*time.Second)
 	QueueSize = getEnvInt("QUEUE_SIZE", 100000)
+
+	MaxSSESubscribers = getEnvInt("MAX_SSE_SUBSCRIBERS", 100)
 
 	FortaAppDomain = getEnv("MON_FORTA_APP_DOMAIN", "")
 	FortaAPIDomain = getEnv("FORTA_API_DOMAIN", "")
