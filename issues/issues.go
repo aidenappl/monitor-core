@@ -21,6 +21,7 @@ type Issue struct {
 	Service         string     `json:"service"`
 	Name            string     `json:"name"`
 	Message         string     `json:"message"`
+	Path            string     `json:"path"`
 	Status          string     `json:"status"`
 	OccurrenceCount uint64     `json:"occurrence_count"`
 	FirstSeen       time.Time  `json:"first_seen"`
@@ -31,21 +32,22 @@ type Issue struct {
 
 // Fingerprint normalization regexes
 var (
-	uuidRegex    = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
-	hexRegex     = regexp.MustCompile(`\b0x[0-9a-fA-F]+\b`)
-	numberRegex  = regexp.MustCompile(`\b\d+\b`)
-	urlRegex     = regexp.MustCompile(`https?://[^\s]+`)
+	uuidRegex   = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+	hexRegex    = regexp.MustCompile(`\b0x[0-9a-fA-F]+\b`)
+	numberRegex = regexp.MustCompile(`\b\d+\b`)
+	urlRegex    = regexp.MustCompile(`https?://[^\s]+`)
 )
 
 // Init creates the issues table if it doesn't exist
 func Init(ctx context.Context) error {
-	return db.Conn.Exec(ctx, `
+	if err := db.Conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS `+db.Database+`.issues (
 			id String,
 			fingerprint String,
 			service String,
 			name String,
 			message String,
+			path String DEFAULT '',
 			status String DEFAULT 'unresolved',
 			occurrence_count UInt64 DEFAULT 1,
 			first_seen DateTime64(3, 'UTC'),
@@ -54,13 +56,24 @@ func Init(ctx context.Context) error {
 			updated_at DateTime64(3, 'UTC') DEFAULT now64(3)
 		) ENGINE = ReplacingMergeTree(updated_at)
 		ORDER BY (id)
-	`)
+	`); err != nil {
+		return err
+	}
+
+	// Migration: add path column if it doesn't exist
+	_ = db.Conn.Exec(ctx, fmt.Sprintf(
+		"ALTER TABLE %s.issues ADD COLUMN IF NOT EXISTS path String DEFAULT ''",
+		db.Database,
+	))
+
+	return nil
 }
 
 // TrackError tracks an error event, creating or updating an issue
 func TrackError(ctx context.Context, event *structs.Event) {
-	message := extractMessage(event)
-	fingerprint := generateFingerprint(event.Service, event.Name, message)
+	path := extractPath(event)
+	message := extractMessage(event, path)
+	fingerprint := generateFingerprint(event.Service, event.Name, message, path)
 	now := time.Now().UTC()
 
 	// Check if issue already exists for this fingerprint
@@ -69,9 +82,9 @@ func TrackError(ctx context.Context, event *structs.Event) {
 		// Create new issue
 		id := uuid.New().String()
 		if err := db.Conn.Exec(ctx, fmt.Sprintf(
-			"INSERT INTO %s.issues (id, fingerprint, service, name, message, status, occurrence_count, first_seen, last_seen, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			"INSERT INTO %s.issues (id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			db.Database,
-		), id, fingerprint, event.Service, event.Name, message, "unresolved", uint64(1), now, now, now); err != nil {
+		), id, fingerprint, event.Service, event.Name, message, path, "unresolved", uint64(1), now, now, now); err != nil {
 			log.Printf("issues: failed to create issue: %v", err)
 		}
 		return
@@ -89,9 +102,9 @@ func TrackError(ctx context.Context, event *structs.Event) {
 	// during merges, so concurrent increments can cause occurrence_count to go backward or lose
 	// increments. This is a known limitation — the approximate count is acceptable for error tracking.
 	if err := db.Conn.Exec(ctx, fmt.Sprintf(
-		"INSERT INTO %s.issues (id, fingerprint, service, name, message, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO %s.issues (id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		db.Database,
-	), existing.ID, existing.Fingerprint, existing.Service, existing.Name, message, status, existing.OccurrenceCount+1, existing.FirstSeen, now, existing.ResolvedAt, now); err != nil {
+	), existing.ID, existing.Fingerprint, existing.Service, existing.Name, message, existing.Path, status, existing.OccurrenceCount+1, existing.FirstSeen, now, existing.ResolvedAt, now); err != nil {
 		log.Printf("issues: failed to update issue %s: %v", existing.ID, err)
 	}
 }
@@ -124,7 +137,7 @@ func List(ctx context.Context, status, service string, limit, offset int) ([]Iss
 
 	// Data query
 	dataQuery := fmt.Sprintf(
-		"SELECT id, fingerprint, service, name, message, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at FROM %s.issues FINAL WHERE 1=1",
+		"SELECT id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at FROM %s.issues FINAL WHERE 1=1",
 		db.Database,
 	)
 	var dataArgs []interface{}
@@ -147,7 +160,7 @@ func List(ctx context.Context, status, service string, limit, offset int) ([]Iss
 	var issues []Issue
 	for rows.Next() {
 		var issue Issue
-		if err := rows.Scan(&issue.ID, &issue.Fingerprint, &issue.Service, &issue.Name, &issue.Message, &issue.Status, &issue.OccurrenceCount, &issue.FirstSeen, &issue.LastSeen, &issue.ResolvedAt, &issue.UpdatedAt); err != nil {
+		if err := rows.Scan(&issue.ID, &issue.Fingerprint, &issue.Service, &issue.Name, &issue.Message, &issue.Path, &issue.Status, &issue.OccurrenceCount, &issue.FirstSeen, &issue.LastSeen, &issue.ResolvedAt, &issue.UpdatedAt); err != nil {
 			return nil, 0, fmt.Errorf("failed to scan issue: %w", err)
 		}
 		issues = append(issues, issue)
@@ -158,12 +171,12 @@ func List(ctx context.Context, status, service string, limit, offset int) ([]Iss
 // Get returns an issue by ID
 func Get(ctx context.Context, id string) (*Issue, error) {
 	row := db.Conn.QueryRow(ctx, fmt.Sprintf(
-		"SELECT id, fingerprint, service, name, message, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at FROM %s.issues FINAL WHERE id = ?",
+		"SELECT id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at FROM %s.issues FINAL WHERE id = ?",
 		db.Database,
 	), id)
 
 	var issue Issue
-	if err := row.Scan(&issue.ID, &issue.Fingerprint, &issue.Service, &issue.Name, &issue.Message, &issue.Status, &issue.OccurrenceCount, &issue.FirstSeen, &issue.LastSeen, &issue.ResolvedAt, &issue.UpdatedAt); err != nil {
+	if err := row.Scan(&issue.ID, &issue.Fingerprint, &issue.Service, &issue.Name, &issue.Message, &issue.Path, &issue.Status, &issue.OccurrenceCount, &issue.FirstSeen, &issue.LastSeen, &issue.ResolvedAt, &issue.UpdatedAt); err != nil {
 		return nil, fmt.Errorf("issue not found")
 	}
 	return &issue, nil
@@ -192,9 +205,9 @@ func UpdateStatus(ctx context.Context, id, status string) error {
 	}
 
 	return db.Conn.Exec(ctx, fmt.Sprintf(
-		"INSERT INTO %s.issues (id, fingerprint, service, name, message, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO %s.issues (id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		db.Database,
-	), existing.ID, existing.Fingerprint, existing.Service, existing.Name, existing.Message, status, existing.OccurrenceCount, existing.FirstSeen, existing.LastSeen, resolvedAt, now)
+	), existing.ID, existing.Fingerprint, existing.Service, existing.Name, existing.Message, existing.Path, status, existing.OccurrenceCount, existing.FirstSeen, existing.LastSeen, resolvedAt, now)
 }
 
 // GetFingerprint returns the fingerprint for an issue (for event lookup)
@@ -208,36 +221,81 @@ func GetFingerprint(ctx context.Context, id string) (string, error) {
 
 func getByFingerprint(ctx context.Context, fingerprint string) (*Issue, error) {
 	row := db.Conn.QueryRow(ctx, fmt.Sprintf(
-		"SELECT id, fingerprint, service, name, message, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at FROM %s.issues FINAL WHERE fingerprint = ?",
+		"SELECT id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at FROM %s.issues FINAL WHERE fingerprint = ?",
 		db.Database,
 	), fingerprint)
 
 	var issue Issue
-	if err := row.Scan(&issue.ID, &issue.Fingerprint, &issue.Service, &issue.Name, &issue.Message, &issue.Status, &issue.OccurrenceCount, &issue.FirstSeen, &issue.LastSeen, &issue.ResolvedAt, &issue.UpdatedAt); err != nil {
+	if err := row.Scan(&issue.ID, &issue.Fingerprint, &issue.Service, &issue.Name, &issue.Message, &issue.Path, &issue.Status, &issue.OccurrenceCount, &issue.FirstSeen, &issue.LastSeen, &issue.ResolvedAt, &issue.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &issue, nil
 }
 
-func extractMessage(event *structs.Event) string {
-	if event.Data != nil {
+func extractPath(event *structs.Event) string {
+	if event.Data == nil {
+		return ""
+	}
+	if p, ok := event.Data["path"]; ok {
+		if s, ok := p.(string); ok {
+			return s
+		}
+	}
+	if p, ok := event.Data["uri"]; ok {
+		if s, ok := p.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func extractMessage(event *structs.Event, path string) string {
+	if event.Data == nil {
+		return event.Name
+	}
+
+	// Get the error string
+	var errStr string
+	if msg, ok := event.Data["error"]; ok {
+		if s, ok := msg.(string); ok {
+			errStr = s
+		}
+	}
+	if errStr == "" {
+		if msg, ok := event.Data["error_message"]; ok {
+			if s, ok := msg.(string); ok {
+				errStr = s
+			}
+		}
+	}
+	if errStr == "" {
 		if msg, ok := event.Data["message"]; ok {
 			if s, ok := msg.(string); ok {
-				return s
+				errStr = s
 			}
 		}
-		if msg, ok := event.Data["error"]; ok {
-			if s, ok := msg.(string); ok {
-				return s
+	}
+
+	// Build descriptive message when path and error are available
+	if path != "" && errStr != "" {
+		method := ""
+		if m, ok := event.Data["method"]; ok {
+			if s, ok := m.(string); ok {
+				method = s + " "
 			}
 		}
+		return method + path + ": " + errStr
+	}
+
+	if errStr != "" {
+		return errStr
 	}
 	return event.Name
 }
 
-func generateFingerprint(service, name, message string) string {
+func generateFingerprint(service, name, message, path string) string {
 	normalized := normalizeMessage(message)
-	raw := service + "|" + name + "|" + normalized
+	raw := service + "|" + name + "|" + path + "|" + normalized
 	h := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(h[:])
 }

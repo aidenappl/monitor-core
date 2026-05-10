@@ -108,8 +108,16 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 		limit = 500
 	}
 
-	query := "SELECT timestamp, service, env, job_id, request_id, trace_id, user_id, name, level, data FROM " + db.Database + ".events WHERE service = ? AND name = ? AND level IN ('error', 'fatal') ORDER BY timestamp DESC LIMIT ?"
-	rows, err := db.Conn.Query(r.Context(), query, issue.Service, issue.Name, limit)
+	var query string
+	var args []interface{}
+	if issue.Path != "" {
+		query = "SELECT timestamp, service, env, job_id, request_id, trace_id, user_id, name, level, data FROM " + db.Database + ".events WHERE service = ? AND name = ? AND level IN ('error', 'fatal') AND (JSONExtractString(data, 'path') = ? OR JSONExtractString(data, 'uri') = ?) ORDER BY timestamp DESC LIMIT ?"
+		args = []interface{}{issue.Service, issue.Name, issue.Path, issue.Path, limit}
+	} else {
+		query = "SELECT timestamp, service, env, job_id, request_id, trace_id, user_id, name, level, data FROM " + db.Database + ".events WHERE service = ? AND name = ? AND level IN ('error', 'fatal') ORDER BY timestamp DESC LIMIT ?"
+		args = []interface{}{issue.Service, issue.Name, limit}
+	}
+	rows, err := db.Conn.Query(r.Context(), query, args...)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to query events", err)
 		return

@@ -11,22 +11,22 @@ import (
 
 // Rule represents an alert rule
 type Rule struct {
-	ID                      string    `json:"id"`
-	Name                    string    `json:"name"`
-	Description             string    `json:"description"`
-	Type                    string    `json:"type"`
-	QueryFilters            string    `json:"query_filters"`
-	Metric                  string    `json:"metric"`
-	Field                   string    `json:"field"`
-	Condition               string    `json:"condition"`
-	Threshold               float64   `json:"threshold"`
-	EvaluationIntervalSecs  uint32    `json:"evaluation_interval_seconds"`
-	ForSeconds              uint32    `json:"for_seconds"`
-	CooldownSeconds         uint32    `json:"cooldown_seconds"`
-	NotificationChannelIDs  string    `json:"notification_channel_ids"`
-	Enabled                 bool      `json:"enabled"`
-	CreatedAt               time.Time `json:"created_at"`
-	UpdatedAt               time.Time `json:"updated_at"`
+	ID                     string    `json:"id"`
+	Name                   string    `json:"name"`
+	Description            string    `json:"description"`
+	Type                   string    `json:"type"`
+	QueryFilters           string    `json:"query_filters"`
+	Metric                 string    `json:"metric"`
+	Field                  string    `json:"field"`
+	Condition              string    `json:"condition"`
+	Threshold              float64   `json:"threshold"`
+	EvaluationIntervalSecs uint32    `json:"evaluation_interval_seconds"`
+	ForSeconds             uint32    `json:"for_seconds"`
+	CooldownSeconds        uint32    `json:"cooldown_seconds"`
+	NotificationChannelIDs string    `json:"notification_channel_ids"`
+	Enabled                bool      `json:"enabled"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
 }
 
 // RuleWithState combines a rule with its current state
