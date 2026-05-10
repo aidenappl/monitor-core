@@ -47,7 +47,7 @@ var (
 	cacheMu sync.RWMutex
 )
 
-// Init creates the api_keys table if it doesn't exist and loads the key cache.
+// Init creates the api_keys table if it doesn't exist, runs migrations, and loads the key cache.
 func Init(ctx context.Context) error {
 	err := db.Conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS `+db.Database+`.api_keys (
@@ -63,6 +63,10 @@ func Init(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create api_keys table: %w", err)
 	}
+
+	// Migration: add scope column to existing tables that don't have it
+	_ = db.Conn.Exec(ctx, `ALTER TABLE `+db.Database+`.api_keys ADD COLUMN IF NOT EXISTS scope String DEFAULT 'admin'`)
+
 	return refreshCache(ctx)
 }
 
