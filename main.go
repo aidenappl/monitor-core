@@ -12,6 +12,7 @@ import (
 
 	forta "github.com/aidenappl/go-forta"
 	"github.com/aidenappl/go-keyring"
+	"github.com/aidenappl/monitor-core/apikeys"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/middleware"
@@ -77,6 +78,11 @@ func main() {
 	}
 	defer db.Close()
 
+	// Initialize API key management (auto-creates table if needed)
+	if err := apikeys.Init(ctx); err != nil {
+		log.Printf("WARNING: failed to initialize api keys: %v", err)
+	}
+
 	// Create event queue
 	queue := services.NewQueue(env.QueueSize)
 	routes.Queue = queue
@@ -105,11 +111,9 @@ func main() {
 	// Event ingestion — authenticated by X-Ingest-Key (used by go-monitor)
 	r.HandleFunc("/v1/events", middleware.IngestAuthMiddleware(routes.IngestEventsHandler)).Methods(http.MethodPost)
 
-	// V1 API routes — protected by Forta JWT validation
+	// V1 API routes — protected by API key or Forta JWT
 	v1 := r.PathPrefix("/v1").Subrouter()
-	v1.Use(func(next http.Handler) http.Handler {
-		return forta.Protected(next.ServeHTTP)
-	})
+	v1.Use(middleware.QueryAuthMiddleware)
 
 	v1.HandleFunc("/events", routes.QueryEventsHandler).Methods(http.MethodGet)
 	v1.HandleFunc("/labels/{label}/values", routes.GetLabelValuesHandler).Methods(http.MethodGet)
@@ -124,6 +128,11 @@ func main() {
 	v1.HandleFunc("/topn", routes.TopNHandler).Methods(http.MethodPost)
 	v1.HandleFunc("/gauge", routes.GaugeHandler).Methods(http.MethodPost)
 	v1.HandleFunc("/compare", routes.CompareHandler).Methods(http.MethodPost)
+
+	// API key management — protected by Forta (admin UI only)
+	v1.HandleFunc("/api-keys", routes.HandleListAPIKeys).Methods(http.MethodGet)
+	v1.HandleFunc("/api-keys", routes.HandleCreateAPIKey).Methods(http.MethodPost)
+	v1.HandleFunc("/api-keys/{id}", routes.HandleDeleteAPIKey).Methods(http.MethodDelete)
 
 	// CORS Middleware
 	corsMiddleware := cors.New(cors.Options{
