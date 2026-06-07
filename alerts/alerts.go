@@ -9,12 +9,28 @@ import (
 	"github.com/google/uuid"
 )
 
+// Priority levels
+const (
+	PriorityCritical = "P0"
+	PriorityHigh     = "P1"
+	PriorityMedium   = "P2"
+	PriorityLow      = "P3"
+)
+
+var ValidPriorities = map[string]bool{
+	PriorityCritical: true,
+	PriorityHigh:     true,
+	PriorityMedium:   true,
+	PriorityLow:      true,
+}
+
 // Rule represents an alert rule
 type Rule struct {
 	ID                     string    `json:"id"`
 	Name                   string    `json:"name"`
 	Description            string    `json:"description"`
 	Type                   string    `json:"type"`
+	Priority               string    `json:"priority"`
 	QueryFilters           string    `json:"query_filters"`
 	Metric                 string    `json:"metric"`
 	Field                  string    `json:"field"`
@@ -74,6 +90,7 @@ func Init(ctx context.Context) error {
 			name String,
 			description String DEFAULT '',
 			type String,
+			priority String DEFAULT 'P2',
 			query_filters String,
 			metric String DEFAULT 'count',
 			field String DEFAULT '',
@@ -92,6 +109,12 @@ func Init(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create alert_rules table: %w", err)
 	}
+
+	// Migration: add priority column for existing tables
+	_ = db.Conn.Exec(ctx, fmt.Sprintf(
+		"ALTER TABLE %s.alert_rules ADD COLUMN IF NOT EXISTS priority String DEFAULT 'P2'",
+		db.Database,
+	))
 
 	err = db.Conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS `+db.Database+`.alert_states (
@@ -140,6 +163,14 @@ func Init(ctx context.Context) error {
 		return fmt.Errorf("failed to create notification_channels table: %w", err)
 	}
 
+	if err := InitServiceGroups(ctx); err != nil {
+		return fmt.Errorf("failed to initialize service_groups: %w", err)
+	}
+
+	if err := InitPolicies(ctx); err != nil {
+		return fmt.Errorf("failed to initialize notification_policies: %w", err)
+	}
+
 	return nil
 }
 
@@ -168,6 +199,9 @@ func CreateRule(ctx context.Context, rule Rule) (*Rule, error) {
 	rule.CreatedAt = now
 	rule.UpdatedAt = now
 
+	if rule.Priority == "" || !ValidPriorities[rule.Priority] {
+		rule.Priority = PriorityMedium
+	}
 	if rule.Metric == "" {
 		rule.Metric = "count"
 	}
@@ -190,9 +224,9 @@ func CreateRule(ctx context.Context, rule Rule) (*Rule, error) {
 	}
 
 	err := db.Conn.Exec(ctx, fmt.Sprintf(
-		`INSERT INTO %s.alert_rules (id, name, description, type, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO %s.alert_rules (id, name, description, type, priority, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		db.Database,
-	), rule.ID, rule.Name, rule.Description, rule.Type, rule.QueryFilters, rule.Metric, rule.Field, rule.Condition, rule.Threshold, rule.EvaluationIntervalSecs, rule.ForSeconds, rule.CooldownSeconds, rule.NotificationChannelIDs, enabled, rule.CreatedAt, rule.UpdatedAt)
+	), rule.ID, rule.Name, rule.Description, rule.Type, rule.Priority, rule.QueryFilters, rule.Metric, rule.Field, rule.Condition, rule.Threshold, rule.EvaluationIntervalSecs, rule.ForSeconds, rule.CooldownSeconds, rule.NotificationChannelIDs, enabled, rule.CreatedAt, rule.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert alert rule: %w", err)
 	}
@@ -203,7 +237,7 @@ func CreateRule(ctx context.Context, rule Rule) (*Rule, error) {
 // ListRules returns all alert rules with their current state
 func ListRules(ctx context.Context) ([]RuleWithState, error) {
 	rows, err := db.Conn.Query(ctx, fmt.Sprintf(
-		"SELECT id, name, description, type, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at FROM %s.alert_rules FINAL ORDER BY created_at DESC",
+		"SELECT id, name, description, type, priority, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at FROM %s.alert_rules FINAL ORDER BY created_at DESC",
 		db.Database,
 	))
 	if err != nil {
@@ -215,7 +249,7 @@ func ListRules(ctx context.Context) ([]RuleWithState, error) {
 	for rows.Next() {
 		var r Rule
 		var enabled uint8
-		if err := rows.Scan(&r.ID, &r.Name, &r.Description, &r.Type, &r.QueryFilters, &r.Metric, &r.Field, &r.Condition, &r.Threshold, &r.EvaluationIntervalSecs, &r.ForSeconds, &r.CooldownSeconds, &r.NotificationChannelIDs, &enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.Description, &r.Type, &r.Priority, &r.QueryFilters, &r.Metric, &r.Field, &r.Condition, &r.Threshold, &r.EvaluationIntervalSecs, &r.ForSeconds, &r.CooldownSeconds, &r.NotificationChannelIDs, &enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("failed to scan alert rule: %w", err)
 		}
 		r.Enabled = enabled == 1
@@ -270,13 +304,13 @@ func GetRule(ctx context.Context, id string) (*RuleWithState, error) {
 
 func getRuleOnly(ctx context.Context, id string) (*Rule, error) {
 	row := db.Conn.QueryRow(ctx, fmt.Sprintf(
-		"SELECT id, name, description, type, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at FROM %s.alert_rules FINAL WHERE id = ?",
+		"SELECT id, name, description, type, priority, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at FROM %s.alert_rules FINAL WHERE id = ?",
 		db.Database,
 	), id)
 
 	var r Rule
 	var enabled uint8
-	if err := row.Scan(&r.ID, &r.Name, &r.Description, &r.Type, &r.QueryFilters, &r.Metric, &r.Field, &r.Condition, &r.Threshold, &r.EvaluationIntervalSecs, &r.ForSeconds, &r.CooldownSeconds, &r.NotificationChannelIDs, &enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
+	if err := row.Scan(&r.ID, &r.Name, &r.Description, &r.Type, &r.Priority, &r.QueryFilters, &r.Metric, &r.Field, &r.Condition, &r.Threshold, &r.EvaluationIntervalSecs, &r.ForSeconds, &r.CooldownSeconds, &r.NotificationChannelIDs, &enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
 		return nil, fmt.Errorf("alert rule not found")
 	}
 	r.Enabled = enabled == 1
@@ -298,6 +332,9 @@ func UpdateRule(ctx context.Context, id string, rule Rule) (*Rule, error) {
 	}
 	if rule.Type != "" {
 		existing.Type = rule.Type
+	}
+	if rule.Priority != "" && ValidPriorities[rule.Priority] {
+		existing.Priority = rule.Priority
 	}
 	if rule.QueryFilters != "" {
 		existing.QueryFilters = rule.QueryFilters
@@ -338,9 +375,9 @@ func UpdateRule(ctx context.Context, id string, rule Rule) (*Rule, error) {
 	}
 
 	err = db.Conn.Exec(ctx, fmt.Sprintf(
-		`INSERT INTO %s.alert_rules (id, name, description, type, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO %s.alert_rules (id, name, description, type, priority, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		db.Database,
-	), existing.ID, existing.Name, existing.Description, existing.Type, existing.QueryFilters, existing.Metric, existing.Field, existing.Condition, existing.Threshold, existing.EvaluationIntervalSecs, existing.ForSeconds, existing.CooldownSeconds, existing.NotificationChannelIDs, enabled, existing.CreatedAt, existing.UpdatedAt)
+	), existing.ID, existing.Name, existing.Description, existing.Type, existing.Priority, existing.QueryFilters, existing.Metric, existing.Field, existing.Condition, existing.Threshold, existing.EvaluationIntervalSecs, existing.ForSeconds, existing.CooldownSeconds, existing.NotificationChannelIDs, enabled, existing.CreatedAt, existing.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to update alert rule: %w", err)
 	}
@@ -445,9 +482,9 @@ func CreateChannel(ctx context.Context, ch Channel) (*Channel, error) {
 	if ch.Name == "" {
 		return nil, fmt.Errorf("name is required")
 	}
-	validTypes := map[string]bool{"webhook": true, "slack": true, "email": true}
+	validTypes := map[string]bool{"webhook": true, "slack": true, "email": true, "pagerduty": true}
 	if !validTypes[ch.Type] {
-		return nil, fmt.Errorf("invalid type: %s (must be webhook, slack, or email)", ch.Type)
+		return nil, fmt.Errorf("invalid type: %s (must be webhook, slack, email, or pagerduty)", ch.Type)
 	}
 
 	ch.ID = uuid.New().String()

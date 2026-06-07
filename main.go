@@ -131,8 +131,12 @@ func main() {
 		batcher.Run(ctx)
 	}()
 
+	// Create alert notification hub for SSE streaming
+	alertHub := alerts.NewAlertHub(env.MaxSSESubscribers)
+	routes.AlertNotifHub = alertHub
+
 	// Start alert evaluator
-	evaluator := alerts.NewEvaluator()
+	evaluator := alerts.NewEvaluator(alertHub)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -212,6 +216,24 @@ func main() {
 	v1.HandleFunc("/notification-channels", routes.HandleListNotificationChannels).Methods(http.MethodGet)
 	v1.HandleFunc("/notification-channels", routes.HandleCreateNotificationChannel).Methods(http.MethodPost)
 	v1.HandleFunc("/notification-channels/{id}", routes.HandleDeleteNotificationChannel).Methods(http.MethodDelete)
+	v1.HandleFunc("/notification-channels/{id}/test", routes.HandleTestNotificationChannel).Methods(http.MethodPost)
+
+	// Service groups
+	v1.HandleFunc("/service-groups", routes.HandleListServiceGroups).Methods(http.MethodGet)
+	v1.HandleFunc("/service-groups", routes.HandleCreateServiceGroup).Methods(http.MethodPost)
+	v1.HandleFunc("/service-groups/{id}", routes.HandleUpdateServiceGroup).Methods(http.MethodPut)
+	v1.HandleFunc("/service-groups/{id}", routes.HandleDeleteServiceGroup).Methods(http.MethodDelete)
+
+	// Notification policies (routing rules)
+	v1.HandleFunc("/notification-policies", routes.HandleListPolicies).Methods(http.MethodGet)
+	v1.HandleFunc("/notification-policies", routes.HandleCreatePolicy).Methods(http.MethodPost)
+	v1.HandleFunc("/notification-policies/reorder", routes.HandleReorderPolicies).Methods(http.MethodPut)
+	v1.HandleFunc("/notification-policies/{id}", routes.HandleGetPolicy).Methods(http.MethodGet)
+	v1.HandleFunc("/notification-policies/{id}", routes.HandleUpdatePolicy).Methods(http.MethodPut)
+	v1.HandleFunc("/notification-policies/{id}", routes.HandleDeletePolicy).Methods(http.MethodDelete)
+
+	// Alert notification stream (SSE for web/desktop notifications)
+	v1.HandleFunc("/alerts/stream", routes.HandleStreamAlerts).Methods(http.MethodGet)
 
 	// Issue tracking
 	v1.HandleFunc("/issues", routes.HandleListIssues).Methods(http.MethodGet)

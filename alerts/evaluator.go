@@ -29,7 +29,8 @@ var validFilterColumns = map[string]bool{
 
 // Evaluator periodically evaluates alert rules
 type Evaluator struct {
-	notifier *Notifier
+	router   *Router
+	alertHub *AlertHub
 	// pendingSince tracks when a rule first entered a "pending" state (for for_seconds)
 	pendingSince map[string]time.Time
 	// lastEvaluated tracks the last evaluation time per rule to respect per-rule intervals
@@ -37,9 +38,10 @@ type Evaluator struct {
 }
 
 // NewEvaluator creates a new alert evaluator
-func NewEvaluator() *Evaluator {
+func NewEvaluator(alertHub *AlertHub) *Evaluator {
 	return &Evaluator{
-		notifier:      NewNotifier(),
+		router:        NewRouter(),
+		alertHub:      alertHub,
 		pendingSince:  make(map[string]time.Time),
 		lastEvaluated: make(map[string]time.Time),
 	}
@@ -179,7 +181,14 @@ func (e *Evaluator) onFiring(ctx context.Context, rule *Rule, state *State) {
 		Message:  msg,
 	})
 
-	e.sendNotifications(ctx, rule, msg, state.Value)
+	if e.alertHub != nil {
+		e.alertHub.PublishStateChange(rule.ID, rule.Name, "firing", msg, state.Value)
+	}
+
+	alertCtx := BuildAlertContext(ctx, rule, "firing", state.Value, msg)
+	if err := e.router.Route(ctx, alertCtx, rule); err != nil {
+		log.Printf("alert evaluator: routing failed for rule %s: %v", rule.ID, err)
+	}
 }
 
 func (e *Evaluator) onResolved(ctx context.Context, rule *Rule, state *State) {
@@ -196,24 +205,13 @@ func (e *Evaluator) onResolved(ctx context.Context, rule *Rule, state *State) {
 		Message:  msg,
 	})
 
-	e.sendNotifications(ctx, rule, msg, state.Value)
-}
-
-func (e *Evaluator) sendNotifications(ctx context.Context, rule *Rule, message string, value float64) {
-	var channelIDs []string
-	if err := json.Unmarshal([]byte(rule.NotificationChannelIDs), &channelIDs); err != nil {
-		return
+	if e.alertHub != nil {
+		e.alertHub.PublishStateChange(rule.ID, rule.Name, "resolved", msg, state.Value)
 	}
 
-	for _, chID := range channelIDs {
-		ch, err := GetChannel(ctx, chID)
-		if err != nil {
-			log.Printf("alert evaluator: failed to get channel %s: %v", chID, err)
-			continue
-		}
-		if err := e.notifier.Send(ch, rule.Name, message, value); err != nil {
-			log.Printf("alert evaluator: failed to send notification via channel %s: %v", chID, err)
-		}
+	alertCtx := BuildAlertContext(ctx, rule, "resolved", state.Value, msg)
+	if err := e.router.Route(ctx, alertCtx, rule); err != nil {
+		log.Printf("alert evaluator: routing failed for rule %s: %v", rule.ID, err)
 	}
 }
 
@@ -369,7 +367,7 @@ func CheckCondition(value float64, condition string, threshold float64) bool {
 
 func listEnabledRules(ctx context.Context) ([]Rule, error) {
 	rows, err := db.Conn.Query(ctx, fmt.Sprintf(
-		"SELECT id, name, description, type, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at FROM %s.alert_rules FINAL WHERE enabled = 1",
+		"SELECT id, name, description, type, priority, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at FROM %s.alert_rules FINAL WHERE enabled = 1",
 		db.Database,
 	))
 	if err != nil {
@@ -381,7 +379,7 @@ func listEnabledRules(ctx context.Context) ([]Rule, error) {
 	for rows.Next() {
 		var r Rule
 		var enabled uint8
-		if err := rows.Scan(&r.ID, &r.Name, &r.Description, &r.Type, &r.QueryFilters, &r.Metric, &r.Field, &r.Condition, &r.Threshold, &r.EvaluationIntervalSecs, &r.ForSeconds, &r.CooldownSeconds, &r.NotificationChannelIDs, &enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.Description, &r.Type, &r.Priority, &r.QueryFilters, &r.Metric, &r.Field, &r.Condition, &r.Threshold, &r.EvaluationIntervalSecs, &r.ForSeconds, &r.CooldownSeconds, &r.NotificationChannelIDs, &enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		r.Enabled = enabled == 1
