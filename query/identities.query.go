@@ -2,6 +2,7 @@ package query
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -21,11 +22,22 @@ type identityScanner interface {
 
 func scanIdentity(row identityScanner) (*structs.Identity, error) {
 	var i structs.Identity
+	// password_hash and identity_data are nullable; scan them through []byte
+	// intermediates because database/sql cannot store a NULL into json.RawMessage
+	// (or a named []byte type) directly. NULL → nil.
+	var passwordHash, identityData []byte
 	err := row.Scan(
 		&i.ID, &i.UserID, &i.Provider, &i.ProviderUserID, &i.ProviderEmail,
-		&i.EmailVerified, &i.PasswordHash, &i.IdentityData, &i.LastLoginAt, &i.InsertedAt,
+		&i.EmailVerified, &passwordHash, &identityData, &i.LastLoginAt, &i.InsertedAt,
 	)
-	return &i, err
+	if err != nil {
+		return nil, err
+	}
+	i.PasswordHash = passwordHash
+	if identityData != nil {
+		i.IdentityData = json.RawMessage(identityData)
+	}
+	return &i, nil
 }
 
 // GetIdentityByProviderSubject resolves the canonical (provider, sub) identity.
