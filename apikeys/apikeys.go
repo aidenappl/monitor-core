@@ -10,25 +10,22 @@ import (
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/query"
+	"github.com/aidenappl/monitor-core/structs"
 	"github.com/google/uuid"
 )
 
-// Scope defines the permission level of an API key.
-type Scope string
+// Scope and APIKey are aliased to the shared structs types so existing callers
+// (routes, middleware) keep using apikeys.APIKey / apikeys.ScopeAdmin unchanged
+// while the storage backend moved from ClickHouse to MariaDB.
+type Scope = structs.Scope
 
 const (
-	ScopeAdmin  Scope = "admin"  // Full read/write access to all routes
-	ScopeIngest Scope = "ingest" // Write-only access to /v1/events ingest
+	ScopeAdmin  = structs.ScopeAdmin
+	ScopeIngest = structs.ScopeIngest
 )
 
-type APIKey struct {
-	ID         string     `json:"id"`
-	Name       string     `json:"name"`
-	Scope      Scope      `json:"scope"`
-	KeyPrefix  string     `json:"key_prefix"`
-	CreatedAt  time.Time  `json:"created_at"`
-	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
-}
+type APIKey = structs.APIKey
 
 type CreateResult struct {
 	APIKey
@@ -47,47 +44,26 @@ var (
 	cacheMu sync.RWMutex
 )
 
-// Init creates the api_keys table if it doesn't exist, runs migrations, and loads the key cache.
+// Init loads the key cache from MariaDB. The api_keys table is created by the
+// MariaDB migration runner (db.RunMigrations), not here. The ctx parameter is
+// retained for call-site compatibility.
 func Init(ctx context.Context) error {
-	err := db.Conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS `+db.Database+`.api_keys (
-			id String,
-			name String,
-			key_hash String,
-			key_prefix String,
-			scope String DEFAULT 'admin',
-			created_at DateTime64(3, 'UTC') DEFAULT now64(3),
-			last_used_at Nullable(DateTime64(3, 'UTC'))
-		) ENGINE = MergeTree ORDER BY (id) SETTINGS index_granularity = 8192
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create api_keys table: %w", err)
-	}
-
-	// Migration: add scope column to existing tables that don't have it
-	_ = db.Conn.Exec(ctx, `ALTER TABLE `+db.Database+`.api_keys ADD COLUMN IF NOT EXISTS scope String DEFAULT 'admin'`)
-
-	return refreshCache(ctx)
+	return refreshCache()
 }
 
-func refreshCache(ctx context.Context) error {
-	rows, err := db.Conn.Query(ctx, fmt.Sprintf("SELECT id, key_hash, scope FROM %s.api_keys", db.Database))
+func refreshCache() error {
+	keys, err := query.ListAPIKeys(db.SQL)
 	if err != nil {
 		return fmt.Errorf("failed to load api keys: %w", err)
 	}
-	defer rows.Close()
 
 	newCache := make(map[string]cachedKey)
-	for rows.Next() {
-		var id, hash, scope string
-		if err := rows.Scan(&id, &hash, &scope); err != nil {
-			return fmt.Errorf("failed to scan api key: %w", err)
-		}
-		s := Scope(scope)
+	for _, k := range keys {
+		s := k.Scope
 		if s != ScopeAdmin && s != ScopeIngest {
 			s = ScopeAdmin // backward compat for keys without scope
 		}
-		newCache[hash] = cachedKey{ID: id, Scope: s}
+		newCache[k.KeyHash] = cachedKey{ID: k.ID, Scope: s}
 	}
 
 	cacheMu.Lock()
@@ -136,10 +112,14 @@ func Create(ctx context.Context, name string, scope Scope) (*CreateResult, error
 	prefix := rawKey[:12]
 	now := time.Now().UTC()
 
-	err = db.Conn.Exec(ctx, fmt.Sprintf(
-		"INSERT INTO %s.api_keys (id, name, key_hash, key_prefix, scope, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-		db.Database,
-	), id, name, hash, prefix, string(scope), now)
+	err = query.CreateAPIKey(db.SQL, query.CreateAPIKeyRequest{
+		ID:        id,
+		Name:      name,
+		KeyHash:   hash,
+		KeyPrefix: prefix,
+		Scope:     scope,
+		CreatedAt: now,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert api key: %w", err)
 	}
@@ -163,51 +143,35 @@ func Create(ctx context.Context, name string, scope Scope) (*CreateResult, error
 
 // List returns all API keys (without the raw key or hash).
 func List(ctx context.Context) ([]APIKey, error) {
-	rows, err := db.Conn.Query(ctx, fmt.Sprintf(
-		"SELECT id, name, key_prefix, scope, created_at, last_used_at FROM %s.api_keys ORDER BY created_at DESC",
-		db.Database,
-	))
+	keys, err := query.ListAPIKeys(db.SQL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list api keys: %w", err)
 	}
-	defer rows.Close()
-
-	var keys []APIKey
-	for rows.Next() {
-		var k APIKey
-		var scope string
-		if err := rows.Scan(&k.ID, &k.Name, &k.KeyPrefix, &scope, &k.CreatedAt, &k.LastUsedAt); err != nil {
-			return nil, fmt.Errorf("failed to scan api key: %w", err)
+	for i := range keys {
+		if keys[i].Scope != ScopeAdmin && keys[i].Scope != ScopeIngest {
+			keys[i].Scope = ScopeAdmin
 		}
-		k.Scope = Scope(scope)
-		if k.Scope != ScopeAdmin && k.Scope != ScopeIngest {
-			k.Scope = ScopeAdmin
-		}
-		keys = append(keys, k)
 	}
 	return keys, nil
 }
 
 // Delete removes an API key by ID.
 func Delete(ctx context.Context, id string) error {
-	// Get the hash before deleting so we can remove from cache
-	var hash string
-	row := db.Conn.QueryRow(ctx, fmt.Sprintf(
-		"SELECT key_hash FROM %s.api_keys WHERE id = ?", db.Database,
-	), id)
-	if err := row.Scan(&hash); err != nil {
+	// Get the hash before deleting so we can remove from cache.
+	existing, err := query.GetAPIKeyByID(db.SQL, id)
+	if err != nil {
+		return fmt.Errorf("failed to look up api key: %w", err)
+	}
+	if existing == nil {
 		return fmt.Errorf("api key not found")
 	}
 
-	err := db.Conn.Exec(ctx, fmt.Sprintf(
-		"ALTER TABLE %s.api_keys DELETE WHERE id = ?", db.Database,
-	), id)
-	if err != nil {
+	if err := query.DeleteAPIKey(db.SQL, id); err != nil {
 		return fmt.Errorf("failed to delete api key: %w", err)
 	}
 
 	cacheMu.Lock()
-	delete(cache, hash)
+	delete(cache, existing.KeyHash)
 	cacheMu.Unlock()
 
 	return nil

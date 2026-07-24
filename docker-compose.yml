@@ -56,6 +56,35 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+      mariadb:
+        condition: service_healthy
+    labels:
+      - "com.docker.compose.project=monitor-core"
+      - "traefik.enable=false"
+
+  mariadb:
+    image: mariadb:11.4
+    container_name: monitor-mariadb
+    ports:
+      - "3336:3306"
+    environment:
+      MARIADB_DATABASE: monitor_auth
+      MARIADB_USER: ${MARIADB_USERNAME:-monitor}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    restart: unless-stopped
+    networks:
+      - monitor-network
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "healthcheck.sh --connect --innodb_initialized || exit 1"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     labels:
       - "com.docker.compose.project=monitor-core"
       - "traefik.enable=false"
@@ -101,3 +130,4 @@ networks:
 volumes:
   clickhouse-data:
   clickhouse-logs:
+  mariadb-data:

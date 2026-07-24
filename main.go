@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,23 +12,33 @@ import (
 	"syscall"
 	"time"
 
-	forta "github.com/aidenappl/go-forta"
 	"github.com/aidenappl/go-keyring"
 	"github.com/aidenappl/monitor-core/alerts"
 	"github.com/aidenappl/monitor-core/apikeys"
+	"github.com/aidenappl/monitor-core/bootstrap"
 	"github.com/aidenappl/monitor-core/dashboards"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/issues"
 	"github.com/aidenappl/monitor-core/middleware"
+	"github.com/aidenappl/monitor-core/migrations"
 	"github.com/aidenappl/monitor-core/routes"
 	"github.com/aidenappl/monitor-core/services"
+	"github.com/aidenappl/monitor-core/sso"
 	"github.com/aidenappl/monitor-core/views"
 	"github.com/gorilla/mux"
 	"github.com/rs/cors"
 )
 
 func main() {
+	// Operator one-off: -backfill-forta <file.json> pre-provisions existing Forta
+	// users (see runFortaBackfill / bootstrap.BackfillFortaUsers) then exits
+	// WITHOUT starting the HTTP server. Empty (the default) leaves normal startup
+	// completely unaffected. Kept in main.go so the single-file `./main.go` Docker
+	// build stays intact (no second package-main file).
+	backfillFortaPath := flag.String("backfill-forta", "", "path to a JSON array of Forta users to pre-provision, then exit")
+	flag.Parse()
+
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -47,33 +59,11 @@ func main() {
 		log.Fatal("FATAL: MONITOR_API_KEY must be set — refusing to start without ingest authentication")
 	}
 
-	// Set up Forta OAuth2 authentication (optional — skipped if credentials are absent).
-	if env.FortaClientID != "" && env.FortaClientSecret != "" {
-		fmt.Print("Connecting to Forta... ")
-		if err := forta.Setup(forta.Config{
-			AppDomain:          env.FortaAppDomain,
-			APIDomain:          env.FortaAPIDomain,
-			LoginDomain:        env.FortaLoginDomain,
-			ClientID:           env.FortaClientID,
-			ClientSecret:       env.FortaClientSecret,
-			CallbackURL:        env.FortaCallbackURL,
-			JWTSigningKey:      env.FortaJWTSigningKey,
-			PostLoginRedirect:  env.FortaPostLoginRedirect,
-			PostLogoutRedirect: env.FortaPostLogoutRedirect,
-			CookieDomain:       env.FortaCookieDomain,
-			CookieInsecure:     env.FortaCookieInsecure,
-			FetchUserOnProtect: env.FortaFetchUserOnProtect,
-			DisableAutoRefresh: env.FortaDisableAutoRefresh,
-			EnforceGrants:      env.FortaEnforceGrants,
-		}); err != nil {
-			log.Printf("WARNING: forta setup failed: %v", err)
-		} else if err := forta.Ping(); err != nil {
-			log.Printf("WARNING: forta unreachable: %v", err)
-		} else {
-			fmt.Println("✅ Done")
-		}
-	} else {
-		log.Println("WARNING: FORTA_CLIENT_ID / FORTA_CLIENT_SECRET not set, Forta auth disabled")
+	// Refuse to start in production on the committed dev-default JWT/crypto keys
+	// (would allow forged admin sessions / decryptable SSO secrets). Set
+	// MON_COOKIE_INSECURE=true for local dev to permit the fallbacks.
+	if err := env.RequireProductionSecrets(); err != nil {
+		log.Fatalf("FATAL: %v", err)
 	}
 
 	// Handle shutdown signals
@@ -86,7 +76,53 @@ func main() {
 	}
 	defer db.Close()
 
-	// Initialize API key management (auto-creates table if needed)
+	// Apply the ClickHouse schema migrations (events + api_keys) at startup.
+	// Ingestion and queries depend on monitor.events existing, so this is
+	// fail-fast — a fresh deploy no longer needs a manual `dev migrate` step.
+	if err := migrations.RunMigrations(ctx); err != nil {
+		log.Fatalf("❌ failed to run ClickHouse migrations: %v", err)
+	}
+
+	// Connect to MariaDB (relational auth data layer: users, identities,
+	// refresh_tokens, sso_providers, sso_sessions, settings, api_keys).
+	if err := db.InitSQL(); err != nil {
+		log.Fatalf("❌ failed to connect to MariaDB: %v", err)
+	}
+	defer db.CloseSQL()
+
+	// Apply the MariaDB auth-schema migrations at startup.
+	if err := db.RunMigrations(); err != nil {
+		log.Fatalf("❌ failed to run MariaDB migrations: %v", err)
+	}
+
+	// Seed the first admin user on a fresh database (no-op once any user exists).
+	if err := bootstrap.EnsureAdminUser(db.SQL); err != nil {
+		log.Fatalf("❌ failed to bootstrap admin user: %v", err)
+	}
+
+	// Seed the Forta SSO provider row (migration path) when MON_SSO_FORTA_* is
+	// configured. Idempotent and additive — a no-op if the row already exists or
+	// Forta is unconfigured. A missing Forta config just means no Forta button, so
+	// this logs and continues (never fatal).
+	if err := bootstrap.EnsureFortaProvider(db.SQL); err != nil {
+		log.Printf("WARNING: failed to seed Forta SSO provider: %v", err)
+	}
+
+	// Operator one-off: -backfill-forta <file.json> pre-provisions existing Forta
+	// users and exits (no server). Runs after migrations + provider seed so the
+	// tables and forta row exist.
+	if *backfillFortaPath != "" {
+		if err := runFortaBackfill(*backfillFortaPath); err != nil {
+			log.Fatalf("❌ forta backfill failed: %v", err)
+		}
+		os.Exit(0)
+	}
+
+	// Wire the SSO revocation checkpoint into SessionMiddleware. Until this runs
+	// the hook is nil and the checkpoint is skipped.
+	sso.Install()
+
+	// Initialize API key management (loads the key cache from MariaDB)
 	if err := apikeys.Init(ctx); err != nil {
 		log.Printf("WARNING: failed to initialize api keys: %v", err)
 	}
@@ -151,21 +187,40 @@ func main() {
 	r.Use(middleware.RequestIDMiddleware)
 	r.Use(middleware.LoggingMiddleware)
 	r.Use(middleware.MuxHeaderMiddleware)
+	// Double-submit CSRF for cookie-authenticated browsers. Safe methods, Bearer
+	// clients, and X-Api-Key clients (ingestion) are exempt, so this does not
+	// affect the go-monitor ingest path or API-key query callers.
+	r.Use(middleware.CSRFMiddleware)
 
 	r.HandleFunc("/health", routes.HealthHandler).Methods(http.MethodGet)
 
-	// Forta OAuth2 routes (unprotected — browser navigates here directly)
-	r.HandleFunc("/forta/login", forta.LoginHandler).Methods(http.MethodGet)
-	r.HandleFunc("/forta/callback", forta.CallbackHandler).Methods(http.MethodGet)
-	r.HandleFunc("/forta/logout", forta.LogoutHandler).Methods(http.MethodGet)
+	// Native session auth (Monitor-owned JWT). Forta is gone; it is now just one
+	// SSO provider row, mounted below via RegisterSSORoutes.
+	//   /auth/login, /auth/register — public, CSRF-exempt (no session yet).
+	//   /auth/refresh — public, CSRF-exempt (authenticates via the refresh cookie).
+	//   /auth/logout, /auth/self* — behind SessionMiddleware.
+	r.HandleFunc("/auth/login", routes.HandleLogin).Methods(http.MethodPost)
+	if env.AllowRegistration {
+		r.HandleFunc("/auth/register", routes.HandleRegister).Methods(http.MethodPost)
+	}
+	r.HandleFunc("/auth/refresh", routes.HandleRefresh).Methods(http.MethodPost)
+	r.HandleFunc("/auth/logout", middleware.Protected(routes.HandleLogout)).Methods(http.MethodPost)
 
-	// Authenticated self endpoint — returns the current Forta user
-	r.HandleFunc("/self", forta.Protected(routes.HandleGetSelf)).Methods(http.MethodGet)
+	// Current-user profile + linked sign-in methods (all Protected).
+	r.HandleFunc("/auth/self", middleware.Protected(routes.HandleGetSelf)).Methods(http.MethodGet)
+	r.HandleFunc("/auth/self", middleware.Protected(routes.HandleUpdateSelf)).Methods(http.MethodPut)
+	r.HandleFunc("/auth/self/identities", middleware.Protected(routes.HandleListIdentities)).Methods(http.MethodGet)
+	r.HandleFunc("/auth/self/identities/{slug}", middleware.Protected(routes.HandleLinkIdentity)).Methods(http.MethodPost)
+	r.HandleFunc("/auth/self/identities/{slug}", middleware.Protected(routes.HandleUnlinkIdentity)).Methods(http.MethodDelete)
 
-	// Event ingestion — authenticated by X-Ingest-Key (used by go-monitor)
+	// Pluggable SSO subsystem (Phase 3A): /auth/sso/config, /auth/sso/{slug}/login,
+	// /auth/sso/{slug}/callback, and the /admin/sso-providers CRUD.
+	routes.RegisterSSORoutes(r)
+
+	// Event ingestion — authenticated by X-Api-Key (used by go-monitor)
 	r.HandleFunc("/v1/events", middleware.IngestAuthMiddleware(routes.IngestEventsHandler)).Methods(http.MethodPost)
 
-	// V1 API routes — protected by API key or Forta JWT
+	// V1 API routes — protected by API key or a Monitor session
 	v1 := r.PathPrefix("/v1").Subrouter()
 	v1.Use(middleware.QueryAuthMiddleware)
 
@@ -184,7 +239,7 @@ func main() {
 	v1.HandleFunc("/gauge", routes.GaugeHandler).Methods(http.MethodPost)
 	v1.HandleFunc("/compare", routes.CompareHandler).Methods(http.MethodPost)
 
-	// API key management — protected by Forta (admin UI only)
+	// API key management — protected by the session/API-key middleware (admin UI)
 	v1.HandleFunc("/api-keys", routes.HandleListAPIKeys).Methods(http.MethodGet)
 	v1.HandleFunc("/api-keys", routes.HandleCreateAPIKey).Methods(http.MethodPost)
 	v1.HandleFunc("/api-keys/{id}", routes.HandleDeleteAPIKey).Methods(http.MethodDelete)
@@ -252,7 +307,7 @@ func main() {
 			"http://localhost:*",
 		},
 		AllowCredentials: true,
-		AllowedHeaders:   []string{"X-Requested-With", "Content-Type", "Origin", "Authorization", "Accept", "Referer", "Dnt", "User-Agent", "X-Api-Key"},
+		AllowedHeaders:   []string{"X-Requested-With", "Content-Type", "Origin", "Authorization", "Accept", "Referer", "Dnt", "User-Agent", "X-Api-Key", "X-CSRF-Token"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 	})
 
@@ -291,4 +346,45 @@ func main() {
 	time.Sleep(2 * time.Second)
 
 	log.Println("shutdown complete")
+}
+
+// runFortaBackfill reads a JSON array of Forta users from path and pre-provisions
+// them as ACTIVE Monitor accounts with linked "forta" identities, so existing
+// Forta users are never provisioned as "pending" on their first post-cutover
+// "Continue with Forta". Idempotent — a second run reports every user as skipped.
+//
+// The file is a JSON array of objects:
+//
+//	[
+//	  {"subject": "forta-user-id", "email": "a@b.com", "email_verified": true,
+//	   "name": "Ada Lovelace", "role": "admin"},
+//	  ...
+//	]
+//
+// where "role" is one of admin|editor|viewer (the operator's mapping of the
+// user's Forta grant/role → Monitor role) and "subject" is the Forta subject id
+// (the identity key — never the email).
+func runFortaBackfill(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+
+	var seeds []bootstrap.FortaUserSeed
+	if err := json.Unmarshal(raw, &seeds); err != nil {
+		return fmt.Errorf("parse %s (expected a JSON array of {subject,email,email_verified,name,role}): %w", path, err)
+	}
+	if len(seeds) == 0 {
+		return fmt.Errorf("%s contained no users", path)
+	}
+
+	log.Printf("forta backfill: processing %d user(s) from %s", len(seeds), path)
+	result, err := bootstrap.BackfillFortaUsers(db.SQL, seeds)
+	// Always report what happened, even on a partial failure.
+	log.Printf("forta backfill: created=%d linked=%d skipped=%d", result.Created, result.Linked, result.Skipped)
+	if err != nil {
+		return err
+	}
+	log.Println("forta backfill: done")
+	return nil
 }

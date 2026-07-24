@@ -3,13 +3,14 @@ package middleware
 import (
 	"net/http"
 
-	forta "github.com/aidenappl/go-forta"
 	"github.com/aidenappl/monitor-core/apikeys"
 	"github.com/aidenappl/monitor-core/env"
 )
 
 // QueryAuthMiddleware authenticates query/analytics requests.
-// Accepts: env-based master key, DB-stored admin-scoped keys, or a valid Forta JWT.
+// Accepts: env-based master key, DB-stored admin-scoped keys, or a valid Monitor
+// session (mon-access-token cookie or Bearer access JWT — validated exactly as
+// SessionMiddleware does, including the SSO revocation checkpoint).
 // Rejects: ingest-scoped keys (they are write-only).
 func QueryAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -31,6 +32,10 @@ func QueryAuthMiddleware(next http.Handler) http.Handler {
 				return
 			}
 		}
-		forta.Protected(next.ServeHTTP)(w, r)
+
+		// Fall back to a Monitor-owned session. SessionMiddleware validates the
+		// access JWT (cookie or Bearer), loads the active user, runs the SSO
+		// checkpoint, injects the user into context, and 401s on failure.
+		SessionMiddleware(next).ServeHTTP(w, r)
 	})
 }

@@ -1,15 +1,19 @@
 # monitor-core
 
-A high-performance event ingestion service that receives monitoring events via HTTP and writes them to ClickHouse in batches.
+The event ingestion, query, and observability API for the Monitor platform — a
+high-performance service that ingests monitoring events into ClickHouse and owns
+identity/authentication (native accounts + pluggable SSO) in MariaDB.
+
+> **Monitor platform** · Go API · `monitor.appleby.cloud` (Lattice)
 
 ## Architecture
 
 ```
-go services
-  ↓ (batched NDJSON over HTTP)
-monitor-core
-  ↓ (batched inserts)
-ClickHouse
+go services (go-monitor / monitor-js SDK)          monitor-web (Next.js)
+  ↓ (batched NDJSON over HTTP, X-Api-Key)             ↓ (proxy: mon-* cookies + X-CSRF-Token)
+monitor-core ──────────────────────────────────────────────────────────
+  ↓ (batched inserts)          ↓ (auth: users, identities, sessions, SSO)
+ClickHouse (events)          MariaDB (monitor_auth)
 ```
 
 ## Features
@@ -19,41 +23,58 @@ ClickHouse
 - **Streaming parser**: Processes events line-by-line without loading entire body into memory
 - **Batched writes**: Collects events and writes to ClickHouse in configurable batches
 - **Non-blocking ingestion**: HTTP handler enqueues events and returns immediately
-- **Simple API key authentication**: Via `X-Api-Key` header
+- **Query + analytics API**: search, autocomplete, aggregation, time series, top-N, gauge, compare
+- **Alerting, issues, dashboards, saved views** and two SSE streams (live tail + alert feed)
+- **Native authentication**: email+password accounts (bcrypt 12) + Monitor-owned HS512
+  JWT sessions (15m access / rotating 7d refresh with reuse detection)
+- **Pluggable SSO**: config-driven OIDC/OAuth2 providers with true account linking (one
+  user, many identities); Forta is one provider among many
+- **API-key authentication** for ingest/query: via the `X-Api-Key` header
 
 ## Quick Start
 
-### 1. Start local ClickHouse
+### 1. Start local ClickHouse + MariaDB
 
 ```bash
 dev up
 ```
 
-Or manually:
+`dev up` brings up both datastores from `docker-compose.yml`: ClickHouse (events) and
+MariaDB (`monitor_auth`, host port 3336 — the auth data layer).
+
+### 2. Schema migrations (automatic)
+
+Both schemas are applied **automatically at startup**, fail-fast:
+
+- **ClickHouse** — `migrations/embed.go` embeds `migrations/*.sql` (idempotent
+  `IF NOT EXISTS`), run from `main.go` right after connecting.
+- **MariaDB** — `db/sql.go`'s `db.RunMigrations()` embeds `db/migrations/*.sql`, runs each
+  once, tracked in a `migrations_applied` table.
+
+A fresh deploy self-migrates — no manual step is required.
+
+### 3. Configure environment
+
+`MONITOR_API_KEY` is **required** — the master ingest/query key (header `X-Api-Key`); the
+server refuses to start without it. In a **production profile** (`MON_COOKIE_INSECURE`
+unset/false) the server also refuses to start unless `MON_JWT_SIGNING_KEY` and a 32-byte
+`MON_CRYPTO_KEY` are set to non-default values.
 
 ```bash
-docker-compose -f docker-compose.dev.yml up -d
+# Ingest/query
+export MONITOR_API_KEY="your-secret-key"
+
+# Auth (local dev — allows the dev-default session/crypto keys)
+export MON_COOKIE_INSECURE=true
+export MON_DB_DSN="monitor:monitor@tcp(127.0.0.1:3336)/monitor_auth"
+export MON_ADMIN_EMAIL="you@example.com"     # seeds the first admin on a fresh DB
+export MON_ADMIN_PASSWORD="a-strong-password"
 ```
 
-### 2. Run schema migrations
-
-```bash
-dev migrate
-```
-
-Or manually:
-
-```bash
-for f in migrations/*.sql; do clickhouse-client < "$f"; done
-```
-
-### 3. Configure environment (optional)
-
-```bash
-export API_KEY="your-secret-key"
-```
-
-All other defaults work with `dev up`.
+To sign in with SSO locally, add a provider via `POST /admin/sso-providers` (or set the
+`MON_SSO_FORTA_*` vars to seed the Forta button). See the full env table under
+[Configuration](#configuration) and the auth model in
+[AGENTS.md](./AGENTS.md) §6. All other defaults work with `dev up`.
 
 ### 4. Run the service
 
@@ -477,6 +498,39 @@ Response:
 
 If `compare_from`/`compare_to` are not specified, the previous period is auto-calculated based on the duration of the current period.
 
+## Authentication
+
+Monitor owns identity end-to-end (it no longer delegates to Forta). Two credential kinds
+coexist:
+
+- **API keys** (`X-Api-Key`) — for ingestion (`POST /v1/events`, admin or ingest scope)
+  and machine query callers (admin scope). The env master key is `MONITOR_API_KEY`.
+- **Sessions** — for the `monitor-web` dashboard. Native email+password accounts (bcrypt
+  cost 12) or pluggable SSO mint a Monitor-owned HS512 JWT session: a 15-minute access
+  token and a rotating 7-day refresh token with reuse detection. Delivered as the `mon-*`
+  cookies (`mon-access-token`, `mon-refresh-token`, `mon-logged-in`, `mon-csrf`); unsafe
+  requests are CSRF-protected via a double-submit `mon-csrf` ↔ `X-CSRF-Token` check.
+
+Auth/identity data lives in MariaDB (`monitor_auth`): `users`, `identities`
+(`UNIQUE(provider, provider_user_id)` — true account linking, one user ↔ many sign-in
+methods), `refresh_tokens`, `sso_providers`, `sso_sessions`, `settings`, `api_keys`.
+
+Endpoint surface (browser/cookie-oriented, outside `/v1`):
+
+```
+POST   /auth/login | /auth/register | /auth/refresh | /auth/logout
+GET/PUT /auth/self
+GET    /auth/self/identities   POST/DELETE /auth/self/identities/{slug}
+GET    /auth/sso/config | /auth/sso/{slug}/login | /auth/sso/{slug}/callback
+GET/POST /admin/sso-providers   PUT/DELETE /admin/sso-providers/{slug}   (admin only)
+```
+
+SSO providers are config rows (OIDC via discovery, or explicit-URL OAuth2 — how Forta
+plugs in). Linking is nOAuth-safe: identity is keyed on `(provider, subject)`, and
+link-on-login only fires when both the IdP email and the existing account email are
+verified. Existing Forta users are migrated with `./monitor-core -backfill-forta
+users.json` (see [MIGRATION.md](./MIGRATION.md)). Full details in [AGENTS.md](./AGENTS.md) §6.
+
 ## Configuration
 
 | Environment Variable  | Default          | Description                                   |
@@ -486,10 +540,19 @@ If `compare_from`/`compare_to` are not specified, the previous period is auto-ca
 | `CLICKHOUSE_DATABASE` | `monitor`        | ClickHouse database name                      |
 | `CLICKHOUSE_USERNAME` | `default`        | ClickHouse username                           |
 | `CLICKHOUSE_PASSWORD` | ``               | ClickHouse password                           |
-| `API_KEY`             | ``               | API key for authentication (empty = disabled) |
+| `MONITOR_API_KEY`     | *(required)*     | Master API key (header `X-Api-Key`); server refuses to start if unset |
 | `BATCH_SIZE`          | `1000`           | Number of events per batch insert             |
 | `FLUSH_INTERVAL`      | `5s`             | Max time to wait before flushing batch        |
 | `QUEUE_SIZE`          | `100000`         | Max events in memory queue                    |
+| `MON_DB_DSN`          | `monitor:monitor@tcp(127.0.0.1:3336)/monitor_auth` | MariaDB DSN (auth data layer); from Keyring in prod |
+| `MON_JWT_SIGNING_KEY` | *(dev default)*  | HS512 session-token key; **prod must override** |
+| `MON_CRYPTO_KEY`      | *(dev default)*  | **Exactly 32 bytes** — AES-256-GCM key for SSO secrets/tokens; **prod must override** |
+| `MON_COOKIE_DOMAIN`   | ``               | Domain set on the `mon-*` cookies             |
+| `MON_COOKIE_INSECURE` | `false`          | `true` for local dev: drops `Secure`, allows dev-default secrets |
+| `MON_PUBLIC_URL`      | `https://monitor.appleby.cloud` | Origin used to build each SSO `redirect_uri`; must match the IdP registration |
+| `MON_ADMIN_EMAIL` / `MON_ADMIN_PASSWORD` | `` | Seed the first admin on a fresh DB; empty = no seed |
+| `MON_ALLOW_REGISTRATION` | `false`       | Gates `POST /auth/register` (self-registration) |
+| `MON_SSO_FORTA_*`     | ``               | Seed the `forta` SSO provider row; all empty = no Forta button (secret is a Keyring ref) |
 
 ## Limits
 
@@ -505,46 +568,46 @@ Use the `dev` CLI for common tasks:
 
 ```bash
 dev help                  # List available commands
-dev up                    # Start local ClickHouse
-dev migrate               # Run schema migrations
-dev run                   # Run the application
+dev up                    # Start local ClickHouse + MariaDB
+dev run                   # Run the app (auto-migrates both schemas at startup)
 dev check                 # Format, vet, and test
-dev down                  # Stop local ClickHouse
+dev down                  # Stop the local stack
 ```
 
 ## Project Structure
 
 ```
 monitor-core/
-  main.go                     # Entry point with routes
+  main.go                     # Entry: config, DB connects + migrations, bootstrap, sso.Install(), routes
   Devfile.yaml                # Dev CLI commands
-  Dockerfile                  # Multi-stage production build
-  docker-compose.yml          # Production stack
-  docker-compose.dev.yml      # Local development with ClickHouse
+  Dockerfile                  # Multi-stage production build (builds ./main.go)
+  docker-compose.yml          # Production stack: monitor-core + ClickHouse + MariaDB (+ monitor-web)
+  docker-compose.dev.yml      # Local development stack
+  MIGRATION.md                # Forta→native cutover runbook (backfill)
   db/
-    clickhouse.go             # ClickHouse connection and batch writer
-  env/
-    env.go                    # Environment configuration
+    clickhouse.go             # ClickHouse connection and batch writer (events)
+    sql.go                    # MariaDB connection (db.SQL), db.Queryable, db.RunMigrations
+    migrations/               # MariaDB auth-schema DDL (100_users … 107_sso_trust_email_verified)
+  env/env.go                  # Environment configuration + RequireProductionSecrets guard
+  jwt/jwt.go                  # Monitor-owned HS512 access/refresh JWTs (alg-pinned)
+  tools/                      # Password.tool.go (bcrypt 12), Crypto.go (AES-256-GCM), Validate.tool.go
+  bootstrap/                  # First-run seeding: admin.go, forta_provider.go, forta_backfill.go
+  sso/                        # Pluggable SSO: adapters (oidc.go, forta.go), resolve.go, checkpoint.go, state.go
+  query/                      # MariaDB query layer (squirrel): users/identities/refresh_tokens/sso_*/api_keys
+  structs/                    # User/Identity/SSOProvider/SSOSession/RefreshToken/APIKey + event/analytics
   middleware/
-    auth.go                   # API key authentication middleware
-    logging.go                # Request logging middleware
-  responder/
-    responder.go              # Standardized JSON response utilities
-  routes/
-    events.go                 # Event ingestion handler
-    query.go                  # Event query and autocomplete handlers
-    analytics.go              # Analytics, time series, and gauge handlers
-  services/
-    queue.go                  # Buffered event queue
-    batcher.go                # Batch collection and flushing
-    query.go                  # Query building and execution
-    analytics.go              # Analytics query engine
-  structs/
-    event.go                  # Event struct and validation
-    analytics.go              # Analytics query and result types
+    session.go                # Monitor session auth + Protected/RequireAdmin/RequireEditor/RejectPending
+    csrf.go                   # Double-submit CSRF (mon-csrf ↔ X-CSRF-Token)
+    ingest_auth.go            # X-Api-Key auth for POST /v1/events
+    query_auth.go             # X-Api-Key (admin) OR Monitor session for /v1/* reads
+    logging.go header.go      # Request logging (SSE-safe) + Server header
+  responder/responder.go      # Standardized JSON response utilities
+  routes/                     # HTTP handlers (thin) — auth + SSO + events/query/analytics/… (see routes/AGENTS.md)
+  services/                   # queue.go batcher.go hub.go query.go analytics.go (ingestion + query engines)
+  apikeys/ alerts/ issues/ dashboards/ views/   # Subsystems (each Init()s from main.go)
   migrations/
-    001_schema.sql            # ClickHouse schema
-    002_add_user_id.sql       # User ID column migration
+    embed.go                  # In-app ClickHouse migration runner (//go:embed *.sql)
+    001_schema.sql 002_add_user_id.sql 003_api_keys.sql
 ```
 
 ## Querying Events
