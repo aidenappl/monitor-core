@@ -67,13 +67,13 @@ func HandleUpdateAlertRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var rule alerts.Rule
-	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+	var req alerts.UpdateRuleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	updated, err := alerts.UpdateRule(r.Context(), id, rule)
+	updated, err := alerts.UpdateRule(r.Context(), id, req)
 	if err != nil {
 		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
@@ -110,18 +110,17 @@ func HandleTestAlertRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	value, err := alerts.EvaluateRuleNow(r.Context(), &ruleWithState.Rule)
+	value, firing, err := alerts.EvaluateRuleNow(r.Context(), &ruleWithState.Rule)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to evaluate alert rule", err)
 		return
 	}
 
-	firing := alerts.CheckCondition(value, ruleWithState.Condition, ruleWithState.Threshold)
-
 	responder.New(w, map[string]interface{}{
 		"value":     value,
 		"threshold": ruleWithState.Threshold,
 		"condition": ruleWithState.Condition,
+		"type":      ruleWithState.Type,
 		"firing":    firing,
 	})
 }
@@ -242,11 +241,17 @@ func HandleStreamAlerts(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+
+	// Clear the server's WriteTimeout for this connection so the SSE stream is
+	// not severed after WriteTimeout (30s in main.go). Relies on the logging
+	// middleware exposing Unwrap() so the controller can reach the raw conn.
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Time{})
+
 	flusher.Flush()
 
 	log.Printf("alert SSE subscriber connected: %s", sub.ID)
 
-	rc := http.NewResponseController(w)
 	keepalive := time.NewTicker(15 * time.Second)
 	defer keepalive.Stop()
 

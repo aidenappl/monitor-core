@@ -20,6 +20,10 @@ func QueryEventsHandler(w http.ResponseWriter, r *http.Request) {
 
 	result, err := services.QueryEvents(r.Context(), params)
 	if err != nil {
+		if isFilterValidationError(err) {
+			responder.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to query events", err)
 		return
 	}
@@ -40,7 +44,7 @@ func GetLabelValuesHandler(w http.ResponseWriter, r *http.Request) {
 
 	result, err := services.GetLabelValues(r.Context(), label, params)
 	if err != nil {
-		if strings.Contains(err.Error(), "invalid label") {
+		if strings.Contains(err.Error(), "invalid label") || isFilterValidationError(err) {
 			responder.Error(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -60,6 +64,10 @@ func GetDataKeysHandler(w http.ResponseWriter, r *http.Request) {
 
 	result, err := services.GetDataKeys(r.Context(), params)
 	if err != nil {
+		if isFilterValidationError(err) {
+			responder.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to get data keys", err)
 		return
 	}
@@ -82,11 +90,27 @@ func GetDataValuesHandler(w http.ResponseWriter, r *http.Request) {
 
 	result, err := services.GetDataValues(r.Context(), key, params)
 	if err != nil {
+		if isFilterValidationError(err) {
+			responder.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to get data values", err)
 		return
 	}
 
 	responder.New(w, result.Values)
+}
+
+// isFilterValidationError reports whether err is a caller-fixable filter error
+// (bad column / bad data field name) that should map to 400 rather than 500.
+func isFilterValidationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "invalid filter column") ||
+		strings.Contains(msg, "invalid data field name") ||
+		strings.Contains(msg, "invalid filter field")
 }
 
 // reservedParams are query params that are not filters

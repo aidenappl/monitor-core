@@ -38,8 +38,32 @@ var (
 	urlRegex    = regexp.MustCompile(`https?://[^\s]+`)
 )
 
-// Init creates the issues table if it doesn't exist
+// Worker-pool configuration for error tracking. Error/fatal events are enqueued
+// onto trackQueue (non-blocking) and drained by a small fixed pool of workers, so
+// an error storm can't spawn unbounded goroutines and shutdown is respected.
+const (
+	trackQueueSize = 1000
+	trackWorkers   = 4
+)
+
+// trackQueue buffers error events awaiting issue tracking. Initialized in Init.
+var trackQueue chan trackJob
+
+// trackJob carries a single error event and the context under which it was
+// captured for the worker pool to process.
+type trackJob struct {
+	event *structs.Event
+}
+
+// Init creates the issues table if it doesn't exist and starts the error-tracking
+// worker pool. The passed ctx is the application shutdown context — workers exit
+// when it is cancelled.
 func Init(ctx context.Context) error {
+	trackQueue = make(chan trackJob, trackQueueSize)
+	for i := 0; i < trackWorkers; i++ {
+		go trackWorker(ctx)
+	}
+
 	if err := db.Conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS `+db.Database+`.issues (
 			id String,
@@ -69,8 +93,42 @@ func Init(ctx context.Context) error {
 	return nil
 }
 
-// TrackError tracks an error event, creating or updating an issue
-func TrackError(ctx context.Context, event *structs.Event) {
+// TrackError enqueues an error event for issue tracking. It is non-blocking: if
+// the worker queue is full (or not yet initialized), the event is dropped and a
+// warning logged rather than blocking the ingestion path or spawning a goroutine.
+func TrackError(event *structs.Event) {
+	if trackQueue == nil {
+		return
+	}
+	select {
+	case trackQueue <- trackJob{event: event}:
+	default:
+		log.Printf("issues: track queue full, dropping error event %s/%s", event.Service, event.Name)
+	}
+}
+
+// trackWorker drains the track queue, processing one error event at a time until
+// the application context is cancelled.
+func trackWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job := <-trackQueue:
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("issues: panic tracking error: %v", r)
+					}
+				}()
+				processError(ctx, job.event)
+			}()
+		}
+	}
+}
+
+// processError creates or updates an issue for an error event.
+func processError(ctx context.Context, event *structs.Event) {
 	path := extractPath(event)
 	message := extractMessage(event, path)
 	fingerprint := generateFingerprint(event.Service, event.Name, message, path)

@@ -45,6 +45,27 @@ type Rule struct {
 	UpdatedAt              time.Time `json:"updated_at"`
 }
 
+// UpdateRuleRequest is the partial-update payload for PUT /v1/alert-rules/{id}.
+// Every field is a pointer so an ABSENT field (nil) is distinguishable from a
+// zero/false value. Only non-nil fields are applied; omitting a field preserves
+// the current value — critically, omitting `enabled` no longer disables the rule.
+type UpdateRuleRequest struct {
+	Name                   *string  `json:"name"`
+	Description            *string  `json:"description"`
+	Type                   *string  `json:"type"`
+	Priority               *string  `json:"priority"`
+	QueryFilters           *string  `json:"query_filters"`
+	Metric                 *string  `json:"metric"`
+	Field                  *string  `json:"field"`
+	Condition              *string  `json:"condition"`
+	Threshold              *float64 `json:"threshold"`
+	EvaluationIntervalSecs *uint32  `json:"evaluation_interval_seconds"`
+	ForSeconds             *uint32  `json:"for_seconds"`
+	CooldownSeconds        *uint32  `json:"cooldown_seconds"`
+	NotificationChannelIDs *string  `json:"notification_channel_ids"`
+	Enabled                *bool    `json:"enabled"`
+}
+
 // RuleWithState combines a rule with its current state
 type RuleWithState struct {
 	Rule
@@ -317,54 +338,78 @@ func getRuleOnly(ctx context.Context, id string) (*Rule, error) {
 	return &r, nil
 }
 
-// UpdateRule updates an existing alert rule
-func UpdateRule(ctx context.Context, id string, rule Rule) (*Rule, error) {
+// UpdateRule applies a partial update to an existing alert rule. Only fields set
+// (non-nil) in the request are changed; absent fields preserve their current
+// value. Enum-constrained fields are validated when provided; numeric fields can
+// be set to 0 and `enabled` can be set to false because pointers distinguish
+// "absent" from "zero".
+func UpdateRule(ctx context.Context, id string, req UpdateRuleRequest) (*Rule, error) {
 	existing, err := getRuleOnly(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 
-	if rule.Name != "" {
-		existing.Name = rule.Name
+	if req.Name != nil {
+		if *req.Name == "" {
+			return nil, fmt.Errorf("name cannot be empty")
+		}
+		existing.Name = *req.Name
 	}
-	if rule.Description != "" {
-		existing.Description = rule.Description
+	if req.Description != nil {
+		existing.Description = *req.Description
 	}
-	if rule.Type != "" {
-		existing.Type = rule.Type
+	if req.Type != nil {
+		validTypes := map[string]bool{"threshold": true, "absence": true, "rate_change": true}
+		if !validTypes[*req.Type] {
+			return nil, fmt.Errorf("invalid type: %s (must be threshold, absence, or rate_change)", *req.Type)
+		}
+		existing.Type = *req.Type
 	}
-	if rule.Priority != "" && ValidPriorities[rule.Priority] {
-		existing.Priority = rule.Priority
+	if req.Priority != nil {
+		if !ValidPriorities[*req.Priority] {
+			return nil, fmt.Errorf("invalid priority: %s", *req.Priority)
+		}
+		existing.Priority = *req.Priority
 	}
-	if rule.QueryFilters != "" {
-		existing.QueryFilters = rule.QueryFilters
+	if req.QueryFilters != nil {
+		existing.QueryFilters = *req.QueryFilters
 	}
-	if rule.Metric != "" {
-		existing.Metric = rule.Metric
+	if req.Metric != nil {
+		validMetrics := map[string]bool{"count": true, "sum": true, "avg": true, "min": true, "max": true}
+		if !validMetrics[*req.Metric] {
+			return nil, fmt.Errorf("invalid metric: %s (must be count, sum, avg, min, or max)", *req.Metric)
+		}
+		existing.Metric = *req.Metric
 	}
-	if rule.Field != "" {
-		existing.Field = rule.Field
+	if req.Field != nil {
+		existing.Field = *req.Field
 	}
-	if rule.Condition != "" {
-		existing.Condition = rule.Condition
+	if req.Condition != nil {
+		validConditions := map[string]bool{"gt": true, "lt": true, "gte": true, "lte": true, "eq": true}
+		if !validConditions[*req.Condition] {
+			return nil, fmt.Errorf("invalid condition: %s", *req.Condition)
+		}
+		existing.Condition = *req.Condition
 	}
-	if rule.Threshold != 0 {
-		existing.Threshold = rule.Threshold
+	if req.Threshold != nil {
+		existing.Threshold = *req.Threshold
 	}
-	if rule.EvaluationIntervalSecs != 0 {
-		existing.EvaluationIntervalSecs = rule.EvaluationIntervalSecs
+	if req.EvaluationIntervalSecs != nil {
+		existing.EvaluationIntervalSecs = *req.EvaluationIntervalSecs
 	}
-	if rule.ForSeconds != 0 {
-		existing.ForSeconds = rule.ForSeconds
+	if req.ForSeconds != nil {
+		existing.ForSeconds = *req.ForSeconds
 	}
-	if rule.CooldownSeconds != 0 {
-		existing.CooldownSeconds = rule.CooldownSeconds
+	if req.CooldownSeconds != nil {
+		existing.CooldownSeconds = *req.CooldownSeconds
 	}
-	if rule.NotificationChannelIDs != "" {
-		existing.NotificationChannelIDs = rule.NotificationChannelIDs
+	if req.NotificationChannelIDs != nil {
+		existing.NotificationChannelIDs = *req.NotificationChannelIDs
 	}
-	// Enabled is explicitly set via the update body
-	existing.Enabled = rule.Enabled
+	// Enabled is applied only when present — omitting it preserves the current value.
+	if req.Enabled != nil {
+		existing.Enabled = *req.Enabled
+	}
 
 	now := time.Now().UTC()
 	existing.UpdatedAt = now

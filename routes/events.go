@@ -3,7 +3,6 @@ package routes
 import (
 	"bufio"
 	"compress/gzip"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -48,17 +47,39 @@ func IngestEventsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer bodyReader.Close()
 
-	count, err := parseAndEnqueue(bodyReader)
+	// Parse + validate the ENTIRE body first. If any line is malformed we return
+	// 400 having enqueued nothing, so a client retry cannot double-commit the
+	// lines that preceded the bad one.
+	events, err := parseEvents(bodyReader)
 	if err != nil {
 		log.Printf("failed to parse events: %v", err)
 		http.Error(w, fmt.Sprintf("Invalid event: %v", err), http.StatusBadRequest)
 		return
 	}
 
+	// Whole body parsed cleanly — now enqueue. Count only events the queue
+	// actually accepted; dropped events are reflected in /health's `dropped`.
+	accepted := 0
+	for _, event := range events {
+		if Queue.Enqueue(event) {
+			accepted++
+		}
+
+		// Publish to SSE hub for live streaming
+		if EventHub != nil {
+			EventHub.Publish(event)
+		}
+
+		// Track errors as issues (bounded, non-blocking worker pool)
+		if event.Level == "error" || event.Level == "fatal" {
+			issues.TrackError(event)
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"accepted": count,
+		"accepted": accepted,
 	})
 }
 
@@ -74,11 +95,15 @@ func getBodyReader(r *http.Request) (io.ReadCloser, error) {
 	return r.Body, nil
 }
 
-func parseAndEnqueue(reader io.Reader) (int, error) {
+// parseEvents streams the NDJSON body line-by-line into a slice, validating each
+// event. It enqueues NOTHING — if any line is invalid JSON or fails Validate(),
+// it returns an error and the caller commits none of the events. This keeps the
+// ingestion endpoint all-or-nothing so client retries can't partially duplicate.
+func parseEvents(reader io.Reader) ([]*structs.Event, error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
-	count := 0
+	var events []*structs.Event
 	lineNum := 0
 
 	for scanner.Scan() {
@@ -91,31 +116,19 @@ func parseAndEnqueue(reader io.Reader) (int, error) {
 
 		var event structs.Event
 		if err := json.Unmarshal(line, &event); err != nil {
-			return count, fmt.Errorf("line %d: invalid JSON: %w", lineNum, err)
+			return nil, fmt.Errorf("line %d: invalid JSON: %w", lineNum, err)
 		}
 
 		if err := event.Validate(); err != nil {
-			return count, fmt.Errorf("line %d: %w", lineNum, err)
+			return nil, fmt.Errorf("line %d: %w", lineNum, err)
 		}
 
-		Queue.Enqueue(&event)
-
-		// Publish to SSE hub for live streaming
-		if EventHub != nil {
-			EventHub.Publish(&event)
-		}
-
-		// Track errors as issues
-		if event.Level == "error" || event.Level == "fatal" {
-			go issues.TrackError(context.Background(), &event)
-		}
-
-		count++
+		events = append(events, &event)
 	}
 
 	if err := scanner.Err(); err != nil {
-		return count, fmt.Errorf("error reading body: %w", err)
+		return nil, fmt.Errorf("error reading body: %w", err)
 	}
 
-	return count, nil
+	return events, nil
 }

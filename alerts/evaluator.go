@@ -80,19 +80,20 @@ func (e *Evaluator) evaluateAll(ctx context.Context) {
 	}
 }
 
-// EvaluateRuleNow evaluates a single rule and returns the current value (for testing)
-func EvaluateRuleNow(ctx context.Context, rule *Rule) (float64, error) {
-	return queryRuleValue(ctx, rule)
+// EvaluateRuleNow evaluates a single rule and returns the current value and
+// whether it is firing (for the test endpoint). It branches on rule.Type just
+// like the live evaluator.
+func EvaluateRuleNow(ctx context.Context, rule *Rule) (value float64, isFiring bool, err error) {
+	return evaluateRuleState(ctx, rule)
 }
 
 func (e *Evaluator) evaluateRule(ctx context.Context, rule *Rule) {
-	value, err := queryRuleValue(ctx, rule)
+	value, isFiring, err := evaluateRuleState(ctx, rule)
 	if err != nil {
 		log.Printf("alert evaluator: failed to query rule %s (%s): %v", rule.ID, rule.Name, err)
 		return
 	}
 
-	isFiring := CheckCondition(value, rule.Condition, rule.Threshold)
 	state, _ := GetState(ctx, rule.ID)
 
 	now := time.Now().UTC()
@@ -215,31 +216,72 @@ func (e *Evaluator) onResolved(ctx context.Context, rule *Rule, state *State) {
 	}
 }
 
-func queryRuleValue(ctx context.Context, rule *Rule) (float64, error) {
-	// Parse filters
+// evaluateRuleState computes a rule's current value and whether it is firing,
+// branching on rule.Type. The "value" recorded is type-dependent (see below).
+func evaluateRuleState(ctx context.Context, rule *Rule) (value float64, isFiring bool, err error) {
+	now := time.Now().UTC()
+	interval := time.Duration(rule.EvaluationIntervalSecs) * time.Second
+
+	switch rule.Type {
+	case "absence":
+		// COUNT over the interval ignoring metric/field; firing when nothing arrived.
+		count, err := queryCountForRange(ctx, rule, now.Add(-interval), now)
+		if err != nil {
+			return 0, false, err
+		}
+		return count, count == 0, nil
+
+	case "rate_change":
+		// Percent change of the aggregate between the previous and current window.
+		cur, err := queryValueForRange(ctx, rule, now.Add(-interval), now)
+		if err != nil {
+			return 0, false, err
+		}
+		prev, err := queryValueForRange(ctx, rule, now.Add(-2*interval), now.Add(-interval))
+		if err != nil {
+			return 0, false, err
+		}
+		var pct float64
+		if prev == 0 {
+			if cur > 0 {
+				pct = 100
+			} else {
+				pct = 0
+			}
+		} else {
+			pct = (cur - prev) / prev * 100
+		}
+		return pct, CheckCondition(pct, rule.Condition, rule.Threshold), nil
+
+	default:
+		// threshold (and empty/unknown): aggregate over the interval vs threshold.
+		v, err := queryValueForRange(ctx, rule, now.Add(-interval), now)
+		if err != nil {
+			return 0, false, err
+		}
+		return v, CheckCondition(v, rule.Condition, rule.Threshold), nil
+	}
+}
+
+// parseRuleFilters decodes a rule's query_filters JSON array.
+func parseRuleFilters(rule *Rule) ([]structs.QueryFilter, error) {
 	var filters []structs.QueryFilter
 	if rule.QueryFilters != "" && rule.QueryFilters != "[]" {
 		if err := json.Unmarshal([]byte(rule.QueryFilters), &filters); err != nil {
-			return 0, fmt.Errorf("failed to parse query filters: %w", err)
+			return nil, fmt.Errorf("failed to parse query filters: %w", err)
 		}
 	}
+	return filters, nil
+}
 
-	// Determine time range based on evaluation interval
-	to := time.Now().UTC()
-	from := to.Add(-time.Duration(rule.EvaluationIntervalSecs) * time.Second)
-
-	// Build aggregation
-	agg := structs.AggregationType(rule.Metric)
-	if agg == "" {
-		agg = structs.AggCount
-	}
-
-	aggExpr, err := buildAggExpr(agg, rule.Field)
+// queryAggForRange runs an arbitrary aggregation expression over [from,to],
+// applying the rule's query_filters. aggExpr is a trusted, code-built expression.
+func queryAggForRange(ctx context.Context, rule *Rule, aggExpr string, from, to time.Time) (float64, error) {
+	filters, err := parseRuleFilters(rule)
 	if err != nil {
 		return 0, err
 	}
 
-	// Build query
 	sql := fmt.Sprintf("SELECT %s AS value FROM %s.events WHERE timestamp >= ? AND timestamp <= ?", aggExpr, db.Database)
 	args := []interface{}{from, to}
 
@@ -256,8 +298,26 @@ func queryRuleValue(ctx context.Context, rule *Rule) (float64, error) {
 	if err := db.Conn.QueryRow(ctx, sql, args...).Scan(&value); err != nil {
 		return 0, fmt.Errorf("query failed: %w", err)
 	}
-
 	return value, nil
+}
+
+// queryValueForRange runs the rule's configured metric aggregation over [from,to].
+func queryValueForRange(ctx context.Context, rule *Rule, from, to time.Time) (float64, error) {
+	agg := structs.AggregationType(rule.Metric)
+	if agg == "" {
+		agg = structs.AggCount
+	}
+	aggExpr, err := buildAggExpr(agg, rule.Field)
+	if err != nil {
+		return 0, err
+	}
+	return queryAggForRange(ctx, rule, aggExpr, from, to)
+}
+
+// queryCountForRange runs a COUNT over [from,to] regardless of the rule's metric
+// (used by absence alerts, which only care whether any matching event arrived).
+func queryCountForRange(ctx context.Context, rule *Rule, from, to time.Time) (float64, error) {
+	return queryAggForRange(ctx, rule, "toFloat64(count())", from, to)
 }
 
 func buildAggExpr(agg structs.AggregationType, field string) (string, error) {

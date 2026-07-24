@@ -135,15 +135,32 @@ func (r *Router) Route(ctx context.Context, alertCtx *AlertContext, rule *Rule) 
 			continue
 		}
 
-		var sendErr error
-		if alertCtx.Status == "resolved" {
-			sendErr = r.notifier.SendResolved(ch, alertCtx.RuleName, alertCtx.Message, alertCtx.Value)
-		} else {
-			sendErr = r.notifier.Send(ch, alertCtx.RuleName, alertCtx.Message, alertCtx.Value)
-		}
-		if sendErr != nil {
-			log.Printf("alert router: failed to send to channel %s: %v", chID, sendErr)
-		}
+		// Dispatch each channel notification on its own goroutine so a single
+		// slow/unreachable channel can't block rule evaluation (the router runs
+		// on the evaluator's single goroutine). The notifier already applies its
+		// own 10s timeout per send; the recover guards against a panicking
+		// notifier taking the process down.
+		status := alertCtx.Status
+		ruleName := alertCtx.RuleName
+		message := alertCtx.Message
+		value := alertCtx.Value
+		go func(ch *Channel) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("alert router: panic sending to channel %s: %v", ch.ID, rec)
+				}
+			}()
+
+			var sendErr error
+			if status == "resolved" {
+				sendErr = r.notifier.SendResolved(ch, ruleName, message, value)
+			} else {
+				sendErr = r.notifier.Send(ch, ruleName, message, value)
+			}
+			if sendErr != nil {
+				log.Printf("alert router: failed to send to channel %s: %v", ch.ID, sendErr)
+			}
+		}(ch)
 	}
 
 	return nil

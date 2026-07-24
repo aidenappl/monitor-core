@@ -1,7 +1,9 @@
 package middleware
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -79,6 +81,28 @@ type loggingResponseWriter struct {
 func (rw *loggingResponseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// Flush forwards to the embedded ResponseWriter if it supports flushing.
+// Required for SSE (Server-Sent Events) streaming to work through this wrapper.
+func (rw *loggingResponseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack delegates to the embedded http.Hijacker (for WebSocket upgrades, etc.).
+func (rw *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := rw.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support Hijack")
+}
+
+// Unwrap returns the embedded ResponseWriter so http.ResponseController can reach
+// through the wrapper (e.g. to set/clear write deadlines on SSE connections).
+func (rw *loggingResponseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
 }
 
 func LoggingMiddleware(next http.Handler) http.Handler {

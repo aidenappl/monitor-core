@@ -69,12 +69,16 @@ var validColumns = map[string]bool{
 	"level":      true,
 }
 
-func applyFilters(builder sq.SelectBuilder, params QueryParams) sq.SelectBuilder {
+func applyFilters(builder sq.SelectBuilder, params QueryParams) (sq.SelectBuilder, error) {
 	for _, f := range params.Filters {
+		var err error
 		if f.IsData {
-			builder = applyDataFilter(builder, f)
+			builder, err = applyDataFilter(builder, f)
 		} else {
-			builder = applyColumnFilter(builder, f)
+			builder, err = applyColumnFilter(builder, f)
+		}
+		if err != nil {
+			return builder, err
 		}
 	}
 
@@ -85,12 +89,12 @@ func applyFilters(builder sq.SelectBuilder, params QueryParams) sq.SelectBuilder
 		builder = builder.Where(sq.LtOrEq{"timestamp": params.To})
 	}
 
-	return builder
+	return builder, nil
 }
 
-func applyColumnFilter(builder sq.SelectBuilder, f Filter) sq.SelectBuilder {
+func applyColumnFilter(builder sq.SelectBuilder, f Filter) (sq.SelectBuilder, error) {
 	if !validColumns[f.Field] {
-		return builder
+		return builder, fmt.Errorf("invalid filter column: %s", f.Field)
 	}
 
 	switch f.Operator {
@@ -118,10 +122,18 @@ func applyColumnFilter(builder sq.SelectBuilder, f Filter) sq.SelectBuilder {
 		}
 	}
 
-	return builder
+	return builder, nil
 }
 
-func applyDataFilter(builder sq.SelectBuilder, f Filter) sq.SelectBuilder {
+func applyDataFilter(builder sq.SelectBuilder, f Filter) (sq.SelectBuilder, error) {
+	// f.Field is the JSON key (the "data." prefix is stripped during parsing) and
+	// is interpolated directly into the SQL text as a string literal, so it MUST be
+	// validated against safeIdentifierRegex (same guard as analytics.go) to prevent
+	// SQL injection. Reject invalid keys rather than silently dropping the filter.
+	if !safeIdentifierRegex.MatchString(f.Field) {
+		return builder, fmt.Errorf("invalid data field name: %s", f.Field)
+	}
+
 	extractStr := fmt.Sprintf("JSONExtractString(data, '%s')", f.Field)
 	extractNum := fmt.Sprintf("toFloat64OrNull(JSONExtractRaw(data, '%s'))", f.Field)
 
@@ -146,7 +158,7 @@ func applyDataFilter(builder sq.SelectBuilder, f Filter) sq.SelectBuilder {
 		builder = builder.Where(fmt.Sprintf("%s LIKE ?", extractStr), fmt.Sprintf("%%%v", f.Value))
 	}
 
-	return builder
+	return builder, nil
 }
 
 func QueryEvents(ctx context.Context, params QueryParams) (*QueryResult, error) {
@@ -161,7 +173,10 @@ func QueryEvents(ctx context.Context, params QueryParams) (*QueryResult, error) 
 	countBuilder := sq.Select("count()").
 		From(eventsTable()).
 		PlaceholderFormat(sq.Question)
-	countBuilder = applyFilters(countBuilder, params)
+	countBuilder, err := applyFilters(countBuilder, params)
+	if err != nil {
+		return nil, err
+	}
 
 	countSQL, countArgs, err := countBuilder.ToSql()
 	if err != nil {
@@ -180,7 +195,10 @@ func QueryEvents(ctx context.Context, params QueryParams) (*QueryResult, error) 
 		Limit(uint64(params.Limit)).
 		Offset(uint64(params.Offset)).
 		PlaceholderFormat(sq.Question)
-	queryBuilder = applyFilters(queryBuilder, params)
+	queryBuilder, err = applyFilters(queryBuilder, params)
+	if err != nil {
+		return nil, err
+	}
 
 	querySQL, queryArgs, err := queryBuilder.ToSql()
 	if err != nil {
@@ -241,10 +259,14 @@ func GetLabelValues(ctx context.Context, label string, params QueryParams) (*Lab
 		if !f.IsData && f.Field == column {
 			continue
 		}
+		var err error
 		if f.IsData {
-			builder = applyDataFilter(builder, f)
+			builder, err = applyDataFilter(builder, f)
 		} else {
-			builder = applyColumnFilter(builder, f)
+			builder, err = applyColumnFilter(builder, f)
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -290,7 +312,10 @@ func GetDataKeys(ctx context.Context, params QueryParams) (*DataKeysResult, erro
 		OrderBy("key").
 		Limit(1000).
 		PlaceholderFormat(sq.Question)
-	builder = applyFilters(builder, params)
+	builder, err := applyFilters(builder, params)
+	if err != nil {
+		return nil, err
+	}
 
 	querySQL, queryArgs, err := builder.ToSql()
 	if err != nil {
@@ -330,7 +355,10 @@ func GetDataValues(ctx context.Context, key string, params QueryParams) (*LabelV
 		OrderBy("value").
 		Limit(1000).
 		PlaceholderFormat(sq.Question)
-	builder = applyFilters(builder, params)
+	builder, err := applyFilters(builder, params)
+	if err != nil {
+		return nil, err
+	}
 
 	querySQL, queryArgs, err := builder.ToSql()
 	if err != nil {
