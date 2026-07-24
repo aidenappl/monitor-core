@@ -46,6 +46,13 @@ var (
 	// the redirect registered with each IdP (OAuth redirect_uri exact-match).
 	PublicBaseURL string
 
+	// WebBaseURL is the monitor-web app origin (scheme+host, no trailing slash).
+	// SSO login/callback run on monitor-core (PublicBaseURL / the API host), but
+	// after completing they must send the browser back to the WEB app — so the
+	// post-login and error redirects are built against this, not a relative path
+	// (which would resolve to the API host). Defaults to the dashboard origin.
+	WebBaseURL string
+
 	// SSE
 	MaxSSESubscribers int
 
@@ -95,7 +102,8 @@ func Load() {
 	CryptoKey = getEnv("MON_CRYPTO_KEY", devCryptoKey) // exactly 32 bytes
 	CookieDomain = getEnv("MON_COOKIE_DOMAIN", "")
 	CookieInsecure = getEnv("MON_COOKIE_INSECURE", "false") == "true"
-	PublicBaseURL = getEnv("MON_PUBLIC_URL", "https://monitor.appleby.cloud")
+	PublicBaseURL = getEnv("MON_PUBLIC_URL", "https://api.monitor.appleby.cloud")
+	WebBaseURL = getEnv("MON_WEB_URL", "https://monitor.appleby.cloud")
 
 	BatchSize = getEnvInt("BATCH_SIZE", 1000)
 	FlushInterval = getEnvDuration("FLUSH_INTERVAL", 5*time.Second)

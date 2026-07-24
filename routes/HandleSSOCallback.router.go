@@ -108,7 +108,7 @@ func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, safeReturnURL(stateData.ReturnURL), http.StatusFound)
+	http.Redirect(w, r, webAppURL(safeReturnURL(stateData.ReturnURL)), http.StatusFound)
 }
 
 // linkSSOIdentity attaches a freshly-authenticated SSO identity to an already
@@ -159,9 +159,9 @@ func linkSSOIdentity(w http.ResponseWriter, r *http.Request, engine db.Queryable
 // redirectLinkResult sends the browser back to the settings return_url with a
 // single result query param (linked=<slug> or link_error=<code>).
 func redirectLinkResult(w http.ResponseWriter, r *http.Request, returnURL, key, val string) {
-	u, err := url.Parse(returnURL)
+	u, err := url.Parse(webAppURL(returnURL))
 	if err != nil {
-		u = &url.URL{Path: "/"}
+		u, _ = url.Parse(webAppURL("/"))
 	}
 	q := u.Query()
 	q.Set(key, val)
@@ -185,9 +185,9 @@ func cacheSSOSession(userID int64, slug string, tokens *sso.TokenSet) error {
 	return query.UpsertSSOSession(db.SQL, userID, slug, encAccess, encRefresh)
 }
 
-// redirectLoginError sends the browser to /login?error=<code>.
+// redirectLoginError sends the browser to the web app's /login?error=<code>.
 func redirectLoginError(w http.ResponseWriter, r *http.Request, code string) {
-	u := url.URL{Path: loginErrorPath}
+	u, _ := url.Parse(webAppURL(loginErrorPath))
 	q := u.Query()
 	q.Set("error", code)
 	u.RawQuery = q.Encode()

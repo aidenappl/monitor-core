@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/responder"
 	"github.com/aidenappl/monitor-core/sso"
 	"github.com/gorilla/mux"
@@ -55,13 +56,25 @@ func HandleSSOLogin(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
-// safeReturnURL restricts post-login redirects to same-origin relative paths,
-// defeating open-redirect abuse. Anything that is not a single-slash-prefixed
-// path (e.g. "//evil.com", "https://evil.com", or a scheme-relative URL) is
-// dropped in favor of "/".
+// safeReturnURL sanitizes a caller-supplied return path to a single-slash-prefixed
+// relative path, defeating open-redirect abuse. Anything that is not a lone
+// relative path (e.g. "//evil.com", "https://evil.com", a scheme-relative URL) is
+// dropped in favor of "/". The result is stored in the state and later turned into
+// an absolute web-app URL by webAppURL at redirect time.
 func safeReturnURL(raw string) string {
 	if raw == "" || !strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") {
 		return "/"
 	}
 	return raw
+}
+
+// webAppURL turns a sanitized relative path into an absolute URL on the monitor-web
+// origin (env.WebBaseURL). SSO runs on the API host, so post-login/error redirects
+// MUST be absolute to the web app — a relative path would resolve to the API host.
+func webAppURL(relPath string) string {
+	base := strings.TrimRight(env.WebBaseURL, "/")
+	if relPath == "" || !strings.HasPrefix(relPath, "/") || strings.HasPrefix(relPath, "//") {
+		return base + "/"
+	}
+	return base + relPath
 }
