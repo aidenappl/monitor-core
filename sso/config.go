@@ -42,7 +42,7 @@ type Provider struct {
 // exact-match rule), so it is derived deterministically from env.PublicBaseURL.
 func (p *Provider) RedirectURL() string {
 	base := strings.TrimRight(env.PublicBaseURL, "/")
-	return base + "/auth/sso/" + p.Slug + "/callback"
+	return base + "/auth/sso/callback"
 }
 
 // LoadProvider fetches a provider by slug and resolves its client secret.

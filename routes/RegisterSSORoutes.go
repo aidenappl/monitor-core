@@ -16,7 +16,7 @@ import (
 //
 //	GET  /auth/sso/config              provider discovery for the login page
 //	GET  /auth/sso/{slug}/login        begin an SSO login (302 to the IdP)
-//	GET  /auth/sso/{slug}/callback     IdP redirect target; mints a Monitor session
+//	GET  /auth/sso/callback            IdP redirect target (provider from state); mints a Monitor session
 //
 // Admin (SessionMiddleware + RequireAdmin):
 //
@@ -28,7 +28,7 @@ func RegisterSSORoutes(r *mux.Router) {
 	// Public SSO endpoints — all GET, so inherently CSRF-safe.
 	r.HandleFunc("/auth/sso/config", HandleSSOConfig).Methods(http.MethodGet)
 	r.HandleFunc("/auth/sso/{slug}/login", HandleSSOLogin).Methods(http.MethodGet)
-	r.HandleFunc("/auth/sso/{slug}/callback", HandleSSOCallback).Methods(http.MethodGet)
+	r.HandleFunc("/auth/sso/callback", HandleSSOCallback).Methods(http.MethodGet)
 
 	// Admin SSO provider CRUD — authenticated as an active user, then gated to
 	// role=admin. RequireAdmin reads the user SessionMiddleware puts in context.

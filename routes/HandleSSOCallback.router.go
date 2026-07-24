@@ -9,17 +9,19 @@ import (
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/sso"
 	"github.com/aidenappl/monitor-core/tools"
-	"github.com/gorilla/mux"
 )
 
 // loginErrorPath is where a failed SSO login lands, with ?error=<code>.
 const loginErrorPath = "/login"
 
-// HandleSSOCallback completes an SSO login (GET /auth/sso/{slug}/callback):
+// HandleSSOCallback completes an SSO login (GET /auth/sso/callback):
 //
 //  1. Surface any provider-returned error.
 //  2. Require code + state; validate and SINGLE-USE-consume the state (this is
-//     the CSRF/replay gate — a state is accepted at most once).
+//     the CSRF/replay gate — a state is accepted at most once). The provider is
+//     taken from the state record, so a single callback path serves every
+//     provider (matching the appleby-cloud convention and the exact redirect_uri
+//     registered with each IdP).
 //  3. Exchange the code (sending the PKCE verifier); the OIDC adapter verifies
 //     the id_token signature/iss/aud/exp AND the nonce.
 //  4. Resolve the identity to a Monitor user (link/provision rules in
@@ -30,8 +32,6 @@ const loginErrorPath = "/login"
 // All failures redirect to /login?error=<code> rather than rendering an error,
 // since this endpoint is reached by a top-level browser navigation.
 func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
-	slug := mux.Vars(r)["slug"]
-
 	if errCode := r.URL.Query().Get("error"); errCode != "" {
 		redirectLoginError(w, r, "sso_denied")
 		return
@@ -44,14 +44,15 @@ func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate + consume state (single-use). Also confirm the state was minted
-	// for THIS provider, so a state issued for one slug cannot be replayed at
-	// another's callback.
+	// Validate + consume state (single-use). The provider slug is carried in the
+	// state record (set at /login), so the callback path itself is provider-
+	// agnostic.
 	stateData, err := sso.ConsumeState(db.SQL, state)
-	if err != nil || stateData.Provider != slug {
+	if err != nil || stateData.Provider == "" {
 		redirectLoginError(w, r, "sso_state_invalid")
 		return
 	}
+	slug := stateData.Provider
 
 	provider, err := sso.LoadProvider(db.SQL, slug)
 	if err != nil || !provider.Enabled {
