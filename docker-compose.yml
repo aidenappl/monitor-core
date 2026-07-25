@@ -103,7 +103,6 @@ services:
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - clickhouse-logs:/var/log/clickhouse-server
-      - ./migrations:/docker-entrypoint-initdb.d:ro
     restart: unless-stopped
     networks:
       - monitor-network
