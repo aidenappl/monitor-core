@@ -8,8 +8,11 @@ services:
       - "3030:3000"
     environment:
       NODE_ENV: production
-      PORT: 3000
+      PORT: "3000"
       HOSTNAME: "0.0.0.0"
+      # Public origin of monitor-core (api.*). Baked into the browser bundle for
+      # the "Continue with <provider>" SSO redirect and used by the server proxy.
+      NEXT_PUBLIC_MONITOR_API_URL: "https://api.monitor.appleby.cloud"
     restart: unless-stopped
     networks:
       - monitor-network
@@ -36,9 +39,18 @@ services:
       HTTP_PORT: "8080"
       CLICKHOUSE_ADDR: "clickhouse:9000"
       CLICKHOUSE_DATABASE: "monitor"
-      CLICKHOUSE_USERNAME: ${CLICKHOUSE_USERNAME:-default}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
-      API_KEY: ${MONITOR_API_KEY}
+      CLICKHOUSE_USERNAME: ${CLICKHOUSE_USERNAME}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      MONITOR_API_KEY: ${MONITOR_API_KEY}
+      # Keyring injects the auth secrets (MON_DB_DSN, MON_JWT_SIGNING_KEY,
+      # MON_CRYPTO_KEY, MON_ADMIN_*, MON_SSO_*) at startup from these credentials.
+      KEYRING_URL: ${KEYRING_URL}
+      KEYRING_ACCESS_KEY_ID: ${KEYRING_ACCESS_KEY_ID}
+      KEYRING_SECRET_ACCESS_KEY: ${KEYRING_SECRET_ACCESS_KEY}
+      # Public API origin (SSO redirect_uri base) and the web app origin the SSO
+      # callback redirects back to. Keyring values, if set, take precedence.
+      MON_PUBLIC_URL: "https://api.monitor.appleby.cloud"
+      MON_WEB_URL: "https://monitor.appleby.cloud"
       BATCH_SIZE: ${BATCH_SIZE:-1000}
       FLUSH_INTERVAL: ${FLUSH_INTERVAL:-5s}
       QUEUE_SIZE: ${QUEUE_SIZE:-100000}
@@ -97,8 +109,8 @@ services:
       - "9000:9000"
     environment:
       CLICKHOUSE_DB: monitor
-      CLICKHOUSE_USER: ${CLICKHOUSE_USERNAME:-default}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USERNAME}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     volumes:
       - clickhouse-data:/var/lib/clickhouse
@@ -109,7 +121,7 @@ services:
     healthcheck:
       test:
         - "CMD-SHELL"
-        - "clickhouse-client --query 'SELECT 1' || exit 1"
+        - "clickhouse-client --user $${CLICKHOUSE_USER} --password $${CLICKHOUSE_PASSWORD} --query 'SELECT 1' || exit 1"
       interval: 10s
       timeout: 5s
       retries: 5
