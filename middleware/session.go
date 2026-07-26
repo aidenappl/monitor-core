@@ -12,9 +12,9 @@ import (
 	"github.com/aidenappl/monitor-core/structs"
 )
 
-// This file implements Monitor's OWN session auth (Phase 2), independent of
-// Forta. It deliberately does NOT touch the existing query_auth.go / ingest_auth.go
-// middleware — Phase 3 rewires those to consume this. Until then both coexist.
+// This file implements Monitor's own session auth: Monitor-issued JWTs carried
+// in mon-* cookies (or a Bearer access token). query_auth.go consumes the same
+// validation path for dashboard/query requests; ingest_auth.go stays API-key only.
 
 // UserContextKey is where SessionMiddleware stashes the authenticated
 // *structs.User. contextKey is declared in logging.go (same package).

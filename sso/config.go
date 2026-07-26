@@ -5,9 +5,9 @@
 //   - kind="oidc"   → generic OpenID Connect via go-oidc discovery + JWKS
 //     id_token verification (oidc.go). Any compliant OIDC provider (Google,
 //     Okta, Entra, Auth0, …) is a config row, not a code change.
-//   - kind="oauth2" → a tolerant OAuth2 adapter (forta.go) covering non-OIDC
-//     providers, including Forta's {success,data{...}} envelope. Forta is just
-//     the first such row; nothing here is Forta-specific.
+//   - kind="oauth2" → a tolerant OAuth2 adapter (oauth2.go) covering non-OIDC
+//     providers with explicit authorize/token/userinfo URLs, including ones that
+//     wrap their replies in a {success,data{...}} envelope.
 //
 // Every adapter normalizes the login to a NormalizedIdentity keyed on
 // (Provider, Subject) — never on email (see resolve.go for why).

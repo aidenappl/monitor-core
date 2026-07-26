@@ -63,20 +63,6 @@ var (
 	AdminEmail        string
 	AdminPassword     string
 	AllowRegistration bool
-
-	// Forta SSO provider seed (migration path). When these are set, bootstrap
-	// seeds a "forta" row into sso_providers on startup so existing Forta users
-	// can keep clicking "Continue with Forta" (see bootstrap.EnsureFortaProvider).
-	// All empty means "no Forta button" — seeding is skipped and startup is
-	// unaffected. The client secret is NOT read here: the seed stores a Keyring
-	// reference (client_secret_ref = "MON_SSO_FORTA_CLIENT_SECRET"), resolved at
-	// login time by sso.resolveSecret.
-	FortaAuthorizeURL  string
-	FortaTokenURL      string
-	FortaUserInfoURL   string
-	FortaIntrospectURL string
-	FortaClientID      string
-	FortaScopes        string
 )
 
 // Load reads all configuration from environment variables.
@@ -117,15 +103,6 @@ func Load() {
 	AdminEmail = getEnv("MON_ADMIN_EMAIL", "")
 	AdminPassword = getEnv("MON_ADMIN_PASSWORD", "")
 	AllowRegistration = getEnv("MON_ALLOW_REGISTRATION", "false") == "true"
-
-	// Forta SSO provider seed. Empty defaults mean "don't seed the Forta row"
-	// (no Forta button); a missing Forta config never blocks startup.
-	FortaAuthorizeURL = getEnv("MON_SSO_FORTA_AUTHORIZE_URL", "")
-	FortaTokenURL = getEnv("MON_SSO_FORTA_TOKEN_URL", "")
-	FortaUserInfoURL = getEnv("MON_SSO_FORTA_USERINFO_URL", "")
-	FortaIntrospectURL = getEnv("MON_SSO_FORTA_INTROSPECT_URL", "")
-	FortaClientID = getEnv("MON_SSO_FORTA_CLIENT_ID", "")
-	FortaScopes = getEnv("MON_SSO_FORTA_SCOPES", "openid email profile")
 }
 
 // RequireProductionSecrets returns an error if the process is running in a

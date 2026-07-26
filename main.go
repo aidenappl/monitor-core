@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -31,14 +29,6 @@ import (
 )
 
 func main() {
-	// Operator one-off: -backfill-forta <file.json> pre-provisions existing Forta
-	// users (see runFortaBackfill / bootstrap.BackfillFortaUsers) then exits
-	// WITHOUT starting the HTTP server. Empty (the default) leaves normal startup
-	// completely unaffected. Kept in main.go so the single-file `./main.go` Docker
-	// build stays intact (no second package-main file).
-	backfillFortaPath := flag.String("backfill-forta", "", "path to a JSON array of Forta users to pre-provision, then exit")
-	flag.Parse()
-
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -98,24 +88,6 @@ func main() {
 	// Seed the first admin user on a fresh database (no-op once any user exists).
 	if err := bootstrap.EnsureAdminUser(db.SQL); err != nil {
 		log.Fatalf("❌ failed to bootstrap admin user: %v", err)
-	}
-
-	// Seed the Forta SSO provider row (migration path) when MON_SSO_FORTA_* is
-	// configured. Idempotent and additive — a no-op if the row already exists or
-	// Forta is unconfigured. A missing Forta config just means no Forta button, so
-	// this logs and continues (never fatal).
-	if err := bootstrap.EnsureFortaProvider(db.SQL); err != nil {
-		log.Printf("WARNING: failed to seed Forta SSO provider: %v", err)
-	}
-
-	// Operator one-off: -backfill-forta <file.json> pre-provisions existing Forta
-	// users and exits (no server). Runs after migrations + provider seed so the
-	// tables and forta row exist.
-	if *backfillFortaPath != "" {
-		if err := runFortaBackfill(*backfillFortaPath); err != nil {
-			log.Fatalf("❌ forta backfill failed: %v", err)
-		}
-		os.Exit(0)
 	}
 
 	// Wire the SSO revocation checkpoint into SessionMiddleware. Until this runs
@@ -194,8 +166,8 @@ func main() {
 
 	r.HandleFunc("/health", routes.HealthHandler).Methods(http.MethodGet)
 
-	// Native session auth (Monitor-owned JWT). Forta is gone; it is now just one
-	// SSO provider row, mounted below via RegisterSSORoutes.
+	// Native session auth (Monitor-owned JWT). External IdPs are config rows,
+	// mounted below via RegisterSSORoutes.
 	//   /auth/login, /auth/register — public, CSRF-exempt (no session yet).
 	//   /auth/refresh — public, CSRF-exempt (authenticates via the refresh cookie).
 	//   /auth/logout, /auth/self* — behind SessionMiddleware.
@@ -346,45 +318,4 @@ func main() {
 	time.Sleep(2 * time.Second)
 
 	log.Println("shutdown complete")
-}
-
-// runFortaBackfill reads a JSON array of Forta users from path and pre-provisions
-// them as ACTIVE Monitor accounts with linked "forta" identities, so existing
-// Forta users are never provisioned as "pending" on their first post-cutover
-// "Continue with Forta". Idempotent — a second run reports every user as skipped.
-//
-// The file is a JSON array of objects:
-//
-//	[
-//	  {"subject": "forta-user-id", "email": "a@b.com", "email_verified": true,
-//	   "name": "Ada Lovelace", "role": "admin"},
-//	  ...
-//	]
-//
-// where "role" is one of admin|editor|viewer (the operator's mapping of the
-// user's Forta grant/role → Monitor role) and "subject" is the Forta subject id
-// (the identity key — never the email).
-func runFortaBackfill(path string) error {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", path, err)
-	}
-
-	var seeds []bootstrap.FortaUserSeed
-	if err := json.Unmarshal(raw, &seeds); err != nil {
-		return fmt.Errorf("parse %s (expected a JSON array of {subject,email,email_verified,name,role}): %w", path, err)
-	}
-	if len(seeds) == 0 {
-		return fmt.Errorf("%s contained no users", path)
-	}
-
-	log.Printf("forta backfill: processing %d user(s) from %s", len(seeds), path)
-	result, err := bootstrap.BackfillFortaUsers(db.SQL, seeds)
-	// Always report what happened, even on a partial failure.
-	log.Printf("forta backfill: created=%d linked=%d skipped=%d", result.Created, result.Linked, result.Skipped)
-	if err != nil {
-		return err
-	}
-	log.Println("forta backfill: done")
-	return nil
 }

@@ -28,7 +28,7 @@ ClickHouse (events)          MariaDB (monitor_auth)
 - **Native authentication**: email+password accounts (bcrypt 12) + Monitor-owned HS512
   JWT sessions (15m access / rotating 7d refresh with reuse detection)
 - **Pluggable SSO**: config-driven OIDC/OAuth2 providers with true account linking (one
-  user, many identities); Forta is one provider among many
+  user, many identities) — any IdP is a config row, not a code change
 - **API-key authentication** for ingest/query: via the `X-Api-Key` header
 
 ## Quick Start
@@ -71,8 +71,8 @@ export MON_ADMIN_EMAIL="you@example.com"     # seeds the first admin on a fresh 
 export MON_ADMIN_PASSWORD="a-strong-password"
 ```
 
-To sign in with SSO locally, add a provider via `POST /admin/sso-providers` (or set the
-`MON_SSO_FORTA_*` vars to seed the Forta button). See the full env table under
+To sign in with SSO locally, add a provider via `POST /admin/sso-providers` (or the
+`/admin/sso` page in `monitor-web`). See the full env table under
 [Configuration](#configuration) and the auth model in
 [AGENTS.md](./AGENTS.md) §6. All other defaults work with `dev up`.
 
@@ -500,8 +500,8 @@ If `compare_from`/`compare_to` are not specified, the previous period is auto-ca
 
 ## Authentication
 
-Monitor owns identity end-to-end (it no longer delegates to Forta). Two credential kinds
-coexist:
+Monitor owns identity end-to-end — it delegates to no external identity provider. Two
+credential kinds coexist:
 
 - **API keys** (`X-Api-Key`) — for ingestion (`POST /v1/events`, admin or ingest scope)
   and machine query callers (admin scope). The env master key is `MONITOR_API_KEY`.
@@ -525,11 +525,11 @@ GET    /auth/sso/config | /auth/sso/{slug}/login | /auth/sso/{slug}/callback
 GET/POST /admin/sso-providers   PUT/DELETE /admin/sso-providers/{slug}   (admin only)
 ```
 
-SSO providers are config rows (OIDC via discovery, or explicit-URL OAuth2 — how Forta
-plugs in). Linking is nOAuth-safe: identity is keyed on `(provider, subject)`, and
+SSO providers are config rows (OIDC via discovery, or explicit-URL OAuth2). Adding one —
+Google, Okta, Entra, Forta, anything else — is a `POST /admin/sso-providers`, never a
+build. Linking is nOAuth-safe: identity is keyed on `(provider, subject)`, and
 link-on-login only fires when both the IdP email and the existing account email are
-verified. Existing Forta users are migrated with `./monitor-core -backfill-forta
-users.json` (see [MIGRATION.md](./MIGRATION.md)). Full details in [AGENTS.md](./AGENTS.md) §6.
+verified. Full details in [AGENTS.md](./AGENTS.md) §6.
 
 ## Configuration
 
@@ -552,7 +552,6 @@ users.json` (see [MIGRATION.md](./MIGRATION.md)). Full details in [AGENTS.md](./
 | `MON_PUBLIC_URL`      | `https://monitor.appleby.cloud` | Origin used to build each SSO `redirect_uri`; must match the IdP registration |
 | `MON_ADMIN_EMAIL` / `MON_ADMIN_PASSWORD` | `` | Seed the first admin on a fresh DB; empty = no seed |
 | `MON_ALLOW_REGISTRATION` | `false`       | Gates `POST /auth/register` (self-registration) |
-| `MON_SSO_FORTA_*`     | ``               | Seed the `forta` SSO provider row; all empty = no Forta button (secret is a Keyring ref) |
 
 ## Limits
 
@@ -583,7 +582,6 @@ monitor-core/
   Dockerfile                  # Multi-stage production build (builds ./main.go)
   docker-compose.yml          # Production stack: monitor-core + ClickHouse + MariaDB (+ monitor-web)
   docker-compose.dev.yml      # Local development stack
-  MIGRATION.md                # Forta→native cutover runbook (backfill)
   db/
     clickhouse.go             # ClickHouse connection and batch writer (events)
     sql.go                    # MariaDB connection (db.SQL), db.Queryable, db.RunMigrations
@@ -591,8 +589,8 @@ monitor-core/
   env/env.go                  # Environment configuration + RequireProductionSecrets guard
   jwt/jwt.go                  # Monitor-owned HS512 access/refresh JWTs (alg-pinned)
   tools/                      # Password.tool.go (bcrypt 12), Crypto.go (AES-256-GCM), Validate.tool.go
-  bootstrap/                  # First-run seeding: admin.go, forta_provider.go, forta_backfill.go
-  sso/                        # Pluggable SSO: adapters (oidc.go, forta.go), resolve.go, checkpoint.go, state.go
+  bootstrap/                  # First-run seeding: admin.go (first admin user)
+  sso/                        # Pluggable SSO: adapters (oidc.go, oauth2.go), resolve.go, checkpoint.go, state.go
   query/                      # MariaDB query layer (squirrel): users/identities/refresh_tokens/sso_*/api_keys
   structs/                    # User/Identity/SSOProvider/SSOSession/RefreshToken/APIKey + event/analytics
   middleware/

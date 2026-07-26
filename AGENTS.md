@@ -23,8 +23,8 @@ It **owns**:
 - **Issue tracking** — grouping error/fatal events by fingerprint (Sentry-style).
 - **Dashboards**, **saved views**, and **API-key management** persistence.
 - **Identity & authentication** — native accounts (email+password), Monitor-owned
-  session tokens, and a pluggable, config-driven SSO subsystem. This was previously
-  delegated to Forta; it is now owned here (see §6 Auth).
+  session tokens, and a pluggable, config-driven SSO subsystem — all owned here
+  (see §6 Auth).
 - Two Server-Sent-Events (SSE) streams: a live event tail and a live alert feed.
 
 It **does not** own: the UI (that's `monitor-web`) or the client SDKs (`go-monitor`,
@@ -53,9 +53,9 @@ It **does not** own: the UI (that's `monitor-web`) or the client SDKs (`go-monit
 - **Secrets:** `github.com/aidenappl/go-keyring` (optional at startup — see §4).
 - **IDs:** `github.com/google/uuid`.
 
-> ⚠️ `go-forta` has been **removed** — Forta is no longer a dependency, it is one SSO
-> provider row (see §6). ClickHouse is still accessed through its native driver, not
-> `db.Queryable`; squirrel builds SQL for both stores.
+> ⚠️ Monitor has **no identity-provider SDK dependency** — every IdP is a config row
+> in `sso_providers` (see §6). ClickHouse is still accessed through its native driver,
+> not `db.Queryable`; squirrel builds SQL for both stores.
 
 ---
 
@@ -73,7 +73,7 @@ monitor-core/
     migrations/            # MariaDB auth-schema DDL (100_users … 107_sso_trust_email_verified)
   jwt/jwt.go               # Monitor-owned HS512 access/refresh JWTs (mint + validate, alg-pinned)
   tools/                   # Password.tool.go (bcrypt 12), Crypto.go (AES-256-GCM), Validate.tool.go (SSRF guard)
-  bootstrap/               # First-run seeding: admin.go, forta_provider.go, forta_backfill.go
+  bootstrap/               # First-run seeding: admin.go (first admin user)
   sso/                     # Pluggable SSO subsystem — see §6
   query/                   # MariaDB query layer (squirrel): users, identities, refresh_tokens, sso_providers, sso_sessions, settings, api_keys
   structs/                 # User/Identity/SSOProvider/SSOSession/RefreshToken/APIKey (.struct.go) + event.go + analytics.go
@@ -92,7 +92,6 @@ monitor-core/
   apikeys/                 # API-key cache (now backed by MariaDB, was ClickHouse)
   alerts/ issues/ dashboards/ views/   # Subsystems (each Init()s from main.go)
   migrations/              # ClickHouse DDL (001_schema, 002_add_user_id, 003_api_keys) + embed.go (in-app runner)
-  MIGRATION.md             # Operator runbook for the Forta→native cutover (backfill steps)
   Devfile.yaml Dockerfile docker-compose.yml docker-compose.dev.yml
 ```
 
@@ -128,15 +127,8 @@ dev down        # stop the local stack
     (added automatically by `ensureDSNParams`).
 - **Bootstrap runs after MariaDB migrations** (`main.go`): `bootstrap.EnsureAdminUser`
   seeds the first admin from `MON_ADMIN_EMAIL`/`MON_ADMIN_PASSWORD` (no-op once any user
-  exists); `bootstrap.EnsureFortaProvider` seeds the `forta` `sso_providers` row when
-  `MON_SSO_FORTA_*` is configured (idempotent, never fatal).
-- **Operator one-off (zero-lockout Forta cutover):** `./bin/monitor-core -backfill-forta
-  users.json` pre-provisions a JSON array of existing Forta users (each
-  `{subject,email,email_verified,name,role}`, keyed on `subject`, mapped to a Monitor
-  role) as active accounts with a linked `forta` identity, then exits without starting
-  the server — so a returning Forta user isn't provisioned as `pending`. Kept in
-  `main.go` (behind a `flag`) so the single-file `./main.go` Docker build stays intact.
-  Full steps: `MIGRATION.md` and `bootstrap/forta_backfill.go`.
+  exists). No SSO provider is seeded from env — providers are created through the admin
+  API / `/admin/sso`, never from Go code.
 - **Unit tests** cover pure logic and the auth layer with a mocked `Queryable`
   (`jwt/jwt_test.go`, `tools/Password_test.go`, `sso/resolve_test.go`, `sso/state_test.go`,
   `routes/HandleIdentities_test.go`, `db/sql_test.go`, `alerts/…`, `issues/…`,
@@ -184,8 +176,10 @@ dev down        # stop the local stack
 
 ### Auth model (Monitor-owned)
 
-Monitor owns identity end-to-end. Forta is no longer *the* auth — it is one row in
-`sso_providers`, indistinguishable from Google/Okta/Entra as far as the code is concerned.
+Monitor owns identity end-to-end. Every external identity provider is a row in
+`sso_providers` — Google, Okta, Entra, Forta and anything else are indistinguishable
+as far as the code is concerned. There is **no provider-specific Go code**; adding an
+IdP means filling in the form at `/admin/sso`, not shipping a build.
 
 **Data model (MariaDB `monitor_auth`) — true account linking, one user ↔ many identities:**
 
@@ -256,8 +250,9 @@ SSO-only account.
 
 - An `sso_providers` row fully describes an IdP. `kind="oidc"` → generic OIDC via go-oidc
   discovery + JWKS id_token verification (`sso/oidc.go`). `kind="oauth2"` → a tolerant
-  OAuth2 adapter (`sso/forta.go`) for non-OIDC providers (Forta's `{success,data{…}}`
-  envelope) — nothing in it is Forta-specific. Dispatch: `sso.NewAdapter` on `kind`.
+  OAuth2 adapter (`sso/oauth2.go`) for non-OIDC providers with explicit
+  authorize/token/userinfo URLs, tolerating both plain RFC 6749 replies and ones wrapped
+  in a `{success,data{…}}` envelope. Dispatch: `sso.NewAdapter` on `kind`.
 - Every adapter normalizes a login to a `NormalizedIdentity{Provider, Subject, Email,
   EmailVerified, …}`. **Subject (the OIDC `sub`), paired with Provider, is the identity —
   email is only a linking hint.**
@@ -276,8 +271,8 @@ SSO-only account.
   3. **Provision** — else, if `auto_provision`, create a fresh `role=pending` user + its
      identity; otherwise reject.
 - **`trust_email_verified`** (per-provider, default off) treats a provider's emails as
-  verified when it returns no `email_verified` claim (Forta's seed sets it). This replaced
-  a hardcoded `slug=="forta"` override — trust is now explicit config.
+  verified when it returns no `email_verified` claim. Trust is explicit per-provider
+  config, never a hardcoded slug in adapter code.
 - **Authenticated LINK flow:** `POST /auth/self/identities/{slug}` mints a link-state
   carrying the current user id; the callback attaches the returned identity to that user,
   refusing to steal one already owned by a different account, and redirects to
@@ -326,7 +321,7 @@ Both are wrapped in `recover()` and cancelled via the shutdown context.
 
 - **ClickHouse** — events/analytics. DB `monitor`, table `events` (30-day TTL).
 - **MariaDB** — auth data. DB `monitor_auth` (`mariadb:11.4`, host port 3336 locally).
-- **SSO IdPs** — any OIDC or OAuth2 provider configured in `sso_providers` (Forta seeded).
+- **SSO IdPs** — any OIDC or OAuth2 provider configured in `sso_providers` (none by default).
 - **Keyring** — optional secret injection at boot (`main.go`); skipped if `KEYRING_*` is
   absent, falling back to plain env vars. Sources `MON_DB_DSN`, `MON_JWT_SIGNING_KEY`,
   `MON_CRYPTO_KEY`, `MON_ADMIN_*`, and each provider's `client_secret_ref` in production.
@@ -363,7 +358,6 @@ Both are wrapped in `recover()` and cancelled via the shutdown context.
   | `MON_PUBLIC_URL` | `https://monitor.appleby.cloud` | origin used to build each SSO `redirect_uri` (`{base}/auth/sso/{slug}/callback`) — must match the IdP registration byte-for-byte |
   | `MON_ADMIN_EMAIL` / `MON_ADMIN_PASSWORD` | `` | seed the first admin on a fresh DB; empty = no seed |
   | `MON_ALLOW_REGISTRATION` | `false` | gates `POST /auth/register` |
-  | `MON_SSO_FORTA_AUTHORIZE_URL` / `_TOKEN_URL` / `_USERINFO_URL` / `_INTROSPECT_URL` / `_CLIENT_ID` / `_SCOPES` | `` (scopes `openid email profile`) | seed the `forta` provider row; all empty = no Forta button. The client **secret** is a Keyring ref (`MON_SSO_FORTA_CLIENT_SECRET`), not read here. |
   | `BATCH_SIZE` / `FLUSH_INTERVAL` / `QUEUE_SIZE` / `MAX_SSE_SUBSCRIBERS` | `1000` / `5s` / `100000` / `100` | ingestion/SSE tuning |
 
 - **Monitoring:** Monitor monitors itself — `mcp__monitor__monitor_service_overview` on
@@ -393,8 +387,8 @@ Both are wrapped in `recover()` and cancelled via the shutdown context.
   secret/IdP token (encrypt with AES-256-GCM). Keep the HS512 pin in `jwt/`.
 - Keep handlers thin; auth data goes through `query.*`, SSO orchestration through `sso/`.
 - Don't touch `Dockerfile`/`docker-compose*.yml`/`.github/workflows/` unless asked. The
-  Dockerfile builds the single `./main.go` — do not add a second `package main` file (the
-  `-backfill-forta` flag deliberately lives in `main.go` for this reason).
+  Dockerfile builds the single `./main.go` — do not add a second `package main` file, and
+  keep any operator CLI flags inside `main.go` for that reason.
 - Any new `/v1/*` route → update this file, the `monitor-web` docs if the UI will call it,
   and add/skip a `monitor-mcp` tool. Any change to the auth model, cookies, or schema →
   update §6 here and `monitor-web/AGENTS.md` in the same change.

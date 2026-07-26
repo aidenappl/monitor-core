@@ -14,11 +14,11 @@ import (
 
 // oauth2Adapter implements Adapter for kind="oauth2" providers — non-OIDC OAuth2
 // servers that expose explicit authorize/token/userinfo URLs and return user
-// data from a userinfo endpoint rather than a verifiable id_token. Forta is the
-// canonical example: this adapter handles its {success,data{authorization{...}}}
-// envelope, but nothing here is Forta-specific — a plain RFC 6749 provider works
-// too. Because there is no id_token, there is no nonce to verify here; state
-// (single-use, server-side) carries the CSRF/replay protection for this kind.
+// data from a userinfo endpoint rather than a verifiable id_token. It is
+// deliberately tolerant: a plain RFC 6749 provider works, and so does one that
+// wraps its replies in a {success,data{...}} envelope. Because there is no
+// id_token, there is no nonce to verify here; state (single-use, server-side)
+// carries the CSRF/replay protection for this kind.
 type oauth2Adapter struct {
 	provider *Provider
 }
@@ -65,12 +65,10 @@ func (a *oauth2Adapter) Exchange(ctx context.Context, code, verifier, nonce stri
 	}
 	email := getUserEmail(userInfo, a.provider.EmailClaim)
 
-	// Forta emails are already verified by Forta; a generic oauth2 provider is
-	// trusted only if it explicitly asserts email_verified.
 	// Trust the provider's email_verified claim when present; otherwise fall back
-	// to the per-provider TrustEmailVerified flag (config, not a hardcoded slug).
-	// Forta returns no email_verified claim but its emails are verified upstream,
-	// so its seed row sets trust_email_verified=1.
+	// to the per-provider TrustEmailVerified flag. That flag is explicit config,
+	// never a hardcoded slug — it exists for providers that verify emails upstream
+	// but return no email_verified claim.
 	emailVerified := a.provider.TrustEmailVerified ||
 		claimBool(userInfo, a.provider.EmailVerifiedClaim, "email_verified")
 
@@ -89,7 +87,7 @@ func (a *oauth2Adapter) Exchange(ctx context.Context, code, verifier, nonce stri
 
 // exchangeCode swaps an authorization code for tokens, trying three request
 // shapes for provider compatibility (JSON body → HTTP Basic → body creds),
-// then unwrapping either a standard OAuth2 response or a Forta envelope.
+// then unwrapping either a standard OAuth2 response or a wrapped envelope.
 func (a *oauth2Adapter) exchangeCode(ctx context.Context, code string) (*TokenSet, error) {
 	p := a.provider
 
@@ -99,7 +97,7 @@ func (a *oauth2Adapter) exchangeCode(ctx context.Context, code string) (*TokenSe
 		"redirect_uri": {p.RedirectURL()},
 	}
 
-	// 1. JSON body (Forta-style).
+	// 1. JSON body (some providers require this).
 	jsonBody, _ := json.Marshal(map[string]string{
 		"client_id":     *p.ClientID,
 		"client_secret": p.ClientSecret,
@@ -170,7 +168,7 @@ func doTokenRequest(req *http.Request) (*TokenSet, error) {
 		return &TokenSet{AccessToken: tr.AccessToken, RefreshToken: tr.RefreshToken}, nil
 	}
 
-	// Forta envelope: {"success":true,"data":{"authorization":{"access_token":...}}}.
+	// Wrapped envelope: {"success":true,"data":{"authorization":{"access_token":...}}}.
 	var env1 struct {
 		Success bool `json:"success"`
 		Data    struct {
@@ -181,7 +179,7 @@ func doTokenRequest(req *http.Request) (*TokenSet, error) {
 		return &TokenSet{AccessToken: env1.Data.Authorization.AccessToken, RefreshToken: env1.Data.Authorization.RefreshToken}, nil
 	}
 
-	// Forta envelope with token at data level.
+	// Wrapped envelope with the token at data level.
 	var env2 struct {
 		Success bool          `json:"success"`
 		Data    tokenResponse `json:"data"`
@@ -197,7 +195,7 @@ func doTokenRequest(req *http.Request) (*TokenSet, error) {
 	return nil, fmt.Errorf("sso: unrecognized token response: %s", string(trunc))
 }
 
-// fetchUserInfo calls the userinfo endpoint and unwraps a Forta envelope.
+// fetchUserInfo calls the userinfo endpoint and unwraps a wrapped envelope.
 func (a *oauth2Adapter) fetchUserInfo(ctx context.Context, accessToken string) (map[string]any, error) {
 	if a.provider.UserInfoURL == nil || *a.provider.UserInfoURL == "" {
 		return nil, fmt.Errorf("sso: oauth2 provider %q missing userinfo_url", a.provider.Slug)
@@ -227,7 +225,7 @@ func (a *oauth2Adapter) fetchUserInfo(ctx context.Context, accessToken string) (
 		return nil, fmt.Errorf("sso: decode userinfo: %w", err)
 	}
 
-	// Unwrap Forta envelope: {"success":...,"data":{...}}.
+	// Unwrap a wrapped envelope: {"success":...,"data":{...}}.
 	if _, hasSuccess := userInfo["success"]; hasSuccess {
 		if data, ok := userInfo["data"].(map[string]any); ok {
 			return data, nil

@@ -24,8 +24,7 @@ subsystem packages, not here. Read the root `../AGENTS.md` first.
 | `HandleAdminSSOProviders.router.go` (mounted by `RegisterSSORoutes.go`) | `GET/POST /admin/sso-providers`, `PUT/DELETE /admin/sso-providers/{slug}` |
 | `cookies.go` / `session.go` | not routes — `mon-*` cookie writing + `issueSession` (mint tokens, persist the refresh-token family) |
 
-> `self.go` (the old Forta-protected `GET /self`) has been **deleted** — native
-> `GET /auth/self` replaces it. There is no `/self` or `/forta/*` route anymore.
+> There is no bare `GET /self` — `GET /auth/self` is the current-user route.
 
 The authoritative route table (with methods, auth, and handler names) is `../main.go`
 (plus `RegisterSSORoutes.go` for the SSO/admin subrouter) — those are the single source

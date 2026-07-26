@@ -7,10 +7,9 @@ import (
 	"github.com/gorilla/mux"
 )
 
-// RegisterSSORoutes mounts the Phase 3A SSO subsystem onto r. It is ADDITIVE and
-// touches none of the existing Forta or /v1 routes. Phase 3B calls this from
-// main.go (and also calls sso.Install() to wire the revocation checkpoint); this
-// phase only exposes it so the wiring stays a single, reviewable one-liner.
+// RegisterSSORoutes mounts the SSO subsystem onto r. main.go calls this (and
+// also calls sso.Install() to wire the revocation checkpoint); keeping the
+// mounting here leaves the wiring a single, reviewable one-liner.
 //
 // Public (browser-facing, no session required):
 //

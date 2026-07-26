@@ -2,8 +2,9 @@ package structs
 
 import "time"
 
-// User is a Monitor account. One user owns many identities (password, forta,
-// google, …) — the true-linking model. Lives in MariaDB (users).
+// User is a Monitor account. One user owns many identities (password, google,
+// or any configured SSO provider) — the true-linking model. Lives in MariaDB
+// (users).
 type User struct {
 	ID            int64     `json:"id"`
 	Email         string    `json:"email"`
