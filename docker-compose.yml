@@ -10,9 +10,10 @@ services:
       NODE_ENV: production
       PORT: "3000"
       HOSTNAME: "0.0.0.0"
-      # Public origin of monitor-core (api.*). Baked into the browser bundle for
-      # the "Continue with <provider>" SSO redirect and used by the server proxy.
+      # Public origin (browser SSO redirect) vs internal origin (server-side proxy
+      # + SSE routes reach monitor-core over the container network, no hairpin).
       NEXT_PUBLIC_MONITOR_API_URL: "https://api.monitor.appleby.cloud"
+      MONITOR_API_INTERNAL_URL: "http://monitor-core:8080"
     restart: unless-stopped
     networks:
       - monitor-network
@@ -39,21 +40,20 @@ services:
       HTTP_PORT: "8080"
       CLICKHOUSE_ADDR: "clickhouse:9000"
       CLICKHOUSE_DATABASE: "monitor"
-      CLICKHOUSE_USERNAME: ${CLICKHOUSE_USERNAME}
+      CLICKHOUSE_USERNAME: ${CLICKHOUSE_USER}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       MONITOR_API_KEY: ${MONITOR_API_KEY}
-      # Keyring injects the auth secrets (MON_DB_DSN, MON_JWT_SIGNING_KEY,
-      # MON_CRYPTO_KEY, MON_ADMIN_*, MON_SSO_*) at startup from these credentials.
+      MON_DB_DSN: monitor:${MARIADB_PASSWORD}@tcp(monitor-mariadb:3306)/monitor_auth
       KEYRING_URL: ${KEYRING_URL}
       KEYRING_ACCESS_KEY_ID: ${KEYRING_ACCESS_KEY_ID}
       KEYRING_SECRET_ACCESS_KEY: ${KEYRING_SECRET_ACCESS_KEY}
-      # Public API origin (SSO redirect_uri base) and the web app origin the SSO
-      # callback redirects back to. Keyring values, if set, take precedence.
       MON_PUBLIC_URL: "https://api.monitor.appleby.cloud"
       MON_WEB_URL: "https://monitor.appleby.cloud"
-      BATCH_SIZE: ${BATCH_SIZE:-1000}
-      FLUSH_INTERVAL: ${FLUSH_INTERVAL:-5s}
-      QUEUE_SIZE: ${QUEUE_SIZE:-100000}
+      # Hardcoded, NOT ${VAR:-default} — Lattice does not resolve the shell-style
+      # ${VAR:-default} syntax (it would pass the literal through).
+      BATCH_SIZE: "1000"
+      FLUSH_INTERVAL: "5s"
+      QUEUE_SIZE: "100000"
     restart: unless-stopped
     networks:
       - monitor-network
@@ -64,7 +64,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 20s
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -81,9 +81,12 @@ services:
       - "3336:3306"
     environment:
       MARIADB_DATABASE: monitor_auth
-      MARIADB_USER: ${MARIADB_USERNAME:-monitor}
+      # Literal, NOT ${MARIADB_USERNAME:-monitor}: Lattice doesn't resolve the
+      # ${VAR:-default} syntax, which left MARIADB_USER empty so MariaDB created no
+      # app user — every 'monitor' login then failed with access-denied.
+      MARIADB_USER: monitor
       MARIADB_PASSWORD: ${MARIADB_PASSWORD}
-      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_PASSWORD}
     volumes:
       - mariadb-data:/var/lib/mysql
     restart: unless-stopped
@@ -109,7 +112,7 @@ services:
       - "9000:9000"
     environment:
       CLICKHOUSE_DB: monitor
-      CLICKHOUSE_USER: ${CLICKHOUSE_USERNAME}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     volumes:
@@ -121,7 +124,7 @@ services:
     healthcheck:
       test:
         - "CMD-SHELL"
-        - "clickhouse-client --user $${CLICKHOUSE_USER} --password $${CLICKHOUSE_PASSWORD} --query 'SELECT 1' || exit 1"
+        - "clickhouse-client --query 'SELECT 1' || exit 1"
       interval: 10s
       timeout: 5s
       retries: 5
