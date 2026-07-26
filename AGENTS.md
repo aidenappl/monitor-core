@@ -341,8 +341,16 @@ Both are wrapped in `recover()` and cancelled via the shutdown context.
 
 ## 8. Operations
 
-- **Deploy:** Docker image → `registry.appleby.cloud/monitor-core`, run under Lattice. Do
-  **not** deploy from here (repo guardrails).
+- **Deploy:** on a push to `main`, `build-and-deploy.yml` builds the image to
+  `registry.appleby.cloud/monitor-core` and then **triggers the redeploy itself** — a
+  `POST` to `LATTICE_DEPLOY_URL?container=monitor-core&commit=<sha>`. This is the same
+  step every other service in the ecosystem uses; keep it identical.
+  Two prerequisites, both outside this repo: the `LATTICE_DEPLOY_URL` repo secret, and an
+  active deploy token on the Lattice stack. `monitor-core` and `monitor-web` are
+  containers in the **same stack** ("Trailblaze Monitor"), so they share one token and one
+  URL — `?container=` is what separates them. A green CI run with no visible change means
+  checking the token's `last_used_at`: if it's `null`, CI never reached Lattice.
+- Do **not** deploy by hand from here (repo guardrails).
 - **Config (env vars, defaults from `env/env.go`):**
 
   | Var | Default | Notes |

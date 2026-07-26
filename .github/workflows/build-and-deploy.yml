@@ -52,9 +52,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Update deployment status
+      - name: Deploy to Lattice
         if: github.ref == 'refs/heads/main'
         run: |
-          echo "Deployment completed successfully!"
-          echo "Image pushed to: ${{ env.REGISTRY_URL }}/${{ github.event.repository.name }}:latest"
-          echo "Ready for Portainer deployment!"
+          echo "Triggering Lattice deployment..."
+          curl -sf -X POST "${{ secrets.LATTICE_DEPLOY_URL }}?container=${{ github.event.repository.name }}&commit=${{ github.sha }}" \
+            --max-time 30 \
+            -o /dev/null -w "HTTP %{http_code}"
+          echo ""
+          echo "Container redeployed successfully!"
