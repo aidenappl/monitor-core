@@ -6,7 +6,7 @@ import (
 	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
-	"github.com/aidenappl/monitor-core/structs"
+	ssolib "github.com/aidenappl/go-forta/sso"
 )
 
 // errNoRows is what a QueryRow scan returns for an absent row; the query layer
@@ -25,20 +25,24 @@ var userCols = []string{
 	"role", "active", "updated_at", "inserted_at",
 }
 
-func testProvider(allowAutoLink, autoProvision bool) *Provider {
-	slug := "google"
-	return &Provider{
-		SSOProvider: &structs.SSOProvider{
-			Slug:          slug,
-			Kind:          "oidc",
-			AllowAutoLink: allowAutoLink,
-			AutoProvision: autoProvision,
-		},
+// testProvider builds the LIBRARY's provider view directly.
+//
+// It does not go through LoadProvider or the row mapping, deliberately: this file
+// tests the DECISION MATRIX — known identity, safe link, provision, refuse — and
+// only four fields of the provider participate in it. Constructing the row and
+// mapping it would couple every case in this file to the mapping's shape without
+// testing anything more.
+func testProvider(allowAutoLink, autoProvision bool) *ssolib.Provider {
+	return &ssolib.Provider{
+		Slug:          "google",
+		Kind:          ssolib.KindOIDC,
+		AllowAutoLink: allowAutoLink,
+		AutoProvision: autoProvision,
 	}
 }
 
-func ni(provider, subject, email string, verified bool) NormalizedIdentity {
-	return NormalizedIdentity{
+func ni(provider, subject, email string, verified bool) ssolib.Identity {
+	return ssolib.Identity{
 		Provider:      provider,
 		Subject:       subject,
 		Email:         email,

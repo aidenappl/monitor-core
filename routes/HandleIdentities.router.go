@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 
+	ssolib "github.com/aidenappl/go-forta/sso"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/query"
@@ -61,18 +62,18 @@ func HandleLinkIdentity(w http.ResponseWriter, r *http.Request) {
 		responder.Error(w, http.StatusNotFound, "sso provider not found")
 		return
 	}
-	if !provider.Enabled {
+	if !provider.Enabled() {
 		responder.Error(w, http.StatusNotFound, "sso provider is disabled")
 		return
 	}
 
-	adapter, err := sso.NewAdapter(provider)
+	adapter, err := ssolib.NewAdapter(r.Context(), provider.Provider)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "sso provider misconfigured", err)
 		return
 	}
 
-	state, nonce, verifier, err := sso.GenerateLinkState(db.SQL, slug, linkReturnURL, user.ID)
+	state, nonce, verifier, err := ssolib.GenerateLinkState(r.Context(), sso.NewStateStore(db.SQL), slug, linkReturnURL, user.ID)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to start link", err)
 		return

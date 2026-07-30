@@ -1,14 +1,14 @@
 package routes
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"net/url"
 
+	ssolib "github.com/aidenappl/go-forta/sso"
 	"github.com/aidenappl/monitor-core/db"
-	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/sso"
-	"github.com/aidenappl/monitor-core/tools"
 )
 
 // loginErrorPath is where a failed SSO login lands, with ?error=<code>.
@@ -47,7 +47,7 @@ func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
 	// Validate + consume state (single-use). The provider slug is carried in the
 	// state record (set at /login), so the callback path itself is provider-
 	// agnostic.
-	stateData, err := sso.ConsumeState(db.SQL, state)
+	stateData, err := ssolib.ConsumeState(r.Context(), sso.NewStateStore(db.SQL), state)
 	if err != nil || stateData.Provider == "" {
 		redirectLoginError(w, r, "sso_state_invalid")
 		return
@@ -55,12 +55,12 @@ func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
 	slug := stateData.Provider
 
 	provider, err := sso.LoadProvider(db.SQL, slug)
-	if err != nil || !provider.Enabled {
+	if err != nil || !provider.Enabled() {
 		redirectLoginError(w, r, "sso_provider_unavailable")
 		return
 	}
 
-	adapter, err := sso.NewAdapter(provider)
+	adapter, err := ssolib.NewAdapter(r.Context(), provider.Provider)
 	if err != nil {
 		log.Printf("sso callback: adapter build failed for %q: %v", slug, err)
 		redirectLoginError(w, r, "sso_provider_unavailable")
@@ -84,7 +84,7 @@ func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := sso.ResolveIdentity(db.SQL, provider, *identity)
+	user, err := sso.ResolveIdentity(db.SQL, provider.Provider, *identity)
 	if err != nil {
 		log.Printf("sso callback: resolve identity failed for %q: %v", slug, err)
 		redirectLoginError(w, r, "sso_resolve_failed")
@@ -98,7 +98,7 @@ func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
 	// Cache the IdP tokens (encrypted at rest) so the checkpoint can introspect
 	// the upstream grant later. A failure here is non-fatal to login — worst
 	// case the session simply isn't checkpointed.
-	if err := cacheSSOSession(user.ID, slug, tokens); err != nil {
+	if err := cacheSSOSession(r.Context(), user.ID, slug, identity, tokens); err != nil {
 		log.Printf("sso callback: failed to cache sso session for user %d: %v", user.ID, err)
 	}
 
@@ -116,42 +116,16 @@ func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
 // already bound to a DIFFERENT user, treats a re-link of the same user as a
 // no-op success, and redirects back to the settings return_url either way. No
 // new session is issued — the caller was already authenticated.
-func linkSSOIdentity(w http.ResponseWriter, r *http.Request, engine db.Queryable, linkUserID int64, slug string, ni sso.NormalizedIdentity, returnURL string) {
-	existing, err := query.GetIdentityByProviderSubject(engine, ni.Provider, ni.Subject)
-	if err != nil {
-		log.Printf("sso link: lookup identity failed for %q: %v", slug, err)
-		redirectLinkResult(w, r, returnURL, "link_error", "sso_link_failed")
-		return
-	}
-	if existing != nil {
-		if existing.UserID == linkUserID {
-			log.Printf("sso link: %s:%s already linked to user %d (no-op)", ni.Provider, ni.Subject, linkUserID)
-			redirectLinkResult(w, r, returnURL, "linked", slug)
-			return
-		}
-		log.Printf("sso link: refusing to link %s:%s to user %d — already owned by user %d", ni.Provider, ni.Subject, linkUserID, existing.UserID)
+func linkSSOIdentity(w http.ResponseWriter, r *http.Request, engine db.Queryable, linkUserID int64, slug string, ni ssolib.Identity, returnURL string) {
+	if err := sso.LinkIdentity(engine, linkUserID, ni); err != nil {
+		// sso.LinkIdentity refuses to move an identity already owned by a different
+		// user. That refusal is the security property — without it, linking is a way
+		// to transfer an identity between accounts — so it lives in one place rather
+		// than being re-implemented per call site.
+		log.Printf("sso link: %v", err)
 		redirectLinkResult(w, r, returnURL, "link_error", "sso_already_linked")
 		return
 	}
-
-	var providerEmail *string
-	if ni.Email != "" {
-		e := ni.Email
-		providerEmail = &e
-	}
-	if _, err := query.CreateIdentity(engine, query.CreateIdentityRequest{
-		UserID:         linkUserID,
-		Provider:       ni.Provider,
-		ProviderUserID: ni.Subject,
-		ProviderEmail:  providerEmail,
-		EmailVerified:  ni.EmailVerified,
-		IdentityData:   ni.RawClaims,
-	}); err != nil {
-		log.Printf("sso link: create identity failed for user %d: %v", linkUserID, err)
-		redirectLinkResult(w, r, returnURL, "link_error", "sso_link_failed")
-		return
-	}
-
 	log.Printf("sso link: linked %s:%s onto user %d", ni.Provider, ni.Subject, linkUserID)
 	redirectLinkResult(w, r, returnURL, "linked", slug)
 }
@@ -169,20 +143,17 @@ func redirectLinkResult(w http.ResponseWriter, r *http.Request, returnURL, key, 
 	http.Redirect(w, r, u.String(), http.StatusFound)
 }
 
-// cacheSSOSession encrypts and upserts the IdP tokens for the checkpoint.
-func cacheSSOSession(userID int64, slug string, tokens *sso.TokenSet) error {
-	encAccess, err := tools.Encrypt(tokens.AccessToken)
-	if err != nil {
-		return err
-	}
-	encRefresh := ""
-	if tokens.RefreshToken != "" {
-		encRefresh, err = tools.Encrypt(tokens.RefreshToken)
-		if err != nil {
-			return err
-		}
-	}
-	return query.UpsertSSOSession(db.SQL, userID, slug, encAccess, encRefresh)
+// cacheSSOSession stores the IdP tokens for the revocation checkpoint.
+//
+// Encryption at rest is the SessionStore's job — see sso/sessionstore.go. This
+// function exists only to build the library's Session shape from what the exchange
+// returned.
+func cacheSSOSession(ctx context.Context, userID int64, slug string, identity *ssolib.Identity, tokens *ssolib.TokenSet) error {
+	return sso.NewSessionStore(db.SQL).SaveSession(ctx, userID, ssolib.Session{
+		Provider: slug,
+		Subject:  identity.Subject,
+		Tokens:   *tokens,
+	})
 }
 
 // redirectLoginError sends the browser to the web app's /login?error=<code>.

@@ -1,14 +1,76 @@
 package sso
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
 
+	ssolib "github.com/aidenappl/go-forta/sso"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/structs"
 )
+
+// Resolver implements ssolib.UserResolver for Monitor.
+//
+// ⚠️ THE LIBRARY DOES NOT CALL THIS INTERFACE — the application does, from its
+// callback handler. The interface exists to give the decision matrix a stable name
+// and to put the documented ordering somewhere a reader of the library will find
+// it. That means nothing in the library will catch an implementation that gets the
+// order wrong; resolve_test.go is what catches it, and it is the reason that file
+// must not be deleted or weakened.
+type Resolver struct {
+	Engine db.Queryable
+}
+
+// NewResolver returns a Resolver over the given engine.
+func NewResolver(engine db.Queryable) *Resolver { return &Resolver{Engine: engine} }
+
+// ResolveUser satisfies ssolib.UserResolver.
+//
+// Monitor's own callback uses ResolveIdentity directly, because it needs the full
+// user row to check user.Active before issuing a session — a user id alone cannot
+// answer that. This method is the interface-shaped view of the same logic, so the
+// two can never diverge.
+func (r *Resolver) ResolveUser(_ context.Context, p *ssolib.Provider, id ssolib.Identity) (int64, error) {
+	user, err := ResolveIdentity(r.Engine, p, id)
+	if err != nil {
+		return 0, err
+	}
+	return user.ID, nil
+}
+
+// LinkIdentity satisfies ssolib.UserResolver.
+func (r *Resolver) LinkIdentity(_ context.Context, p *ssolib.Provider, userID int64, id ssolib.Identity) error {
+	return LinkIdentity(r.Engine, userID, id)
+}
+
+// LinkIdentity attaches an identity to an already-authenticated user.
+//
+// It refuses to move an identity that is already owned by a DIFFERENT user.
+// Without that check, linking becomes a way to transfer an identity between
+// accounts: sign in as yourself, link the victim's identity, and their next SSO
+// login lands in your account.
+//
+// Re-linking the same identity to the same user is a no-op success, because a user
+// double-clicking "connect" is not an error worth showing them.
+func LinkIdentity(engine db.Queryable, userID int64, ni ssolib.Identity) error {
+	existing, err := query.GetIdentityByProviderSubject(engine, ni.Provider, ni.Subject)
+	if err != nil {
+		return fmt.Errorf("sso: lookup identity: %w", err)
+	}
+	if existing != nil {
+		if existing.UserID == userID {
+			return nil
+		}
+		return fmt.Errorf("sso: %s:%s is already linked to another user", ni.Provider, ni.Subject)
+	}
+	if _, err := createIdentityFor(engine, userID, ni); err != nil {
+		return fmt.Errorf("sso: link identity onto user %d: %w", userID, err)
+	}
+	return nil
+}
 
 // ResolveIdentity maps a NormalizedIdentity to the Monitor user it should log in
 // as, in three strictly-ordered steps. This is where the nOAuth / pre-account-
@@ -31,7 +93,7 @@ import (
 //     provisioning is disabled, the login is rejected.
 //
 // engine is a db.Queryable so this is unit-testable against a mocked DB.
-func ResolveIdentity(engine db.Queryable, p *Provider, ni NormalizedIdentity) (*structs.User, error) {
+func ResolveIdentity(engine db.Queryable, p *ssolib.Provider, ni ssolib.Identity) (*structs.User, error) {
 	if ni.Subject == "" {
 		return nil, fmt.Errorf("sso: cannot resolve identity with empty subject")
 	}
@@ -97,7 +159,7 @@ type txBeginner interface {
 // (which could log in via nothing and block re-registration), so when engine is a
 // real *sql.DB the two inserts run in one transaction. When it isn't (unit tests
 // with a mocked Queryable), it falls back to sequential inserts.
-func provisionUserWithIdentity(engine db.Queryable, ni NormalizedIdentity) (*structs.User, error) {
+func provisionUserWithIdentity(engine db.Queryable, ni ssolib.Identity) (*structs.User, error) {
 	req := query.CreateUserRequest{
 		Email:         ni.Email,
 		EmailVerified: ni.EmailVerified,
@@ -137,7 +199,7 @@ func provisionUserWithIdentity(engine db.Queryable, ni NormalizedIdentity) (*str
 }
 
 // createIdentityFor attaches ni as a new identity of userID.
-func createIdentityFor(engine db.Queryable, userID int64, ni NormalizedIdentity) (*structs.Identity, error) {
+func createIdentityFor(engine db.Queryable, userID int64, ni ssolib.Identity) (*structs.Identity, error) {
 	var providerEmail *string
 	if ni.Email != "" {
 		e := ni.Email

@@ -47,8 +47,9 @@ It **does not** own: the UI (that's `monitor-web`) or the client SDKs (`go-monit
     `db.Queryable` + squirrel-against-`database/sql` stack.
 - **CORS:** `github.com/rs/cors`.
 - **Sessions/JWT:** `github.com/golang-jwt/jwt/v5` (Monitor-owned HS512 tokens).
-- **SSO:** `github.com/coreos/go-oidc/v3` (OIDC discovery + id_token verification) and
-  `golang.org/x/oauth2`.
+- **SSO:** `github.com/aidenappl/go-forta/sso` **v1.6.0** — the shared SSO module. It brings
+  `coreos/go-oidc/v3` and `golang.org/x/oauth2` transitively; this repo no longer imports
+  either directly.
 - **Passwords/crypto:** `golang.org/x/crypto/bcrypt` (cost 12) + AES-256-GCM (`tools/Crypto.go`).
 - **Secrets:** `github.com/aidenappl/go-keyring` (optional at startup — see §4).
 - **IDs:** `github.com/google/uuid`.
@@ -74,7 +75,7 @@ monitor-core/
   jwt/jwt.go               # Monitor-owned HS512 access/refresh JWTs (mint + validate, alg-pinned)
   tools/                   # Password.tool.go (bcrypt 12), Crypto.go (AES-256-GCM), Validate.tool.go (SSRF guard)
   bootstrap/               # First-run seeding: admin.go (first admin user)
-  sso/                     # Pluggable SSO subsystem — see §6
+  sso/                     # Thin wiring onto go-forta/sso — see §6
   query/                   # MariaDB query layer (squirrel): users, identities, refresh_tokens, sso_providers, sso_sessions, settings, api_keys
   structs/                 # User/Identity/SSOProvider/SSOSession/RefreshToken/APIKey (.struct.go) + event.go + analytics.go
   middleware/
@@ -130,7 +131,7 @@ dev down        # stop the local stack
   exists). No SSO provider is seeded from env — providers are created through the admin
   API / `/admin/sso`, never from Go code.
 - **Unit tests** cover pure logic and the auth layer with a mocked `Queryable`
-  (`jwt/jwt_test.go`, `tools/Password_test.go`, `sso/resolve_test.go`, `sso/state_test.go`,
+  (`jwt/jwt_test.go`, `tools/Password_test.go`, `sso/resolve_test.go`,
   `routes/HandleIdentities_test.go`, `db/sql_test.go`, `alerts/…`, `issues/…`,
   `services/query_test.go`). No integration tests (no ClickHouse/MariaDB harness); `dev
   test` runs the unit tests.
@@ -246,16 +247,40 @@ token revokes the entire `family_id` and clears cookies (OAuth 2.0 Security BCP 
 refresh cookie isn't sent). `HandleUpdateSelf` can create a `password` identity for an
 SSO-only account.
 
-**SSO subsystem (`sso/`) — config-driven, no per-provider code beyond two adapters:**
+**SSO subsystem (`sso/`) — thin wiring onto `go-forta/sso`:**
 
-- An `sso_providers` row fully describes an IdP. `kind="oidc"` → generic OIDC via go-oidc
-  discovery + JWKS id_token verification (`sso/oidc.go`). `kind="oauth2"` → a tolerant
-  OAuth2 adapter (`sso/oauth2.go`) for non-OIDC providers with explicit
-  authorize/token/userinfo URLs, tolerating both plain RFC 6749 replies and ones wrapped
-  in a `{success,data{…}}` envelope. Dispatch: `sso.NewAdapter` on `kind`.
-- Every adapter normalizes a login to a `NormalizedIdentity{Provider, Subject, Email,
+⚠️ **THE PROTOCOL NO LONGER LIVES HERE.** Discovery, PKCE, state, nonce, id_token
+verification, UserInfo, introspection and the revocation checkpoint are all in
+`github.com/aidenappl/go-forta/sso`. This code was where they were written, and it was lifted
+out because `lattice-api` and `openbucket-api` had forked thinner copies that drifted into real
+vulnerabilities. `sso/adapter.go`, `oidc.go`, `oauth2.go`, `introspect.go` and `state.go` were
+**deleted** — do not re-add a local copy.
+
+What remains is everything the library refuses to know:
+
+| File | Role |
+|------|------|
+| `sso/config.go` | Maps an `sso_providers` row → `ssolib.Provider`; resolves the client secret (Keyring ref → env of the same name → AES-GCM column). |
+| `sso/statestore.go` | `ssolib.StateStore` over the settings KV. ⚠️ Its `ConsumeState` atomicity is the replay defence — the DELETE decides the winner, not the read. |
+| `sso/sessionstore.go` | `ssolib.SessionStore` over `sso_sessions`, with AES-256-GCM at rest. Returns `(nil, nil)` for a native login, which is what stops the checkpoint denying every password user. |
+| `sso/resolve.go` | `ssolib.UserResolver` — the link/provision decision matrix, plus `LinkIdentity`. **The most security-sensitive file here.** |
+| `sso/checkpoint.go` | Installs the library `Checkpointer` into the session middleware. |
+
+- An `sso_providers` row still fully describes an IdP; `kind` selects the library's OIDC or
+  OAuth2 adapter. A login normalizes to `ssolib.Identity{Provider, Subject, Email,
   EmailVerified, …}`. **Subject (the OIDC `sub`), paired with Provider, is the identity —
   email is only a linking hint.**
+- **What the migration fixed for free:** the old local `oauth2` adapter accepted a PKCE
+  verifier and then discarded it, hand-rolling three token requests in sequence. So PKCE was
+  configured, appeared in logs, and defended nothing — and every login performed a failing
+  request first. The library sends the verifier on one standard request, asserted end-to-end by
+  a test against a fake IdP that enforces PKCE.
+- ⚠️ **A known gap, recorded rather than hidden:** `middleware.SSOCheckpoint` is a `bool` hook,
+  so `CheckpointUnavailable` — "the IdP could not be reached and the 30-minute grace window has
+  elapsed" — is mapped to **deny**, surfacing as a 401 where it should be a 503 with
+  `Retry-After`. Denying is the right call of the two available (allowing would be the
+  unbounded fail-open the library exists to prevent), but the status is wrong. Widening the
+  hook to carry a status is the fix, and it belongs with the middleware.
 - **Login flow:** `HandleSSOLogin` mints a single-use server-side `{state, nonce, PKCE
   verifier}` record (10-min TTL, carries a sanitized same-origin `return_url`) and 302s to
   the authorize URL. `HandleSSOCallback` single-use-consumes the state (CSRF/replay gate,

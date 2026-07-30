@@ -1,88 +1,71 @@
 package sso
 
 import (
+	"context"
 	"log"
-	"time"
 
+	ssolib "github.com/aidenappl/go-forta/sso"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/middleware"
-	"github.com/aidenappl/monitor-core/query"
-	"github.com/aidenappl/monitor-core/tools"
 )
 
-// checkpointTTL is how long a checkpoint result is trusted before the IdP grant
-// is re-introspected. Short enough to catch a revocation quickly, long enough to
-// keep the IdP off the per-request hot path.
-const checkpointTTL = 5 * time.Minute
-
-// checkpointSSOGrant is the middleware.SSOCheckpoint hook. For an SSO-backed
-// session it periodically re-checks that the upstream IdP grant is still live:
+// Install wires the shared Checkpointer into the session middleware.
 //
-//   - No sso_sessions row → the session is native (password), not SSO-backed →
-//     pass (true).
-//   - Checked within checkpointTTL → trust the cached result → pass.
-//   - Otherwise introspect the IdP with the cached (decrypted) refresh token:
-//     active=false → delete the session and FAIL (false), killing the local
-//     session; a network/DB/config error → FAIL-OPEN (true) so an IdP blip does
-//     not log everyone out.
-func checkpointSSOGrant(userID int64) bool {
-	sess, err := query.GetSSOSession(db.SQL, userID)
-	if err != nil {
-		log.Printf("sso: checkpoint: load session for user %d failed, failing open: %v", userID, err)
-		return true
-	}
-	if sess == nil {
-		// Not an SSO-backed session — nothing to checkpoint.
-		return true
+// Called from main.go once the SSO subsystem is mounted. Until then the hook stays
+// nil and SessionMiddleware skips the checkpoint entirely, which is what lets the
+// service run with SSO unconfigured.
+func Install() {
+	checkpointer := &ssolib.Checkpointer{
+		Sessions:  NewSessionStore(db.SQL),
+		Providers: loadLibProvider,
+		Logf:      log.Printf,
+		// Interval and Grace are left at the library defaults — 5 minutes and 30
+		// minutes. Overriding them here would be a policy decision made in the wrong
+		// place: the reasoning for both numbers, and for why neither fail-open nor
+		// fail-closed is acceptable, lives with the constants.
 	}
 
-	if time.Since(sess.LastCheckedAt) < checkpointTTL {
-		return true
-	}
+	middleware.SSOCheckpoint = func(userID int64) bool {
+		switch checkpointer.Check(context.Background(), userID) {
+		case ssolib.CheckpointRevoked:
+			// Definitive: the IdP said the grant is gone. Deny.
+			return false
 
-	provider, err := LoadProvider(db.SQL, sess.Provider)
-	if err != nil {
-		log.Printf("sso: checkpoint: load provider %q failed, failing open: %v", sess.Provider, err)
-		return true
-	}
-	if provider.IntrospectURL == nil || *provider.IntrospectURL == "" {
-		// Provider cannot be introspected — nothing to check, just reset the TTL.
-		_ = query.TouchSSOSession(db.SQL, userID)
-		return true
-	}
+		case ssolib.CheckpointUnavailable:
+			// ⚠️ NOT THE SAME THING AS REVOKED, and Monitor currently cannot express
+			// the difference.
+			//
+			// The correct response is HTTP 503 with Retry-After, so the client waits
+			// rather than discarding its credentials and stampeding the identity
+			// provider that is already down. middleware.SSOCheckpoint is a bool hook,
+			// so the only choices available here are allow and deny.
+			//
+			// DENY is chosen: this state is only reached after the 30-minute grace
+			// window has already elapsed with no answer, so allowing would be the
+			// unbounded fail-open the library exists to prevent. The cost is that the
+			// user sees a 401 where they should see a 503.
+			//
+			// Widening the hook to return a status is the right fix and belongs with
+			// the middleware, not here. Until then this comment is the record of what
+			// is being lost.
+			log.Printf("sso: checkpoint unavailable for user %d — denying (should be 503; the middleware hook cannot express it)", userID)
+			return false
 
-	// Prefer the refresh token (long-lived) for introspection; fall back to the
-	// access token. Both are stored AES-256-GCM encrypted.
-	encToken := sess.AccessToken
-	hint := "access_token"
-	if sess.RefreshToken != nil && *sess.RefreshToken != "" {
-		encToken = *sess.RefreshToken
-		hint = "refresh_token"
+		default:
+			return true
+		}
 	}
-	token, err := tools.Decrypt(encToken)
-	if err != nil {
-		log.Printf("sso: checkpoint: decrypt token for user %d failed, failing open: %v", userID, err)
-		return true
-	}
-
-	resp, err := Introspect(provider, token, hint)
-	if err != nil {
-		log.Printf("sso: checkpoint: introspect for user %d failed, failing open: %v", userID, err)
-		return true
-	}
-	if !resp.Active {
-		log.Printf("sso: checkpoint: upstream grant revoked for user %d — killing session", userID)
-		_ = query.DeleteSSOSession(db.SQL, userID)
-		return false
-	}
-
-	_ = query.TouchSSOSession(db.SQL, userID)
-	return true
 }
 
-// Install wires checkpointSSOGrant into the session middleware. Phase 3B calls
-// this from main.go once the SSO subsystem is mounted; until then the hook stays
-// nil and SessionMiddleware skips the checkpoint entirely.
-func Install() {
-	middleware.SSOCheckpoint = checkpointSSOGrant
+// loadLibProvider adapts LoadProvider to the Checkpointer's lookup signature.
+//
+// The provider is re-resolved on every check rather than cached, so a rotated
+// client secret or a disabled provider takes effect at the next checkpoint instead
+// of at the next restart.
+func loadLibProvider(_ context.Context, slug string) (*ssolib.Provider, error) {
+	p, err := LoadProvider(db.SQL, slug)
+	if err != nil {
+		return nil, err
+	}
+	return p.Provider, nil
 }

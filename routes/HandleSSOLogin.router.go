@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	ssolib "github.com/aidenappl/go-forta/sso"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/responder"
@@ -28,12 +29,12 @@ func HandleSSOLogin(w http.ResponseWriter, r *http.Request) {
 		responder.Error(w, http.StatusNotFound, "sso provider not found")
 		return
 	}
-	if !provider.Enabled {
+	if !provider.Enabled() {
 		responder.Error(w, http.StatusNotFound, "sso provider is disabled")
 		return
 	}
 
-	adapter, err := sso.NewAdapter(provider)
+	adapter, err := ssolib.NewAdapter(r.Context(), provider.Provider)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "sso provider misconfigured", err)
 		return
@@ -41,7 +42,7 @@ func HandleSSOLogin(w http.ResponseWriter, r *http.Request) {
 
 	returnURL := safeReturnURL(r.URL.Query().Get("return_url"))
 
-	state, nonce, verifier, err := sso.GenerateState(db.SQL, slug, returnURL)
+	state, nonce, verifier, err := ssolib.GenerateState(r.Context(), sso.NewStateStore(db.SQL), slug, returnURL)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to start sso login", err)
 		return

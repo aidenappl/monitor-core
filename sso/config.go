@@ -1,16 +1,32 @@
-// Package sso implements Monitor's pluggable, config-driven SSO subsystem. A row
-// in sso_providers (see query.SSOProvider) fully describes an identity provider;
-// there is no per-provider Go code beyond two adapters:
+// Package sso wires Monitor onto the shared SSO implementation in
+// github.com/aidenappl/go-forta/sso.
 //
-//   - kind="oidc"   → generic OpenID Connect via go-oidc discovery + JWKS
-//     id_token verification (oidc.go). Any compliant OIDC provider (Google,
-//     Okta, Entra, Auth0, …) is a config row, not a code change.
-//   - kind="oauth2" → a tolerant OAuth2 adapter (oauth2.go) covering non-OIDC
-//     providers with explicit authorize/token/userinfo URLs, including ones that
-//     wrap their replies in a {success,data{...}} envelope.
+// ─────────────────────────────────────────────────────────────────────────────
+// WHAT MOVED OUT, AND WHY THIS PACKAGE STILL EXISTS
 //
-// Every adapter normalizes the login to a NormalizedIdentity keyed on
-// (Provider, Subject) — never on email (see resolve.go for why).
+// The OAuth2/OIDC protocol — discovery, PKCE, state, nonce, id_token
+// verification, UserInfo, introspection and the revocation checkpoint — now lives
+// in the shared module. This package was where that code was written, and it was
+// lifted out because two other services had forked thinner copies of it and the
+// forks had drifted into real vulnerabilities. Keeping one implementation is the
+// point; keeping THIS one as the implementation is not.
+//
+// What remains here is everything the library deliberately refuses to know:
+//
+//	config.go        — maps an sso_providers ROW onto ssolib.Provider, and
+//	                   resolves the client secret (Keyring ref, then env, then
+//	                   AES-GCM column) — three mechanisms no library should own.
+//	statestore.go    — ssolib.StateStore over Monitor's settings KV table.
+//	sessionstore.go  — ssolib.SessionStore over sso_sessions, with AES-256-GCM
+//	                   encryption at rest.
+//	resolve.go       — ssolib.UserResolver: the link/provision decision matrix.
+//	                   ⚠️ THE MOST SECURITY-SENSITIVE FILE IN THE PACKAGE.
+//	checkpoint.go    — installs the library's Checkpointer into the session
+//	                   middleware.
+//
+// Deleted: adapter.go, oidc.go, oauth2.go, introspect.go, state.go. If you are
+// looking for that code, it is in the module — do not re-add a local copy.
+// ─────────────────────────────────────────────────────────────────────────────
 package sso
 
 import (
@@ -18,34 +34,36 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
+	ssolib "github.com/aidenappl/go-forta/sso"
 	keyring "github.com/aidenappl/go-keyring"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/structs"
 	"github.com/aidenappl/monitor-core/tools"
-	"github.com/coreos/go-oidc/v3/oidc"
 )
 
-// Provider is a fully-resolved, runtime view of an sso_providers row: the stored
-// record plus its decrypted client secret. Build one with LoadProvider.
+// callbackPath is the single callback route every provider redirects to. The
+// provider is recovered from the state record rather than from the path, so one
+// exact redirect_uri is registered with every IdP.
+const callbackPath = "/auth/sso/callback"
+
+// Provider pairs the library's provider view with the stored row it came from.
+//
+// The row is retained because Monitor's own handlers need fields the library has
+// no use for — Enabled, ButtonLabel, ID — and because an admin API returns the row
+// shape, not the library's.
 type Provider struct {
-	*structs.SSOProvider
-	ClientSecret string
+	*ssolib.Provider
+
+	// Row is the sso_providers record this was built from.
+	Row *structs.SSOProvider
 }
 
-// RedirectURL is the exact redirect_uri this provider's callback runs at. It
-// MUST match byte-for-byte the value registered with the IdP (OAuth redirect_uri
-// exact-match rule), so it is derived deterministically from env.PublicBaseURL.
-func (p *Provider) RedirectURL() string {
-	base := strings.TrimRight(env.PublicBaseURL, "/")
-	return base + "/auth/sso/callback"
-}
-
-// LoadProvider fetches a provider by slug and resolves its client secret.
+// LoadProvider fetches a provider by slug, resolves its secret, and maps it onto
+// the library's Provider.
 func LoadProvider(engine db.Queryable, slug string) (*Provider, error) {
 	row, err := query.GetProviderBySlug(engine, slug)
 	if err != nil {
@@ -54,25 +72,97 @@ func LoadProvider(engine db.Queryable, slug string) (*Provider, error) {
 	if row == nil {
 		return nil, fmt.Errorf("sso: provider %q not found", slug)
 	}
+
 	secret, err := resolveSecret(row)
 	if err != nil {
 		return nil, err
 	}
-	return &Provider{SSOProvider: row, ClientSecret: secret}, nil
+
+	return &Provider{Provider: toLibProvider(row, secret), Row: row}, nil
 }
 
-// resolveSecret returns a provider's client secret. Resolution order:
-//  1. Keyring reference (client_secret_ref) — looked up live, then falling back
-//     to an env var of the same name (Keyring injects secrets into the env at
-//     boot, so a ref may already be present without a live Keyring connection).
-//  2. AES-256-GCM encrypted DB value (client_secret_enc).
+// Enabled reports whether the underlying row is enabled.
+func (p *Provider) Enabled() bool { return p.Row != nil && p.Row.Enabled }
+
+// toLibProvider maps a stored row onto the library's Provider.
 //
-// Returns "" (no error) when neither is configured — valid for public clients.
+// ⚠️ The mapping is where a nullable column becomes a plain string, so every
+// dereference is guarded. A nil IssuerURL reaching the library as "" produces a
+// clear Validate() error naming the field; a nil dereference here produces a
+// panic in the middle of a login.
+func toLibProvider(row *structs.SSOProvider, secret string) *ssolib.Provider {
+	return &ssolib.Provider{
+		Slug:        row.Slug,
+		DisplayName: row.DisplayName,
+		Kind:        ssolib.Kind(row.Kind),
+
+		IssuerURL:     deref(row.IssuerURL),
+		AuthorizeURL:  deref(row.AuthorizeURL),
+		TokenURL:      deref(row.TokenURL),
+		UserInfoURL:   deref(row.UserInfoURL),
+		IntrospectURL: deref(row.IntrospectURL),
+
+		ClientID:     deref(row.ClientID),
+		ClientSecret: secret,
+
+		Scopes:      row.Scopes,
+		RedirectURL: RedirectURL(),
+
+		SubjectClaim:       row.SubjectClaim,
+		EmailClaim:         row.EmailClaim,
+		EmailVerifiedClaim: row.EmailVerifiedClaim,
+		TrustEmailVerified: row.TrustEmailVerified,
+
+		AllowAutoLink: row.AllowAutoLink,
+		AutoProvision: row.AutoProvision,
+
+		// FetchUserInfo stays OFF for kind=oidc. Monitor reads identity from the
+		// id_token, which is signed; UserInfo would be an extra round trip on every
+		// login for claims it already has. The library still enforces the OIDC Core
+		// §5.3.2 sub check whenever it IS enabled.
+		FetchUserInfo: false,
+	}
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// RedirectURL is the exact redirect_uri Monitor's callback runs at.
+//
+// It MUST match byte-for-byte what is registered with each IdP — OAuth compares
+// redirect_uri exactly, with no normalisation of a trailing slash, case, or a
+// default port — so it is derived deterministically from env.PublicBaseURL rather
+// than reconstructed from the incoming request. Building it from the request would
+// let a Host header decide where a code may be sent.
+func RedirectURL() string {
+	return strings.TrimRight(env.PublicBaseURL, "/") + callbackPath
+}
+
+// resolveSecret returns a provider's client secret.
+//
+// Resolution order, and each step exists for a reason:
+//
+//  1. Keyring reference (client_secret_ref) — the master copy, so rotating in
+//     Keyring takes effect without touching the database.
+//  2. An environment variable of the SAME NAME as the ref. Keyring injects
+//     secrets into the environment at boot, so a ref may already be present
+//     without a live Keyring connection — this is what keeps a Keyring outage
+//     from breaking logins on an already-running process.
+//  3. AES-256-GCM encrypted column (client_secret_enc), for a provider
+//     configured entirely through the admin UI with no Keyring entry.
+//
+// Returns ("", nil) when none is configured, which is valid for a public client.
 func resolveSecret(p *structs.SSOProvider) (string, error) {
 	if p.ClientSecretRef != nil && *p.ClientSecretRef != "" {
 		ref := *p.ClientSecretRef
+
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+
 		if v, err := keyring.Get(ctx, ref); err == nil && v != "" {
 			return v, nil
 		}
@@ -81,31 +171,9 @@ func resolveSecret(p *structs.SSOProvider) (string, error) {
 		}
 		return "", fmt.Errorf("sso: could not resolve client_secret_ref %q via keyring or env", ref)
 	}
+
 	if p.ClientSecretEnc != nil && *p.ClientSecretEnc != "" {
 		return tools.Decrypt(*p.ClientSecretEnc)
 	}
 	return "", nil
-}
-
-// --- OIDC discovery cache ------------------------------------------------
-
-var (
-	discoveryMu    sync.Mutex
-	discoveryCache = map[string]*oidc.Provider{}
-)
-
-// getOIDCProvider returns a cached *oidc.Provider for issuer, performing OIDC
-// discovery ({issuer}/.well-known/openid-configuration) once per issuer.
-func getOIDCProvider(ctx context.Context, issuer string) (*oidc.Provider, error) {
-	discoveryMu.Lock()
-	defer discoveryMu.Unlock()
-	if p, ok := discoveryCache[issuer]; ok {
-		return p, nil
-	}
-	p, err := oidc.NewProvider(ctx, issuer)
-	if err != nil {
-		return nil, fmt.Errorf("sso: oidc discovery for %q: %w", issuer, err)
-	}
-	discoveryCache[issuer] = p
-	return p, nil
 }

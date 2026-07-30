@@ -525,6 +525,10 @@ GET    /auth/sso/config | /auth/sso/{slug}/login | /auth/sso/{slug}/callback
 GET/POST /admin/sso-providers   PUT/DELETE /admin/sso-providers/{slug}   (admin only)
 ```
 
+The SSO protocol itself lives in [`go-forta/sso`](https://github.com/aidenappl/go-forta/tree/main/sso)
+(v1.6.0) — this repo keeps only the parts that library refuses to know: the provider-row mapping,
+secret resolution, state and session storage, and the identity-resolution rules.
+
 SSO providers are config rows (OIDC via discovery, or explicit-URL OAuth2). Adding one —
 Google, Okta, Entra, Forta, anything else — is a `POST /admin/sso-providers`, never a
 build. Linking is nOAuth-safe: identity is keyed on `(provider, subject)`, and
