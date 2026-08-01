@@ -247,6 +247,44 @@ token revokes the entire `family_id` and clears cookies (OAuth 2.0 Security BCP 
 refresh cookie isn't sent). `HandleUpdateSelf` can create a `password` identity for an
 SSO-only account.
 
+**The public SSO config contract (`GET /auth/sso/config`) — shared shape:**
+
+One response shape across monitor-core, lattice-api and openbucket-api, so a login
+page written once renders against any of them. Modelled on Zulip's
+`server_settings`, which solves the same problem: an unauthenticated page that
+must know which providers exist before anyone has logged in.
+
+```json
+{ "providers": [ { "name": "forta", "display_name": "Forta",
+    "display_icon": "/auth/sso/icon/forta", "button_color": null,
+    "button_text_color": null, "login_url": "/auth/sso/forta/login",
+    "sort_order": 0 } ] }
+```
+
+⚠️ **This endpoint is UNAUTHENTICATED.** It carries display data only — never an
+issuer URL, `client_id`, or scope list. Adding a field here is publishing it.
+
+Three properties are security decisions rather than style:
+
+| Property | Why |
+|---|---|
+| `login_url` is **computed from the slug**, never stored | a stored URL is an admin-controlled value an unauthenticated page turns into a link the user is told to click — an open redirect with your domain on it, and a phishing lure that survives review because the page is genuine |
+| `display_icon` is **never the admin's third-party URL** | hot-linking leaks every unauthenticated visitor's IP, UA and Referer to that party, makes the page depend on their uptime, and lets them swap the image after review. The bytes are fetched once at save time and served from this origin |
+| Colours are **re-validated on render**, not only on write | validating only on write trusts that every row ever written passed that check — false for a row inserted before it existed, by a migration, or by hand. These end up inside CSS on an unauthenticated page |
+
+⚠️ **`display_icon: null` is CONTRACTUAL, not an error.** It means *render a plain
+text button*. Every client must handle it: it is the state before an icon is
+configured, and the state a provider returns to when a fetch fails. A cached asset
+resolves to `/auth/sso/icon/{slug}`; a bundled icon resolves to `bundled:<slug>`,
+a short opaque identifier the frontend maps to an asset it ships — deliberately
+not a path, which would be an admin-controlled string the page turns into a URL.
+
+**`GET /auth/sso/icon/{slug}`** serves the cached bytes with `X-Content-Type-Options:
+nosniff`, `Content-Disposition: inline`, and a 24h `Cache-Control` (not
+`immutable` — the URL carries no content hash, so the bytes genuinely can change).
+The fetch, SSRF defence and SVG rejection all live in `go-forta/sso`'s
+`FetchIcon`; this repo only stores and serves.
+
 **SSO subsystem (`sso/`) — thin wiring onto `go-forta/sso`:**
 
 ⚠️ **THE PROTOCOL NO LONGER LIVES HERE.** Discovery, PKCE, state, nonce, id_token

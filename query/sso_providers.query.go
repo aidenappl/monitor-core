@@ -2,6 +2,7 @@ package query
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 
 	sq "github.com/Masterminds/squirrel"
@@ -15,6 +16,11 @@ var ssoProviderColumns = []string{
 	"client_secret_ref", "client_secret_enc", "scopes", "email_claim",
 	"email_verified_claim", "trust_email_verified", "subject_claim", "button_label",
 	"allow_auto_link", "auto_provision", "enabled", "inserted_at",
+	// Branding. icon_cache_data is DELIBERATELY ABSENT — it is a MEDIUMBLOB and
+	// this list is used by the admin listing, so including it would ship every
+	// provider's image bytes on every page load. GetProviderIcon reads it.
+	"display_icon", "icon_url", "icon_cache_type", "icon_cached_at", "icon_error",
+	"button_color", "button_text_color", "sort_order",
 }
 
 type ssoProviderScanner interface {
@@ -29,6 +35,8 @@ func scanSSOProvider(row ssoProviderScanner) (*structs.SSOProvider, error) {
 		&p.ClientSecretRef, &p.ClientSecretEnc, &p.Scopes, &p.EmailClaim,
 		&p.EmailVerifiedClaim, &p.TrustEmailVerified, &p.SubjectClaim, &p.ButtonLabel,
 		&p.AllowAutoLink, &p.AutoProvision, &p.Enabled, &p.InsertedAt,
+		&p.DisplayIcon, &p.IconURL, &p.IconCacheType, &p.IconCachedAt, &p.IconError,
+		&p.ButtonColor, &p.ButtonTextColor, &p.SortOrder,
 	)
 	return &p, err
 }
@@ -49,7 +57,7 @@ func listProviders(engine db.Queryable, where sq.Sqlizer) ([]structs.SSOProvider
 	if where != nil {
 		q = q.Where(where)
 	}
-	query, args, err := q.OrderBy("slug ASC").ToSql()
+	query, args, err := q.OrderBy("sort_order ASC", "slug ASC").ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("build query: %w", err)
 	}
@@ -277,4 +285,69 @@ func derefStr(p *string) string {
 
 func derefBool(p *bool) bool {
 	return p != nil && *p
+}
+
+// GetProviderIcon returns the cached icon bytes for a slug.
+//
+// Separate from the provider listing on purpose: icon_cache_data is a MEDIUMBLOB
+// and the listing is loaded by the admin page and the public config endpoint, so
+// carrying image bytes there would ship them on every request that only wanted a
+// button label.
+//
+// Returns ("", nil, nil) when the provider exists but has no cached icon — the
+// caller renders a text button, which is the contractual fallback.
+func GetProviderIcon(engine db.Queryable, slug string) (contentType string, data []byte, err error) {
+	row := engine.QueryRow(
+		"SELECT icon_cache_type, icon_cache_data FROM sso_providers WHERE slug = ? AND enabled = 1",
+		slug,
+	)
+
+	var ct sql.NullString
+	var blob []byte
+	if err := row.Scan(&ct, &blob); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil, nil
+		}
+		return "", nil, err
+	}
+	if !ct.Valid || len(blob) == 0 {
+		return "", nil, nil
+	}
+	return ct.String, blob, nil
+}
+
+// SetProviderIcon stores a freshly fetched icon, or records why the fetch failed.
+//
+// ⚠️ BOTH OUTCOMES ARE A SUCCESSFUL WRITE. A failed fetch must never block saving
+// the provider — an administrator correcting an issuer URL must not be stopped by
+// a logo that 404s. On failure the bytes are cleared, the reason is recorded, and
+// the login page falls back to a text button.
+func SetProviderIcon(engine db.Queryable, slug, contentType string, data []byte, fetchErr string) error {
+	if fetchErr != "" {
+		_, err := engine.Exec(
+			`UPDATE sso_providers
+			 SET icon_cache_data = NULL, icon_cache_type = NULL, icon_cached_at = NULL, icon_error = ?
+			 WHERE slug = ?`,
+			truncateError(fetchErr), slug,
+		)
+		return err
+	}
+	_, err := engine.Exec(
+		`UPDATE sso_providers
+		 SET icon_cache_data = ?, icon_cache_type = ?, icon_cached_at = NOW(), icon_error = NULL
+		 WHERE slug = ?`,
+		data, contentType, slug,
+	)
+	return err
+}
+
+// truncateError bounds an error message to the column width. The message
+// originates from a remote server in some cases, so it is both untrusted and
+// unbounded.
+func truncateError(s string) string {
+	const max = 250
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }

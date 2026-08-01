@@ -14,6 +14,7 @@ import (
 // Public (browser-facing, no session required):
 //
 //	GET  /auth/sso/config              provider discovery for the login page
+//	GET  /auth/sso/icon/{slug}         cached provider icon, served from this origin
 //	GET  /auth/sso/{slug}/login        begin an SSO login (302 to the IdP)
 //	GET  /auth/sso/callback            IdP redirect target (provider from state); mints a Monitor session
 //
@@ -27,6 +28,11 @@ func RegisterSSORoutes(r *mux.Router) {
 	// Public SSO endpoints — all GET, so inherently CSRF-safe.
 	r.HandleFunc("/auth/sso/config", HandleSSOConfig).Methods(http.MethodGet)
 	r.HandleFunc("/auth/sso/{slug}/login", HandleSSOLogin).Methods(http.MethodGet)
+	// The cached provider icon. Public by necessity — the login page is
+	// unauthenticated — and safe because it returns only bytes this server
+	// re-encoded itself, for an enabled provider. Registered BEFORE the callback so
+	// the {slug} pattern above cannot swallow "icon".
+	r.HandleFunc("/auth/sso/icon/{slug}", HandleSSOIcon).Methods(http.MethodGet)
 	r.HandleFunc("/auth/sso/callback", HandleSSOCallback).Methods(http.MethodGet)
 
 	// Admin SSO provider CRUD — authenticated as an active user, then gated to

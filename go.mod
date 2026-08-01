@@ -17,13 +17,14 @@ require (
 
 require (
 	github.com/coreos/go-oidc/v3 v3.20.0 // indirect
+	golang.org/x/image v0.44.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 )
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/ClickHouse/ch-go v0.71.0 // indirect
-	github.com/aidenappl/go-forta v1.6.0
+	github.com/aidenappl/go-forta v1.7.0
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-faster/city v1.0.1 // indirect
