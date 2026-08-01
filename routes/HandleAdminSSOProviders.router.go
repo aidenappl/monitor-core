@@ -1,9 +1,12 @@
 package routes
 
 import (
+	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 
+	sso "github.com/aidenappl/go-forta/sso"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
@@ -37,6 +40,17 @@ type adminProviderView struct {
 	AutoProvision      bool    `json:"auto_provision"`
 	Enabled            bool    `json:"enabled"`
 	HasSecret          bool    `json:"has_secret"`
+
+	DisplayIcon     *string `json:"display_icon,omitempty"`
+	IconURL         *string `json:"icon_url,omitempty"`
+	ButtonColor     *string `json:"button_color,omitempty"`
+	ButtonTextColor *string `json:"button_text_color,omitempty"`
+	SortOrder       int     `json:"sort_order"`
+
+	// HasIcon and IconError let the admin UI show whether the last fetch worked
+	// and, when it did not, why — without shipping the image bytes in a listing.
+	HasIcon   bool    `json:"has_icon"`
+	IconError *string `json:"icon_error,omitempty"`
 }
 
 func toAdminView(p *structs.SSOProvider) adminProviderView {
@@ -58,6 +72,13 @@ func toAdminView(p *structs.SSOProvider) adminProviderView {
 		TrustEmailVerified: p.TrustEmailVerified,
 		SubjectClaim:       p.SubjectClaim,
 		ButtonLabel:        p.ButtonLabel,
+		DisplayIcon:        p.DisplayIcon,
+		IconURL:            p.IconURL,
+		ButtonColor:        p.ButtonColor,
+		ButtonTextColor:    p.ButtonTextColor,
+		SortOrder:          p.SortOrder,
+		HasIcon:            p.IconCacheType != nil && *p.IconCacheType != "",
+		IconError:          p.IconError,
 		AllowAutoLink:      p.AllowAutoLink,
 		AutoProvision:      p.AutoProvision,
 		Enabled:            p.Enabled,
@@ -106,6 +127,97 @@ type ssoProviderBody struct {
 	AllowAutoLink      *bool   `json:"allow_auto_link"`
 	AutoProvision      *bool   `json:"auto_provision"`
 	Enabled            *bool   `json:"enabled"`
+
+	// ── Branding ────────────────────────────────────────────────────────────
+	DisplayIcon     *string `json:"display_icon"`
+	IconURL         *string `json:"icon_url"`
+	ButtonColor     *string `json:"button_color"`
+	ButtonTextColor *string `json:"button_text_color"`
+	SortOrder       *int    `json:"sort_order"`
+}
+
+// bundledIcons is the set of icon slugs the frontends ship an asset for.
+//
+// ⚠️ AN ALLOWLIST, NOT FREE TEXT, and that is the point. display_icon is sent to
+// an unauthenticated login page which turns it into something it renders; if any
+// string were accepted, an administrator could put a path or a URL there. Adding
+// an icon here means shipping the asset in the frontends in the same change.
+var bundledIcons = map[string]bool{
+	"google": true, "github": true, "microsoft": true,
+	"forta": true, "okta": true, "gitlab": true, "apple": true,
+}
+
+// validateBranding checks the branding fields. Returns a client-facing message
+// and false on the first failure.
+//
+// ⚠️ COLOURS ARE VALIDATED HERE **AND AGAIN ON RENDER** (see safeColor in
+// HandleSSOConfig). Belt and braces on purpose: these values reach CSS on an
+// unauthenticated page, and validating only on write trusts that every row ever
+// stored came through this function — untrue for anything inserted by a
+// migration or by hand.
+func validateBranding(body *ssoProviderBody) (string, bool) {
+	if body.DisplayIcon != nil && *body.DisplayIcon != "" && !bundledIcons[*body.DisplayIcon] {
+		return "display_icon: not a bundled icon slug", false
+	}
+	for _, c := range []struct {
+		name string
+		val  *string
+	}{
+		{"button_color", body.ButtonColor},
+		{"button_text_color", body.ButtonTextColor},
+	} {
+		if c.val != nil && *c.val != "" && !hexColor.MatchString(*c.val) {
+			return c.name + ": must be #rrggbb", false
+		}
+	}
+	// icon_url goes through the same SSRF guard as every other provider URL. It is
+	// checked again, more thoroughly, inside sso.FetchIcon — this is the early,
+	// cheap refusal so an obviously-bad value never reaches the fetch.
+	if body.IconURL != nil && *body.IconURL != "" {
+		if err := tools.ValidateExternalURL(*body.IconURL); err != nil {
+			return "icon_url: " + err.Error(), false
+		}
+	}
+	return "", true
+}
+
+// refreshProviderIcon fetches, validates and caches a provider's icon.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// ⚠️ A FAILED FETCH MUST NEVER FAIL THE SAVE.
+//
+// An administrator correcting an issuer URL must not be blocked because the logo
+// they set last week now 404s. The provider is already written by the time this
+// runs; the outcome here only decides whether an icon is cached or an error is
+// recorded, and the login page falls back to a text button either way.
+//
+// It runs SYNCHRONOUSLY rather than in a goroutine, deliberately: the admin who
+// pressed Save is the person who can fix a bad URL, and they should be told now
+// rather than discovering it on the login page later. sso.FetchIcon is bounded at
+// five seconds, which is an acceptable cost on an infrequent admin action.
+// ─────────────────────────────────────────────────────────────────────────────
+func refreshProviderIcon(ctx context.Context, slug string, iconURL *string) {
+	if iconURL == nil || *iconURL == "" {
+		// Cleared, or never set. Drop any cached bytes so removing the URL actually
+		// removes the icon rather than leaving a stale one served forever.
+		if err := query.SetProviderIcon(db.SQL, slug, "", nil, ""); err != nil {
+			log.Printf("sso: failed to clear icon for %q: %v", slug, err)
+		}
+		return
+	}
+
+	icon, err := sso.FetchIcon(ctx, *iconURL)
+	if err != nil {
+		log.Printf("sso: icon fetch failed for %q: %v", slug, err)
+		if setErr := query.SetProviderIcon(db.SQL, slug, "", nil, err.Error()); setErr != nil {
+			log.Printf("sso: failed to record icon error for %q: %v", slug, setErr)
+		}
+		return
+	}
+
+	if err := query.SetProviderIcon(db.SQL, slug, icon.ContentType, icon.Data, ""); err != nil {
+		log.Printf("sso: failed to cache icon for %q: %v", slug, err)
+	}
 }
 
 // validateProviderURLs runs the SSRF guard over every provider URL present in
@@ -148,6 +260,10 @@ func HandleCreateSSOProvider(w http.ResponseWriter, r *http.Request) {
 		responder.Error(w, http.StatusBadRequest, msg)
 		return
 	}
+	if msg, ok := validateBranding(&body); !ok {
+		responder.Error(w, http.StatusBadRequest, msg)
+		return
+	}
 
 	req := query.CreateProviderRequest{
 		Slug:               *body.Slug,
@@ -169,6 +285,12 @@ func HandleCreateSSOProvider(w http.ResponseWriter, r *http.Request) {
 		AllowAutoLink:      body.AllowAutoLink,
 		AutoProvision:      body.AutoProvision,
 		Enabled:            body.Enabled,
+
+		DisplayIcon:     body.DisplayIcon,
+		IconURL:         body.IconURL,
+		ButtonColor:     body.ButtonColor,
+		ButtonTextColor: body.ButtonTextColor,
+		SortOrder:       body.SortOrder,
 	}
 	if body.Kind != nil {
 		req.Kind = *body.Kind
@@ -186,6 +308,16 @@ func HandleCreateSSOProvider(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to create sso provider", err)
 		return
+	}
+
+	// After the write, never before: the icon is decoration and its failure must
+	// not cost the administrator the provider they just configured.
+	refreshProviderIcon(r.Context(), provider.Slug, body.IconURL)
+
+	// Re-read so the response carries the icon state this request just produced,
+	// rather than the pre-fetch row.
+	if fresh, ferr := query.GetProviderBySlug(db.SQL, provider.Slug); ferr == nil && fresh != nil {
+		provider = fresh
 	}
 	responder.New(w, toAdminView(provider), "sso provider created")
 }
@@ -205,6 +337,10 @@ func HandleUpdateSSOProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if msg, ok := validateProviderURLs(&body); !ok {
+		responder.Error(w, http.StatusBadRequest, msg)
+		return
+	}
+	if msg, ok := validateBranding(&body); !ok {
 		responder.Error(w, http.StatusBadRequest, msg)
 		return
 	}
@@ -229,6 +365,12 @@ func HandleUpdateSSOProvider(w http.ResponseWriter, r *http.Request) {
 		AllowAutoLink:      body.AllowAutoLink,
 		AutoProvision:      body.AutoProvision,
 		Enabled:            body.Enabled,
+
+		DisplayIcon:     body.DisplayIcon,
+		IconURL:         body.IconURL,
+		ButtonColor:     body.ButtonColor,
+		ButtonTextColor: body.ButtonTextColor,
+		SortOrder:       body.SortOrder,
 	}
 	if body.ClientSecret != nil && *body.ClientSecret != "" {
 		enc, err := tools.Encrypt(*body.ClientSecret)
@@ -253,6 +395,19 @@ func HandleUpdateSSOProvider(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to update sso provider", err)
 		return
+	}
+
+	// Re-fetch the icon only when icon_url was actually part of this request.
+	//
+	// ⚠️ The nil check matters. This is a PATCH-shaped endpoint — an absent field
+	// means "leave it alone". Refetching unconditionally would hit the third party
+	// on every unrelated save (toggling `enabled`, fixing a scope), and clearing on
+	// a nil would delete a working icon the moment anyone edited anything else.
+	if body.IconURL != nil {
+		refreshProviderIcon(r.Context(), slug, body.IconURL)
+		if fresh, ferr := query.GetProviderBySlug(db.SQL, slug); ferr == nil && fresh != nil {
+			provider = fresh
+		}
 	}
 	responder.New(w, toAdminView(provider), "sso provider updated")
 }

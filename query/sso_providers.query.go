@@ -126,6 +126,13 @@ type CreateProviderRequest struct {
 	AllowAutoLink      *bool
 	AutoProvision      *bool
 	Enabled            *bool
+
+	// Branding. All optional; nil means "not supplied" on both create and update.
+	DisplayIcon     *string
+	IconURL         *string
+	ButtonColor     *string
+	ButtonTextColor *string
+	SortOrder       *int
 }
 
 // CreateProvider inserts a new provider and returns the hydrated row.
@@ -148,6 +155,10 @@ func CreateProvider(engine db.Queryable, req CreateProviderRequest) (*structs.SS
 		"client_secret_ref": req.ClientSecretRef,
 		"client_secret_enc": req.ClientSecretEnc,
 		"button_label":      req.ButtonLabel,
+		"display_icon":      req.DisplayIcon,
+		"icon_url":          req.IconURL,
+		"button_color":      req.ButtonColor,
+		"button_text_color": req.ButtonTextColor,
 	}
 	if req.Scopes != nil {
 		cols["scopes"] = *req.Scopes
@@ -172,6 +183,11 @@ func CreateProvider(engine db.Queryable, req CreateProviderRequest) (*structs.SS
 	}
 	if req.Enabled != nil {
 		cols["enabled"] = *req.Enabled
+	}
+	// sort_order is NOT NULL with a default of 0, so it is set only when supplied
+	// rather than being written as a nil that the driver would reject.
+	if req.SortOrder != nil {
+		cols["sort_order"] = *req.SortOrder
 	}
 
 	columns := make([]string, 0, len(cols))
@@ -214,6 +230,13 @@ type UpdateProviderRequest struct {
 	AllowAutoLink      *bool
 	AutoProvision      *bool
 	Enabled            *bool
+
+	// Branding. All optional; nil means "not supplied" on both create and update.
+	DisplayIcon     *string
+	IconURL         *string
+	ButtonColor     *string
+	ButtonTextColor *string
+	SortOrder       *int
 }
 
 // UpdateProvider applies a partial update and returns the refreshed row.
@@ -249,6 +272,18 @@ func UpdateProvider(engine db.Queryable, slug string, req UpdateProviderRequest)
 	apply("allow_auto_link", derefBool(req.AllowAutoLink), req.AllowAutoLink != nil)
 	apply("auto_provision", derefBool(req.AutoProvision), req.AutoProvision != nil)
 	apply("enabled", derefBool(req.Enabled), req.Enabled != nil)
+
+	// Branding. Each applies only when the field was present in the request, so an
+	// unrelated save (toggling `enabled`, fixing a scope) cannot silently clear a
+	// provider's icon or colours — this endpoint is PATCH-shaped and an absent
+	// field means "leave it alone".
+	apply("display_icon", req.DisplayIcon, req.DisplayIcon != nil)
+	apply("icon_url", req.IconURL, req.IconURL != nil)
+	apply("button_color", req.ButtonColor, req.ButtonColor != nil)
+	apply("button_text_color", req.ButtonTextColor, req.ButtonTextColor != nil)
+	if req.SortOrder != nil {
+		apply("sort_order", *req.SortOrder, true)
+	}
 
 	if !hasUpdate {
 		return GetProviderBySlug(engine, slug)

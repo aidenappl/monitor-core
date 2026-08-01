@@ -154,3 +154,33 @@ func TestDisplayLabel(t *testing.T) {
 		t.Fatalf("label = %q; an empty button label must fall back rather than render an empty button", got)
 	}
 }
+
+// TestBundledIcons pins the allowlist.
+//
+// ⚠️ display_icon is sent to an UNAUTHENTICATED login page which turns it into
+// something it renders. Accepting free text would let an administrator put a path
+// or a URL there. The allowlist means the only thing they choose is which asset
+// the frontend already ships.
+func TestBundledIcons(t *testing.T) {
+	for _, slug := range []string{"google", "github", "microsoft", "forta", "okta", "gitlab", "apple"} {
+		if !bundledIcons[slug] {
+			t.Errorf("%q is missing from the bundled icon allowlist", slug)
+		}
+	}
+
+	rejected := []struct{ value, why string }{
+		{"../../etc/passwd", "a traversal path must not be accepted as an icon identifier"},
+		{"https://evil.example/logo.png", "a URL belongs in icon_url, where it is fetched and validated — not here, where it would be rendered directly"},
+		{"/static/anything.svg", "an absolute path would let an administrator point the login page at any asset"},
+		{"data:image/svg+xml;base64,PHN2Zz4=", "a data URI is a way to smuggle an inline SVG past the fetch pipeline entirely"},
+		{"GOOGLE", "matching is exact; a case variant is not an asset the frontend ships"},
+		{"", "empty is handled by the caller as 'not set', never as a lookup"},
+	}
+	for _, tt := range rejected {
+		t.Run("rejects_"+tt.value, func(t *testing.T) {
+			if bundledIcons[tt.value] {
+				t.Fatalf("%q is in the bundled icon allowlist. %s", tt.value, tt.why)
+			}
+		})
+	}
+}
