@@ -29,6 +29,14 @@ import (
 // It deliberately does not assert a 200: a valid signed logout token would
 // require a real IdP, and go-forta's backchannel_test.go already covers
 // verification. What matters here is that the request REACHES the handler.
+//
+// ⚠️ AND THAT IS EXACTLY AS FAR AS THIS FILE CAN SEE. It builds a bare
+// mux.Router, so it proves nothing about main.go's global middleware stack —
+// which is where the endpoint actually broke in production on 2026-08-08:
+// CSRFMiddleware refused the POST with 403 "missing csrf cookie" while every
+// assertion below still passed. The middleware half lives in
+// middleware/csrf_test.go, and a change to this endpoint's path must be made in
+// BOTH places or one of them is testing a URL that no longer exists.
 // ─────────────────────────────────────────────────────────────────────────────
 func TestBackchannelLogoutRouteIsMountedAndPublic(t *testing.T) {
 	r := mux.NewRouter()

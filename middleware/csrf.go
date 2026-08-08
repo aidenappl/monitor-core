@@ -31,6 +31,32 @@ func isSSOCallbackPath(path string) bool {
 	return strings.HasPrefix(path, "/auth/sso/") && strings.HasSuffix(path, "/callback")
 }
 
+// isBackchannelLogoutPath matches /auth/sso/{slug}/backchannel-logout.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// ⚠️ EXEMPT, AND WITHOUT THE EXEMPTION THE FEATURE IS SILENTLY DEAD.
+//
+// This is a server-to-server POST from the identity provider (OIDC Back-Channel
+// Logout 1.0 §2.5). It carries no cookie, no Bearer token and no X-Api-Key, so
+// it falls through every other exemption above and is refused 403 "missing csrf
+// cookie". Forta then retries six times, marks the delivery exhausted, and the
+// operator sees a receiver that looks broken — while revocation quietly stays at
+// poll speed. Observed in production on 2026-08-08, from an endpoint whose unit
+// test passed because it exercised the router WITHOUT this middleware.
+//
+// Exempting it is correct, not a concession. CSRF defends against a browser
+// being tricked into spending AMBIENT AUTHORITY — cookies it already holds. This
+// endpoint has none: it reads no cookie and no session, and its sole
+// authentication is the signature on the logout token, verified against the
+// provider's JWKS and against our client_id. A forged cross-site POST arriving
+// here without a validly signed token is rejected by that verification, which is
+// strictly stronger than a double-submit cookie. The CSRF check can only ever
+// reject the legitimate caller.
+// ─────────────────────────────────────────────────────────────────────────────
+func isBackchannelLogoutPath(path string) bool {
+	return strings.HasPrefix(path, "/auth/sso/") && strings.HasSuffix(path, "/backchannel-logout")
+}
+
 // CSRFMiddleware implements the double-submit-cookie pattern. A non-HttpOnly
 // mon-csrf cookie (SameSite=Strict) must be echoed back in the X-CSRF-Token
 // header on unsafe requests, and the two are compared in constant time. Safe
@@ -66,7 +92,7 @@ func CSRFMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if csrfExemptPaths[r.URL.Path] || isSSOCallbackPath(r.URL.Path) {
+		if csrfExemptPaths[r.URL.Path] || isSSOCallbackPath(r.URL.Path) || isBackchannelLogoutPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}

@@ -258,6 +258,21 @@ Session-gating it would reject every genuine notification — invisibly, and ind
 "nothing has been revoked yet". `routes/backchannel_route_test.go` pins both that failure mode and
 the not-mounted-at-all one (a 404 that Forta retries to exhaustion while nothing here logs a thing).
 
+⚠️ **It is exempt from `CSRFMiddleware`, and must stay exempt.** The notification is a
+server-to-server POST with no cookie, no Bearer token and no `X-Api-Key`, so it falls through
+every other exemption and is refused **403 `missing csrf cookie` (4030)**. That shipped on
+2026-08-08 and made the feature silently dead: Forta retried six times, marked each delivery
+exhausted, and revocation stayed at poll speed while the endpoint looked like a broken receiver.
+Exempting is correct rather than a concession — CSRF defends ambient cookie authority, and this
+endpoint has none; its only authentication is the signature on the logout token, which is
+strictly stronger. See `isBackchannelLogoutPath`.
+
+⚠️ **The routing test alone is not sufficient**, and this is the reason the bug shipped.
+`routes/backchannel_route_test.go` builds a bare `mux.Router`, so it cannot see the global
+middleware stack — every one of its assertions passed while production returned 403.
+`middleware/csrf_test.go` covers that half. **Changing this endpoint's path means changing both**,
+or one of them silently tests a URL that no longer exists.
+
 ⚠️ **It does NOT replace the checkpoint.** Back-channel logout is best-effort *by specification* —
 notifications can be lost and retries can be exhausted — so the 5-minute poll stays the guarantee
 and this is the fast path. Do not relax `CheckpointInterval` because this exists.
