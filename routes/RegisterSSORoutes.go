@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/aidenappl/monitor-core/middleware"
+	"github.com/aidenappl/monitor-core/sso"
 	"github.com/gorilla/mux"
 )
 
@@ -34,6 +35,21 @@ func RegisterSSORoutes(r *mux.Router) {
 	// the {slug} pattern above cannot swallow "icon".
 	r.HandleFunc("/auth/sso/icon/{slug}", HandleSSOIcon).Methods(http.MethodGet)
 	r.HandleFunc("/auth/sso/callback", HandleSSOCallback).Methods(http.MethodGet)
+
+	// OIDC Back-Channel Logout 1.0 §2.5 — a form POST from the identity provider,
+	// not from a browser.
+	//
+	// ⚠️ PUBLIC AND UNAUTHENTICATED IN THE ORDINARY SENSE: no cookie, no bearer
+	// token. Its authentication IS the signature on the logout token, checked
+	// against the provider's JWKS and against this client_id. It must NOT be moved
+	// under SessionMiddleware — the caller is Forta, which holds no Monitor
+	// session, so requiring one would reject every genuine notification.
+	//
+	// Registered per slug rather than with a {slug} variable: the handler is built
+	// around one provider's verifier, and a path variable would invite pointing a
+	// notification at a provider that did not send it.
+	r.Handle("/auth/sso/forta/backchannel-logout",
+		sso.BackchannelLogoutHandler("forta")).Methods(http.MethodPost)
 
 	// Admin SSO provider CRUD — authenticated as an active user, then gated to
 	// role=admin. RequireAdmin reads the user SessionMiddleware puts in context.

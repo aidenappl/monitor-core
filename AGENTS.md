@@ -190,7 +190,7 @@ IdP means filling in the form at `/admin/sso`, not shipping a build.
 | `identities` | One sign-in method per row, `UNIQUE(provider, provider_user_id)`. `provider="password"` stores a bcrypt hash in `password_hash`; SSO rows store the claim envelope in `identity_data`. **`(provider, provider_user_id)` is the ONLY identity key — never email.** `FK → users ON DELETE CASCADE`. |
 | `refresh_tokens` | Rotating-refresh store. Only the SHA-256 `token_hash` (`BINARY(32)`) is persisted; tokens minted from one login share a `family_id`; rotation stamps `replaced_by`. |
 | `sso_providers` | One configured IdP per row (see below). |
-| `sso_sessions` | One row per SSO-backed user (`user_id` PK) caching the AES-256-GCM-encrypted IdP tokens so the checkpoint can re-introspect the upstream grant. |
+| `sso_sessions` | One row per SSO-backed user (`user_id` PK) caching the AES-256-GCM-encrypted IdP tokens so the checkpoint can re-introspect the upstream grant. Also carries `subject` and `sid` (migration 109) — the two things a back-channel logout token can name. **Neither can be backfilled**: `sid` exists only in the id_token of the login that created the row, so a session written without one is unreachable by a session-scoped logout for its whole life. |
 | `settings` | Key/value app settings. |
 | `api_keys` | Ingest/admin API keys (`scope` = `admin`\|`ingest`). Moved here from ClickHouse. |
 
@@ -233,6 +233,7 @@ DELETE /auth/self/identities/{slug}         unlink (refuses the last identity)  
 GET    /auth/sso/config                     enabled providers for the login page  [public] → [{slug,button_label,login_url}]
 GET    /auth/sso/{slug}/login               302 to the IdP                        [public]
 GET    /auth/sso/{slug}/callback            IdP redirect target → session         [public, CSRF-exempt]
+POST   /auth/sso/forta/backchannel-logout   OIDC Back-Channel Logout 1.0 §2.5     [public — signature IS the auth]
 GET    /admin/sso-providers                 list providers (secrets never returned)  [Protected + RequireAdmin]
 POST   /admin/sso-providers                 create a provider                     [Protected + RequireAdmin]
 PUT    /admin/sso-providers/{slug}          update a provider                     [Protected + RequireAdmin]
@@ -246,6 +247,20 @@ token revokes the entire `family_id` and clears cookies (OAuth 2.0 Security BCP 
 `HandleLogout` revokes the family (or all of the user's tokens when the path-scoped
 refresh cookie isn't sent). `HandleUpdateSelf` can create a `password` identity for an
 SSO-only account.
+
+**Back-channel logout (`POST /auth/sso/forta/backchannel-logout`).** Forta pushes a signed
+`logout_token` the instant a grant is revoked, closing the checkpoint's 5-minute window.
+
+⚠️ **It is public on purpose and must never move under `SessionMiddleware`.** The caller is
+Forta, which holds no Monitor session and no cookie; its only authentication is the signature on
+the token, verified against Forta's JWKS and against this `client_id` inside go-forta's handler.
+Session-gating it would reject every genuine notification — invisibly, and indistinguishably from
+"nothing has been revoked yet". `routes/backchannel_route_test.go` pins both that failure mode and
+the not-mounted-at-all one (a 404 that Forta retries to exhaustion while nothing here logs a thing).
+
+⚠️ **It does NOT replace the checkpoint.** Back-channel logout is best-effort *by specification* —
+notifications can be lost and retries can be exhausted — so the 5-minute poll stays the guarantee
+and this is the fast path. Do not relax `CheckpointInterval` because this exists.
 
 **The public SSO config contract (`GET /auth/sso/config`) — shared shape:**
 
@@ -300,7 +315,8 @@ What remains is everything the library refuses to know:
 |------|------|
 | `sso/config.go` | Maps an `sso_providers` row → `ssolib.Provider`; resolves the client secret (Keyring ref → env of the same name → AES-GCM column). |
 | `sso/statestore.go` | `ssolib.StateStore` over the settings KV. ⚠️ Its `ConsumeState` atomicity is the replay defence — the DELETE decides the winner, not the read. |
-| `sso/sessionstore.go` | `ssolib.SessionStore` over `sso_sessions`, with AES-256-GCM at rest. Returns `(nil, nil)` for a native login, which is what stops the checkpoint denying every password user. |
+| `sso/sessionstore.go` | `ssolib.SessionStore` over `sso_sessions`, with AES-256-GCM at rest. Returns `(nil, nil)` for a native login, which is what stops the checkpoint denying every password user. Also implements `ssolib.BackchannelLogoutTarget` (`DeleteSessionsBySID`/`BySubject`) — the same store the checkpoint uses, so push and poll end sessions through one code path. |
+| `sso/backchannel.go` | Builds the OIDC Back-Channel Logout 1.0 receiver. Mounted at `POST /auth/sso/forta/backchannel-logout`. |
 | `sso/resolve.go` | `ssolib.UserResolver` — the link/provision decision matrix, plus `LinkIdentity`. **The most security-sensitive file here.** |
 | `sso/checkpoint.go` | Installs the library `Checkpointer` into the session middleware. |
 

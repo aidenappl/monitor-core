@@ -8,8 +8,8 @@ github.com/DATA-DOG/go-sqlmock v1.5.2 h1:OcvFkGmslmlZibjAjaHm3L//6LiuBgolP7Oputl
 github.com/DATA-DOG/go-sqlmock v1.5.2/go.mod h1:88MAG/4G7SMwSE3CeA0ZKzrT5CiOU3OJ+JlNzwDqpNU=
 github.com/Masterminds/squirrel v1.5.4 h1:uUcX/aBc8O7Fg9kaISIUsHXdKuqehiXAMQTYX8afzqM=
 github.com/Masterminds/squirrel v1.5.4/go.mod h1:NNaOrjSoIDfDA40n7sr2tPNZRfjzjA400rg+riTZj10=
-github.com/aidenappl/go-forta v1.7.0 h1:7DzvGkzWhcKGWbISSNyCKC04tqI4T5pHYHJuGzY7Hxs=
-github.com/aidenappl/go-forta v1.7.0/go.mod h1:rWBBthu4VVez71aY2odJQ3290Z/bCL8jsWOwJcah48A=
+github.com/aidenappl/go-forta v1.9.0 h1:9JRD7oF7etARm8wLh/06SQFRzcaXI6SDBQUqGLiJ2sg=
+github.com/aidenappl/go-forta v1.9.0/go.mod h1:rWBBthu4VVez71aY2odJQ3290Z/bCL8jsWOwJcah48A=
 github.com/aidenappl/go-keyring v1.0.2 h1:rD5qbs9T4Pyu1vmCYAgSzGdlzxeB2Ac+whycn6hD0LA=
 github.com/aidenappl/go-keyring v1.0.2/go.mod h1:QNxilp2a8ttZ2aR+qwa9j/NCma7GdTqkmJh2vKcYzRE=
 github.com/andybalholm/brotli v1.2.0 h1:ukwgCxwYrmACq68yiUqwIWnGY0cTPox/M94sVwToPjQ=

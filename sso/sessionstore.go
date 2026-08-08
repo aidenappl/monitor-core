@@ -43,7 +43,11 @@ func (s *SessionStore) SaveSession(_ context.Context, userID int64, sess ssolib.
 		}
 	}
 
-	return query.UpsertSSOSession(s.Engine, userID, sess.Provider, encAccess, encRefresh)
+	// Subject and SID are persisted even though nothing reads them until a logout
+	// token arrives. They CANNOT be added later: `sid` lives only in the id_token
+	// of the login that created this row, so a session written without one is
+	// unreachable by a session-scoped logout for the rest of its life.
+	return query.UpsertSSOSession(s.Engine, userID, sess.Provider, sess.Subject, sess.SID, encAccess, encRefresh)
 }
 
 // LoadSession returns the decrypted session, or (nil, nil) when the user has none.
@@ -80,9 +84,47 @@ func (s *SessionStore) LoadSession(_ context.Context, userID int64) (*ssolib.Ses
 
 	return &ssolib.Session{
 		Provider:      row.Provider,
+		Subject:       derefOr(row.Subject),
+		SID:           derefOr(row.SID),
 		Tokens:        ssolib.TokenSet{AccessToken: access, RefreshToken: refresh},
 		LastCheckedAt: row.LastCheckedAt,
 	}, nil
+}
+
+// derefOr flattens a nullable column to a string. NULL and "" are the same thing
+// to every caller here: "this session cannot be addressed that way".
+func derefOr(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BackchannelLogoutTarget — the receiving half of OIDC Back-Channel Logout 1.0.
+//
+// Implementing this OPTIONAL interface is what upgrades Monitor from
+// poll-speed revocation (the 5-minute introspection checkpoint) to push-speed.
+// Without it go-forta's handler answers 501 and says so, rather than answering
+// 200 and discarding the notification.
+//
+// ⚠️ BOTH METHODS RETURN (0, nil) FOR "NOTHING MATCHED", NEVER AN ERROR. A
+// duplicate delivery, an already-expired session and a row predating migration
+// 109 all land here, and all three are normal. Returning an error would make the
+// provider retry a message that had already been applied, then report this
+// receiver as broken.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// DeleteSessionsBySID ends the single session with this OIDC session id.
+func (s *SessionStore) DeleteSessionsBySID(_ context.Context, provider, sid string) (int, error) {
+	return query.DeleteSSOSessionsBySID(s.Engine, provider, sid)
+}
+
+// DeleteSessionsBySubject ends every session this subject holds with the
+// provider — the correct scope for a subject-wide event such as an
+// administrator revoking a grant.
+func (s *SessionStore) DeleteSessionsBySubject(_ context.Context, provider, subject string) (int, error) {
+	return query.DeleteSSOSessionsBySubject(s.Engine, provider, subject)
 }
 
 // TouchSession resets the checkpoint interval after a successful check.

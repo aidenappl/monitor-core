@@ -152,7 +152,18 @@ func cacheSSOSession(ctx context.Context, userID int64, slug string, identity *s
 	return sso.NewSessionStore(db.SQL).SaveSession(ctx, userID, ssolib.Session{
 		Provider: slug,
 		Subject:  identity.Subject,
-		Tokens:   *tokens,
+
+		// ⚠️ THIS IS THE ONLY MOMENT `sid` IS AVAILABLE. It lives in the id_token
+		// of this exchange and nowhere else — not in the access token, not in
+		// UserInfo, not in any later introspection. A session saved without it is
+		// unreachable by a session-scoped back-channel logout for the rest of its
+		// life, and no migration can repair that.
+		//
+		// Empty is normal: go-forta reads it from the verified id_token only, and
+		// a conforming OIDC provider need not issue one.
+		SID: identity.SID,
+
+		Tokens: *tokens,
 	})
 }
 
