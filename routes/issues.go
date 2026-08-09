@@ -2,6 +2,7 @@ package routes
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 
@@ -108,14 +109,21 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 		limit = 500
 	}
 
+	// service + name + (path) is only a cheap PRE-FILTER that narrows the scan —
+	// it is a superset, never the answer. All three feed the fingerprint, so an
+	// event differing in any of them cannot belong to this issue; but many
+	// distinct issues share one service+name (every `scraper.run.failed` across
+	// every tenant, say), so membership is decided by recomputing each candidate's
+	// fingerprint below. Filtering on the pre-filter alone previously returned
+	// other tenants' failures as though they were this issue's occurrences.
 	var query string
 	var args []interface{}
 	if issue.Path != "" {
 		query = "SELECT timestamp, service, env, job_id, request_id, trace_id, user_id, name, level, data FROM " + db.Database + ".events WHERE service = ? AND name = ? AND level IN ('error', 'fatal') AND (JSONExtractString(data, 'path') = ? OR JSONExtractString(data, 'uri') = ?) ORDER BY timestamp DESC LIMIT ?"
-		args = []interface{}{issue.Service, issue.Name, issue.Path, issue.Path, limit}
+		args = []interface{}{issue.Service, issue.Name, issue.Path, issue.Path, candidateScanLimit(limit)}
 	} else {
 		query = "SELECT timestamp, service, env, job_id, request_id, trace_id, user_id, name, level, data FROM " + db.Database + ".events WHERE service = ? AND name = ? AND level IN ('error', 'fatal') ORDER BY timestamp DESC LIMIT ?"
-		args = []interface{}{issue.Service, issue.Name, limit}
+		args = []interface{}{issue.Service, issue.Name, candidateScanLimit(limit)}
 	}
 	rows, err := db.Conn.Query(r.Context(), query, args...)
 	if err != nil {
@@ -124,8 +132,12 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	var events []*structs.Event
+	events := []*structs.Event{}
+	scanned := 0
 	for rows.Next() {
+		if len(events) >= limit {
+			break
+		}
 		var e structs.Event
 		var dataStr string
 		if err := rows.Scan(&e.Timestamp, &e.Service, &e.Env, &e.JobID, &e.RequestID, &e.TraceID, &e.UserID, &e.Name, &e.Level, &dataStr); err != nil {
@@ -135,12 +147,31 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 		if dataStr != "" && dataStr != "{}" {
 			json.Unmarshal([]byte(dataStr), &e.Data)
 		}
+		scanned++
+		if issues.FingerprintForEvent(&e) != issue.Fingerprint {
+			continue
+		}
 		events = append(events, &e)
 	}
 
-	if events == nil {
-		events = []*structs.Event{}
+	// A sparse issue buried among high-volume siblings can exhaust the candidate
+	// window before filling the page. Say so rather than letting an incomplete
+	// page read as "that's all there is".
+	if len(events) < limit && scanned >= candidateScanLimit(limit) {
+		log.Printf("issues: event scan window exhausted for issue %s (%d matched of %d scanned); older occurrences may exist", id, len(events), scanned)
 	}
 
 	responder.New(w, events)
+}
+
+// candidateScanLimit sizes the pre-filter window. Events for one issue can be
+// heavily diluted by siblings sharing its service+name, so scan well past the
+// requested page size — bounded, so a pathological issue can't scan the table.
+func candidateScanLimit(limit int) int {
+	const maxScan = 10000
+	scan := limit * 20
+	if scan > maxScan {
+		scan = maxScan
+	}
+	return scan
 }

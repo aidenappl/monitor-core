@@ -3,10 +3,14 @@ package issues
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"regexp"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
@@ -36,7 +40,47 @@ var (
 	hexRegex    = regexp.MustCompile(`\b0x[0-9a-fA-F]+\b`)
 	numberRegex = regexp.MustCompile(`\b\d+\b`)
 	urlRegex    = regexp.MustCompile(`https?://[^\s]+`)
+
+	// statusCodeSuffix matches text ending in an HTTP status-code introducer, e.g.
+	// "...returned status " or "...with code ". Used to look BEHIND a numeric match
+	// (RE2 has no lookbehind) so status codes survive normalization — see
+	// normalizeMessage.
+	statusCodeSuffix = regexp.MustCompile(`(?i)\b(?:status|status_code|statuscode|code|http)[ _=:]*$`)
 )
+
+// issueNamespace seeds the deterministic issue UUIDs derived from fingerprints.
+// Fixed forever: changing it re-keys every issue and orphans all history.
+var issueNamespace = uuid.MustParse("6f1d8f6a-2a3e-5c47-9a4b-6d1c0f2e7b31")
+
+// issueIDFor derives an issue's primary key from its fingerprint.
+//
+// This is what actually makes issue identity correct. The issues table is a
+// ReplacingMergeTree(updated_at) ORDER BY (id), so ClickHouse collapses rows that
+// share an id and nothing else — it cannot enforce uniqueness on fingerprint, and
+// FINAL does not help. Minting uuid.New() per insert meant two workers that both
+// saw "no existing issue" for one fingerprint created two permanently distinct
+// issues; production accumulated four rows for a single fingerprint that way.
+//
+// Deriving the id from the fingerprint makes the racers write the SAME id, so the
+// engine merges them on its own. That holds across processes and replicas too,
+// which a process-local mutex could never guarantee.
+func issueIDFor(fingerprint string) string {
+	return uuid.NewSHA1(issueNamespace, []byte(fingerprint)).String()
+}
+
+// fingerprintLocks shards a fixed set of mutexes across fingerprints so the
+// read-then-write in processError is serialized per issue without allocating a
+// lock per fingerprint or serializing the whole worker pool. A fixed array keeps
+// this bounded — a map keyed by fingerprint would grow without limit under an
+// error storm, which is the exact condition it exists to survive.
+var fingerprintLocks [64]sync.Mutex
+
+func lockFingerprint(fingerprint string) func() {
+	h := sha256.Sum256([]byte(fingerprint))
+	m := &fingerprintLocks[int(h[0])%len(fingerprintLocks)]
+	m.Lock()
+	return m.Unlock
+}
 
 // Worker-pool configuration for error tracking. Error/fatal events are enqueued
 // onto trackQueue (non-blocking) and drained by a small fixed pool of workers, so
@@ -134,11 +178,27 @@ func processError(ctx context.Context, event *structs.Event) {
 	fingerprint := generateFingerprint(event.Service, event.Name, message, path)
 	now := time.Now().UTC()
 
+	// Serialize per fingerprint so concurrent workers don't interleave the
+	// read-then-write below and lose occurrence increments. This is a
+	// best-effort, process-local guard for the COUNT only — correctness of issue
+	// IDENTITY comes from issueIDFor, which is what makes concurrent creates
+	// converge on one row even across replicas.
+	unlock := lockFingerprint(fingerprint)
+	defer unlock()
+
 	// Check if issue already exists for this fingerprint
 	existing, err := getByFingerprint(ctx, fingerprint)
-	if err != nil || existing == nil {
+	if err != nil {
+		// A genuine query failure. Returning here rather than falling through to
+		// the create branch matters: treating "the database was briefly
+		// unreachable" as "this issue is new" is how a transient blip used to
+		// mint a duplicate issue row.
+		log.Printf("issues: lookup failed for fingerprint %s: %v", fingerprint, err)
+		return
+	}
+	if existing == nil {
 		// Create new issue
-		id := uuid.New().String()
+		id := issueIDFor(fingerprint)
 		if err := db.Conn.Exec(ctx, fmt.Sprintf(
 			"INSERT INTO %s.issues (id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			db.Database,
@@ -285,6 +345,12 @@ func getByFingerprint(ctx context.Context, fingerprint string) (*Issue, error) {
 
 	var issue Issue
 	if err := row.Scan(&issue.ID, &issue.Fingerprint, &issue.Service, &issue.Name, &issue.Message, &issue.Path, &issue.Status, &issue.OccurrenceCount, &issue.FirstSeen, &issue.LastSeen, &issue.ResolvedAt, &issue.UpdatedAt); err != nil {
+		// "No such issue yet" is an expected outcome, not a failure. Callers must
+		// be able to tell it apart from a real query error, because only the
+		// former should lead to creating an issue.
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	return &issue, nil
@@ -351,6 +417,17 @@ func extractMessage(event *structs.Event, path string) string {
 	return event.Name
 }
 
+// FingerprintForEvent computes the fingerprint the given event groups under,
+// using exactly the same derivation as issue creation. Callers that need to know
+// whether an event belongs to an issue must compare THIS against the issue's
+// fingerprint — matching on service+name alone lumps together every distinct
+// failure that happens to share an event name.
+func FingerprintForEvent(event *structs.Event) string {
+	path := extractPath(event)
+	message := extractMessage(event, path)
+	return generateFingerprint(event.Service, event.Name, message, path)
+}
+
 func generateFingerprint(service, name, message, path string) string {
 	normalized := normalizeMessage(message)
 	raw := service + "|" + name + "|" + path + "|" + normalized
@@ -365,7 +442,45 @@ func normalizeMessage(message string) string {
 	message = hexRegex.ReplaceAllString(message, "<HEX>")
 	// Strip URLs
 	message = urlRegex.ReplaceAllString(message, "<URL>")
-	// Strip numbers
-	message = numberRegex.ReplaceAllString(message, "<N>")
+	// Strip numbers — except HTTP status codes, which are a failure CLASS, not an
+	// incidental identifier.
+	message = replaceNumbersPreservingStatusCodes(message)
 	return message
+}
+
+// replaceNumbersPreservingStatusCodes collapses digit runs to <N> the way plain
+// numberRegex replacement did, but keeps a 3-digit number that is introduced as
+// an HTTP status.
+//
+// Collapsing every number merged genuinely different failures into one issue:
+// "workday returned status 502 for lowes (offset 7820)" and "... status 429 ...
+// (offset 560)" both normalized to "status <N> ... (offset <N>)", so a Bad
+// Gateway and a rate-limit shared a fingerprint, an occurrence count, and a
+// displayed message that flip-flopped to whichever arrived last. Stripping the
+// offset is right — it is noise. Stripping the status is not.
+//
+// RE2 has no lookbehind, so matches are located by index and the preceding text
+// is inspected directly.
+func replaceNumbersPreservingStatusCodes(message string) string {
+	matches := numberRegex.FindAllStringIndex(message, -1)
+	if matches == nil {
+		return message
+	}
+
+	var b strings.Builder
+	last := 0
+	for _, m := range matches {
+		start, end := m[0], m[1]
+		b.WriteString(message[last:start])
+
+		digits := message[start:end]
+		if len(digits) == 3 && statusCodeSuffix.MatchString(message[:start]) {
+			b.WriteString(digits)
+		} else {
+			b.WriteString("<N>")
+		}
+		last = end
+	}
+	b.WriteString(message[last:])
+	return b.String()
 }

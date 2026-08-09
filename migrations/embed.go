@@ -19,6 +19,18 @@ var migrationsFS embed.FS
 // executed via the ClickHouse connection. All statements are idempotent
 // (IF NOT EXISTS), so re-running is safe — there is no applied-tracking table.
 //
+// Two consequences bind anything added here, because there is no tracking table
+// and the runner is fail-fast:
+//   - Every file runs on EVERY boot. A statement that is not idempotent (an
+//     INSERT ... SELECT, an UPDATE, a DELETE) will be re-applied on each restart
+//     and compound. Schema-only, IF NOT EXISTS-guarded statements only.
+//   - Files are split naively on ';'. A semicolon inside a comment produces a
+//     comment-only fragment, which ClickHouse rejects and which therefore takes
+//     the service down at startup.
+//
+// One-off data reconciliation belongs in migrations/manual/ — a subdirectory,
+// so the `*.sql` pattern above does not embed it — and is run by hand.
+//
 // This is the ClickHouse schema (events + api_keys). The relational (MariaDB)
 // auth schema has its own runner in db.RunMigrations. Ingestion and queries
 // depend on monitor.events existing, so this is fail-fast: the caller should
