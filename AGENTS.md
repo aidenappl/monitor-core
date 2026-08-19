@@ -182,6 +182,34 @@ Monitor owns identity end-to-end. Every external identity provider is a row in
 as far as the code is concerned. There is **no provider-specific Go code**; adding an
 IdP means filling in the form at `/admin/sso`, not shipping a build.
 
+**Issue tracking (MariaDB `monitor`) — the issue row is relational, events stay columnar:**
+
+| Table | Holds |
+|---|---|
+| `monitor.issues` | one row per fingerprint — identity, counts, first/last seen, and the mutable triage state (status, priority, title, assignee) |
+| `monitor.issue_timeline` | append-only polymorphic feed: comments, status transitions, regressions, assignment, PR events |
+| `monitor.issue_links` | linked GitHub PRs/issues/commits with a cached state, refreshed by webhook |
+
+`issues.id` is **not** auto-increment — it is the deterministic UUIDv5 from
+`issues.issueIDFor(fingerprint)`, so concurrent creators converge on one row. That namespace must
+never change.
+
+`status` is a single four-value enum (`unresolved`, `in_progress`, `resolved`, `ignored`), not two
+axes. `unresolved` is both the default and the backlog. **Automated recurrence only ever
+transitions out of `resolved`** — see `query.UpsertIssueOccurrence` — so an agent holding
+`in_progress` is never clobbered.
+
+The occurrence fold is a **single** `INSERT … ON DUPLICATE KEY UPDATE`. That is what fixes the
+`occurrence_count` drift documented in `issues/AGENTS.md`, which came from a read-then-write
+against a ClickHouse `ReplacingMergeTree`. **Do not turn it back into a read-then-write** — the
+SET-clause ordering is load-bearing too, since MariaDB evaluates left to right and every clause
+testing the previous `status` must precede `status`'s own reassignment. `query/issues_query_test.go`
+pins both properties.
+
+Neither `assignee_user_id` nor the child tables carry foreign keys. A default RESTRICT constraint
+would make any referenced user undeletable — the exact defect keyring-api shipped, where every FK
+into `access_logs` was RESTRICT and a secret that had ever been read could never be removed.
+
 **Data model (MariaDB `monitor_auth`) — true account linking, one user ↔ many identities:**
 
 | Table | Purpose |
@@ -435,7 +463,13 @@ Both are wrapped in `recover()` and cancelled via the shutdown context.
 ### External systems
 
 - **ClickHouse** — events/analytics. DB `monitor`, table `events` (30-day TTL).
-- **MariaDB** — auth data. DB `monitor_auth` (`mariadb:11.4`, host port 3336 locally).
+- **MariaDB** — two schemas on one host, one `db.SQL` pool (`mariadb:11.4`, host port 3336
+  locally). `monitor_auth` holds the auth layer; `monitor` holds issue-tracking state
+  (`issues`, `issue_timeline`, `issue_links`). Cross-schema joins between them are native.
+  **⚠️ The DSN user needs privileges on both**, and `migrations_applied` lives in `monitor_auth`.
+  **⚠️ ClickHouse also has a database named `monitor`** — same name, different engine. A
+  qualified `monitor.<table>` in a squirrel query means MariaDB; ClickHouse is reached via
+  `db.Conn`.
 - **SSO IdPs** — any OIDC or OAuth2 provider configured in `sso_providers` (none by default).
 - **Keyring** — optional secret injection at boot (`main.go`); skipped if `KEYRING_*` is
   absent, falling back to plain env vars. Sources `MON_DB_DSN`, `MON_JWT_SIGNING_KEY`,

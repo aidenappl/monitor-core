@@ -85,6 +85,20 @@ func main() {
 		log.Fatalf("❌ failed to run MariaDB migrations: %v", err)
 	}
 
+	// `monitor-core backfill-issues` copies the legacy ClickHouse issues table
+	// into MariaDB and exits without serving. Placed after both migration runners
+	// so the destination schema is guaranteed to exist, and kept as an explicit
+	// subcommand rather than a boot step because it is a one-time cutover, not
+	// part of normal startup. Safe to re-run — see issues.BackfillFromClickHouse.
+	if len(os.Args) > 1 && os.Args[1] == "backfill-issues" {
+		copied, err := issues.BackfillFromClickHouse(ctx)
+		if err != nil {
+			log.Fatalf("❌ backfill failed after %d issue(s): %v", copied, err)
+		}
+		log.Printf("✅ backfilled %d issue(s)", copied)
+		return
+	}
+
 	// Seed the first admin user on a fresh database (no-op once any user exists).
 	if err := bootstrap.EnsureAdminUser(db.SQL); err != nil {
 		log.Fatalf("❌ failed to bootstrap admin user: %v", err)

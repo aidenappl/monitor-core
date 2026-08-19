@@ -6,8 +6,12 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
 
 ## File
 
-- `issues.go` — the whole subsystem (struct, `Init` + worker pool, `TrackError` /
-  `processError`, `List`, `Get`, `UpdateStatus`, fingerprinting helpers).
+- `issues.go` — the subsystem (`Init` + worker pool, `TrackError` / `processError`,
+  `recordRegression`, `List` / `Get` / `UpdateStatus` shims over `query`, fingerprinting
+  helpers). Persistence lives in `query/issues.query.go`; `Issue` is an alias for
+  `structs.Issue`.
+- `backfill.go` — one-time `BackfillFromClickHouse`, run via the `backfill-issues`
+  subcommand.
 - `issues_test.go` — unit tests for `normalizeMessage` + `generateFingerprint`.
 - `grouping_test.go` — regression tests for the three grouping bugs fixed
   2026-08-07: fingerprint-derived issue ids, status-code preservation in
@@ -48,11 +52,29 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
   alone is only a pre-filter, since many issues share one event name.
 - **Message/path extraction** pulls `path`/`uri`, `error`/`error_message`/`message`,
   and `method` out of the event's `data` map to build a descriptive title.
-- **Storage:** ClickHouse `monitor.issues`, `ReplacingMergeTree(updated_at) ORDER BY
-  (id)`. Reads use `FINAL` to collapse duplicate versions. `TrackError` does a
-  read-then-write (get by fingerprint → insert new version with count+1). Resolved
-  issues that recur are flipped back to `unresolved` (regression detection).
-- **Status** ∈ {`unresolved`,`resolved`,`ignored`}. `resolved` stamps `resolved_at`.
+- **Storage: MariaDB `monitor.issues`** (moved off ClickHouse). The table is created by
+  `db.RunMigrations` (`db/migrations/111_create_issues.sql`), not by `Init`. ClickHouse
+  keeps only `events`. The legacy ClickHouse `issues` table is left in place, unread —
+  drop it once a release has passed.
+- **`processError` is a single atomic statement.** `query.UpsertIssueOccurrence` is one
+  `INSERT … ON DUPLICATE KEY UPDATE`, so `occurrence_count = occurrence_count + 1`
+  happens under a row lock. **This is the fix for the drift bug**, and it is why the
+  64-way `fingerprintLocks` shard is gone: that only ever serialized one process, and
+  the read-then-write it guarded no longer exists. **Do not reintroduce a lock here** —
+  if one seems necessary, the upsert has probably been split back into a read and a
+  write. `query/issues_query_test.go` fails the build if it is.
+- **SET-clause ordering in the upsert is load-bearing.** MariaDB evaluates left to
+  right, so `regression_count`, `regressed_at` and `resolved_at` all read the *previous*
+  `status` and must precede `status`'s own reassignment. Moving `status` earlier
+  compiles, passes casual review, and silently stops counting regressions.
+- **Status** ∈ {`unresolved`,`in_progress`,`resolved`,`ignored`} — one axis, not two.
+  `unresolved` is both the default and the backlog. `resolved` stamps `resolved_at`.
+- **Regression** is a status flip on the same issue, never a new issue. On recurrence
+  the upsert transitions **only** out of `resolved` → `unresolved`, stamping
+  `regressed_at` and incrementing `regression_count`; `in_progress`, `unresolved` and
+  `ignored` are left alone, so an agent mid-work is never clobbered. `recordRegression`
+  then appends a `regressed` timeline entry keyed on the stored `regressed_at`, so
+  racing workers compute the same `dedupe_key` and collapse to one row.
 
 ## API surface (wired in main.go → routes/issues.go)
 
@@ -70,12 +92,26 @@ This is the primary error-investigation surface (mirrored by
 
 | Sev | Where | Issue |
 |---|---|---|
-| 🟢 | `issues.go` (`processError`) | **Occurrence-count drift** — read-then-write into a ReplacingMergeTree. `lockFingerprint` now serializes this per fingerprint *within a process*, so single-instance drift is largely gone, but concurrent increments across replicas can still lose updates. Approximate counts remain acceptable for error tracking. |
-| 🟢 | `GET /issues` | **No time filter or sort.** Hardcoded `ORDER BY last_seen DESC`, no `from`/`to`/`sort` params — server-side, not just in the MCP. Callers wanting "issues created in the last 24h" must filter on `first_seen` client-side. |
-| 🟢 | subsystem-wide | **No auto-resolve.** Regression reopen exists (`resolved` → `unresolved` on recurrence) but nothing ages an issue out after N days of silence. |
+| 🟢 | `GET /issues` | **Filters/sort not yet exposed on the route.** `query.ListIssues` supports status, service, assignee, search, `has_pr`, `from`/`to` and sort, but `routes/issues.go` still passes only status+service and a fixed `last_seen DESC`. Wiring them up is Phase 4. |
+| 🟢 | subsystem-wide | **No auto-resolve.** Regression reopen exists but nothing ages an issue out after N days of silence. |
+| 🟢 | `UpdateStatus` | **Records no actor**, so a status change lands without a timeline entry naming who made it. Handlers should call `query.UpdateIssue` with `middleware.GetActor` instead; the shim stays only until the routes are cut over. |
+
+**Resolved 2026-08-19:** occurrence-count drift is **fixed**, not mitigated. The issue
+row moved to MariaDB and the fold became a single atomic statement, so concurrent
+workers — across processes and replicas — can no longer lose increments. The
+`lockFingerprint` mutex shard was deleted as redundant.
 
 **Resolved 2026-07-23:** the unbounded detached-goroutine `TrackError` was replaced by
 a bounded channel + fixed worker pool tied to the shutdown context (see above).
+
+## Cutting over from the ClickHouse issues table
+
+`monitor-core backfill-issues` copies the legacy ClickHouse rows into MariaDB and exits
+without serving. Safe to re-run: rows match on the primary key, which is the
+deterministic UUIDv5 from the fingerprint, so both stores agree on identity and no id
+remapping is needed. Conflicts resolve additively — the greater `occurrence_count` wins
+and the seen-window widens — so a backfill running alongside live ingestion cannot walk
+a live counter backwards. Triage state already set in MariaDB is never reverted.
 
 **Resolved 2026-08-07:**
 - **Duplicate issues per fingerprint** — ids are now derived from the fingerprint

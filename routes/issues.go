@@ -118,9 +118,9 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 	// other tenants' failures as though they were this issue's occurrences.
 	var query string
 	var args []interface{}
-	if issue.Path != "" {
+	if issue.Path != nil && *issue.Path != "" {
 		query = "SELECT timestamp, service, env, job_id, request_id, trace_id, user_id, name, level, data FROM " + db.Database + ".events WHERE service = ? AND name = ? AND level IN ('error', 'fatal') AND (JSONExtractString(data, 'path') = ? OR JSONExtractString(data, 'uri') = ?) ORDER BY timestamp DESC LIMIT ?"
-		args = []interface{}{issue.Service, issue.Name, issue.Path, issue.Path, candidateScanLimit(limit)}
+		args = []interface{}{issue.Service, issue.Name, *issue.Path, *issue.Path, candidateScanLimit(limit)}
 	} else {
 		query = "SELECT timestamp, service, env, job_id, request_id, trace_id, user_id, name, level, data FROM " + db.Database + ".events WHERE service = ? AND name = ? AND level IN ('error', 'fatal') ORDER BY timestamp DESC LIMIT ?"
 		args = []interface{}{issue.Service, issue.Name, candidateScanLimit(limit)}

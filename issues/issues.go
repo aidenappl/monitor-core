@@ -3,36 +3,23 @@ package issues
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"log"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/structs"
 	"github.com/google/uuid"
 )
 
-// Issue represents a tracked error issue
-type Issue struct {
-	ID              string     `json:"id"`
-	Fingerprint     string     `json:"fingerprint"`
-	Service         string     `json:"service"`
-	Name            string     `json:"name"`
-	Message         string     `json:"message"`
-	Path            string     `json:"path"`
-	Status          string     `json:"status"`
-	OccurrenceCount uint64     `json:"occurrence_count"`
-	FirstSeen       time.Time  `json:"first_seen"`
-	LastSeen        time.Time  `json:"last_seen"`
-	ResolvedAt      *time.Time `json:"resolved_at,omitempty"`
-	UpdatedAt       time.Time  `json:"updated_at"`
-}
+// Issue is the tracked error issue, now owned by MariaDB (monitor.issues) rather
+// than ClickHouse. Aliased rather than redeclared so existing call sites keep
+// compiling against the canonical struct.
+type Issue = structs.Issue
 
 // Fingerprint normalization regexes
 var (
@@ -68,19 +55,13 @@ func issueIDFor(fingerprint string) string {
 	return uuid.NewSHA1(issueNamespace, []byte(fingerprint)).String()
 }
 
-// fingerprintLocks shards a fixed set of mutexes across fingerprints so the
-// read-then-write in processError is serialized per issue without allocating a
-// lock per fingerprint or serializing the whole worker pool. A fixed array keeps
-// this bounded — a map keyed by fingerprint would grow without limit under an
-// error storm, which is the exact condition it exists to survive.
-var fingerprintLocks [64]sync.Mutex
-
-func lockFingerprint(fingerprint string) func() {
-	h := sha256.Sum256([]byte(fingerprint))
-	m := &fingerprintLocks[int(h[0])%len(fingerprintLocks)]
-	m.Lock()
-	return m.Unlock
-}
+// The 64-way fingerprintLocks mutex shard that used to live here is gone. It
+// existed only to serialize a read-then-write against ClickHouse, and was always
+// a partial fix — process-local, so it could never protect against a second
+// replica. processError now folds an occurrence in a single atomic
+// INSERT ... ON DUPLICATE KEY UPDATE, which is correct across processes and
+// replicas alike. Do not reintroduce a lock here; if one seems necessary, the
+// upsert has probably been split back into a read and a write.
 
 // Worker-pool configuration for error tracking. Error/fatal events are enqueued
 // onto trackQueue (non-blocking) and drained by a small fixed pool of workers, so
@@ -99,41 +80,20 @@ type trackJob struct {
 	event *structs.Event
 }
 
-// Init creates the issues table if it doesn't exist and starts the error-tracking
-// worker pool. The passed ctx is the application shutdown context — workers exit
-// when it is cancelled.
+// Init starts the error-tracking worker pool. The passed ctx is the application
+// shutdown context — workers exit when it is cancelled.
+//
+// It no longer creates a schema. The issues table lives in MariaDB now and is
+// created by db.RunMigrations (db/migrations/111_create_issues.sql), which tracks
+// what it has applied — unlike the ad-hoc CREATE TABLE that used to run here on
+// every boot. The old ClickHouse `issues` table is deliberately left in place,
+// unread, so the backfill can be re-run if needed; drop it once a release has
+// passed.
 func Init(ctx context.Context) error {
 	trackQueue = make(chan trackJob, trackQueueSize)
 	for i := 0; i < trackWorkers; i++ {
 		go trackWorker(ctx)
 	}
-
-	if err := db.Conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS `+db.Database+`.issues (
-			id String,
-			fingerprint String,
-			service String,
-			name String,
-			message String,
-			path String DEFAULT '',
-			status String DEFAULT 'unresolved',
-			occurrence_count UInt64 DEFAULT 1,
-			first_seen DateTime64(3, 'UTC'),
-			last_seen DateTime64(3, 'UTC'),
-			resolved_at Nullable(DateTime64(3, 'UTC')),
-			updated_at DateTime64(3, 'UTC') DEFAULT now64(3)
-		) ENGINE = ReplacingMergeTree(updated_at)
-		ORDER BY (id)
-	`); err != nil {
-		return err
-	}
-
-	// Migration: add path column if it doesn't exist
-	_ = db.Conn.Exec(ctx, fmt.Sprintf(
-		"ALTER TABLE %s.issues ADD COLUMN IF NOT EXISTS path String DEFAULT ''",
-		db.Database,
-	))
-
 	return nil
 }
 
@@ -171,189 +131,168 @@ func trackWorker(ctx context.Context) {
 	}
 }
 
-// processError creates or updates an issue for an error event.
+// regressionFreshness bounds how recently an issue must have regressed for this
+// event to be treated as the cause. It only avoids a redundant no-op write on an
+// issue that regressed long ago — correctness comes from the dedupe key, not from
+// this window.
+const regressionFreshness = time.Minute
+
+// processError folds one error event into its issue.
+//
+// The whole create-or-update is a single atomic statement (see
+// query.UpsertIssueOccurrence). There is no read-then-write and no lock: two
+// workers racing on one fingerprint both increment, and neither loses. That is
+// the fix for the occurrence_count drift this function used to carry.
 func processError(ctx context.Context, event *structs.Event) {
 	path := extractPath(event)
 	message := extractMessage(event, path)
 	fingerprint := generateFingerprint(event.Service, event.Name, message, path)
-	now := time.Now().UTC()
 
-	// Serialize per fingerprint so concurrent workers don't interleave the
-	// read-then-write below and lose occurrence increments. This is a
-	// best-effort, process-local guard for the COUNT only — correctness of issue
-	// IDENTITY comes from issueIDFor, which is what makes concurrent creates
-	// converge on one row even across replicas.
-	unlock := lockFingerprint(fingerprint)
-	defer unlock()
+	// DATETIME(3) stores milliseconds, so truncate before writing. Otherwise the
+	// value read back never equals the one sent, and the regression dedupe key
+	// below would differ between the racers it exists to collapse.
+	seenAt := event.Timestamp.UTC().Truncate(time.Millisecond)
+	if seenAt.IsZero() {
+		seenAt = time.Now().UTC().Truncate(time.Millisecond)
+	}
 
-	// Check if issue already exists for this fingerprint
-	existing, err := getByFingerprint(ctx, fingerprint)
+	issue, err := query.UpsertIssueOccurrence(db.SQL, query.UpsertIssueOccurrenceRequest{
+		ID:          issueIDFor(fingerprint),
+		Fingerprint: fingerprint,
+		Service:     event.Service,
+		Name:        event.Name,
+		Message:     message,
+		Path:        path,
+		SeenAt:      seenAt,
+	})
 	if err != nil {
-		// A genuine query failure. Returning here rather than falling through to
-		// the create branch matters: treating "the database was briefly
-		// unreachable" as "this issue is new" is how a transient blip used to
-		// mint a duplicate issue row.
-		log.Printf("issues: lookup failed for fingerprint %s: %v", fingerprint, err)
+		log.Printf("issues: failed to record occurrence for fingerprint %s: %v", fingerprint, err)
 		return
 	}
-	if existing == nil {
-		// Create new issue
-		id := issueIDFor(fingerprint)
-		if err := db.Conn.Exec(ctx, fmt.Sprintf(
-			"INSERT INTO %s.issues (id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			db.Database,
-		), id, fingerprint, event.Service, event.Name, message, path, "unresolved", uint64(1), now, now, now); err != nil {
-			log.Printf("issues: failed to create issue: %v", err)
-		}
+	if issue == nil {
 		return
 	}
 
-	// Update existing issue — increment count, update last_seen
-	// If it was resolved, mark as unresolved (regression)
-	status := existing.Status
-	if status == "resolved" {
-		status = "unresolved"
+	recordRegression(issue)
+}
+
+// recordRegression appends a timeline entry when an issue has just come back
+// from resolved.
+//
+// The entry is keyed on the stored regressed_at, so two workers that raced on the
+// same recurrence compute the SAME dedupe key and collapse to one row — and
+// re-emitting an older regression is a harmless no-op rather than a duplicate.
+// That is why this needs no lock and no exactly-once guarantee from the caller.
+//
+// A failure here is logged, not propagated: losing a timeline entry must never
+// cost the occurrence count that was already durably recorded.
+func recordRegression(issue *structs.Issue) {
+	if issue.RegressedAt == nil {
+		return
+	}
+	if time.Since(*issue.RegressedAt) > regressionFreshness {
+		return
 	}
 
-	// NOTE: The read-then-write pattern here is susceptible to race conditions under concurrent
-	// error bursts. With ClickHouse's ReplacingMergeTree, the row with the latest updated_at wins
-	// during merges, so concurrent increments can cause occurrence_count to go backward or lose
-	// increments. This is a known limitation — the approximate count is acceptable for error tracking.
-	if err := db.Conn.Exec(ctx, fmt.Sprintf(
-		"INSERT INTO %s.issues (id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		db.Database,
-	), existing.ID, existing.Fingerprint, existing.Service, existing.Name, message, existing.Path, status, existing.OccurrenceCount+1, existing.FirstSeen, now, existing.ResolvedAt, now); err != nil {
-		log.Printf("issues: failed to update issue %s: %v", existing.ID, err)
+	dedupeKey := "regressed:" + issue.RegressedAt.UTC().Format(time.RFC3339Nano)
+	body := fmt.Sprintf("Recurred after being resolved (regression #%d).", issue.RegressionCount)
+
+	if _, err := query.AppendTimelineEntry(db.SQL, query.AppendTimelineEntryRequest{
+		IssueID: issue.ID,
+		Type:    structs.TimelineRegressed,
+		Actor:   structs.SystemActor(regressionActorLabel),
+		Body:    &body,
+		Metadata: map[string]any{
+			"regression_count": issue.RegressionCount,
+			"previous_status":  string(structs.IssueStatusResolved),
+			"regressed_at":     issue.RegressedAt.UTC(),
+		},
+		DedupeKey: &dedupeKey,
+	}); err != nil {
+		log.Printf("issues: failed to record regression for issue %s: %v", issue.ID, err)
 	}
 }
 
-// List returns issues with optional filters
+// regressionActorLabel attributes automated regressions to ingestion itself,
+// since no caller is responsible for them.
+const regressionActorLabel = "ingest"
+
+// List returns a page of issues plus the total matching the filters.
+//
+// Filtering, sorting, paginating and counting now happen in one relational query
+// each, rather than against a ClickHouse ReplacingMergeTree with FINAL — where
+// count(DISTINCT id) had to work around rows the engine had not yet merged.
 func List(ctx context.Context, status, service string, limit, offset int) ([]Issue, int, error) {
-	if limit <= 0 {
-		limit = 50
+	req := query.ListIssuesRequest{
+		Sort:       query.IssueSortLastSeen,
+		Descending: true,
+		Limit:      limit,
+		Offset:     offset,
 	}
-	if limit > 500 {
-		limit = 500
-	}
-
-	// Count query
-	countQuery := fmt.Sprintf("SELECT count(DISTINCT id) FROM %s.issues FINAL WHERE 1=1", db.Database)
-	var countArgs []interface{}
 	if status != "" {
-		countQuery += " AND status = ?"
-		countArgs = append(countArgs, status)
-	}
-	if service != "" {
-		countQuery += " AND service = ?"
-		countArgs = append(countArgs, service)
-	}
-
-	var total uint64
-	if err := db.Conn.QueryRow(ctx, countQuery, countArgs...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("count query failed: %w", err)
-	}
-
-	// Data query
-	dataQuery := fmt.Sprintf(
-		"SELECT id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at FROM %s.issues FINAL WHERE 1=1",
-		db.Database,
-	)
-	var dataArgs []interface{}
-	if status != "" {
-		dataQuery += " AND status = ?"
-		dataArgs = append(dataArgs, status)
-	}
-	if service != "" {
-		dataQuery += " AND service = ?"
-		dataArgs = append(dataArgs, service)
-	}
-	dataQuery += fmt.Sprintf(" ORDER BY last_seen DESC LIMIT %d OFFSET %d", limit, offset)
-
-	rows, err := db.Conn.Query(ctx, dataQuery, dataArgs...)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to list issues: %w", err)
-	}
-	defer rows.Close()
-
-	var issues []Issue
-	for rows.Next() {
-		var issue Issue
-		if err := rows.Scan(&issue.ID, &issue.Fingerprint, &issue.Service, &issue.Name, &issue.Message, &issue.Path, &issue.Status, &issue.OccurrenceCount, &issue.FirstSeen, &issue.LastSeen, &issue.ResolvedAt, &issue.UpdatedAt); err != nil {
-			return nil, 0, fmt.Errorf("failed to scan issue: %w", err)
+		s := structs.IssueStatus(status)
+		if !s.IsValid() {
+			return nil, 0, fmt.Errorf("invalid status: %s", status)
 		}
-		issues = append(issues, issue)
+		req.Status = &s
 	}
-	return issues, int(total), nil
+	if service != "" {
+		req.Service = &service
+	}
+
+	total, err := query.CountIssues(db.SQL, req)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	list, err := query.ListIssues(db.SQL, req)
+	if err != nil {
+		return nil, 0, err
+	}
+	return list, total, nil
 }
 
-// Get returns an issue by ID
+// Get returns an issue by id.
 func Get(ctx context.Context, id string) (*Issue, error) {
-	row := db.Conn.QueryRow(ctx, fmt.Sprintf(
-		"SELECT id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at FROM %s.issues FINAL WHERE id = ?",
-		db.Database,
-	), id)
-
-	var issue Issue
-	if err := row.Scan(&issue.ID, &issue.Fingerprint, &issue.Service, &issue.Name, &issue.Message, &issue.Path, &issue.Status, &issue.OccurrenceCount, &issue.FirstSeen, &issue.LastSeen, &issue.ResolvedAt, &issue.UpdatedAt); err != nil {
+	issue, err := query.GetIssue(db.SQL, id)
+	if err != nil {
+		return nil, err
+	}
+	if issue == nil {
 		return nil, fmt.Errorf("issue not found")
 	}
-	return &issue, nil
+	return issue, nil
 }
 
-// UpdateStatus updates the status of an issue
+// UpdateStatus sets an issue's status.
+//
+// Deprecated in spirit: it records no actor, so the change lands without a
+// timeline entry naming who made it. The handler layer should call
+// query.UpdateIssue with the actor from middleware.GetActor instead. Kept while
+// the routes are cut over.
 func UpdateStatus(ctx context.Context, id, status string) error {
-	existing, err := Get(ctx, id)
+	s := structs.IssueStatus(status)
+	if !s.IsValid() {
+		return fmt.Errorf("invalid status: %s (must be unresolved, in_progress, resolved, or ignored)", status)
+	}
+
+	updated, err := query.UpdateIssue(db.SQL, id, query.UpdateIssueRequest{Status: &s})
 	if err != nil {
 		return err
 	}
-
-	validStatuses := map[string]bool{
-		"unresolved": true,
-		"resolved":   true,
-		"ignored":    true,
+	if updated == nil {
+		return fmt.Errorf("issue not found")
 	}
-	if !validStatuses[status] {
-		return fmt.Errorf("invalid status: %s (must be unresolved, resolved, or ignored)", status)
-	}
-
-	now := time.Now().UTC()
-	var resolvedAt *time.Time
-	if status == "resolved" {
-		resolvedAt = &now
-	}
-
-	return db.Conn.Exec(ctx, fmt.Sprintf(
-		"INSERT INTO %s.issues (id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		db.Database,
-	), existing.ID, existing.Fingerprint, existing.Service, existing.Name, existing.Message, existing.Path, status, existing.OccurrenceCount, existing.FirstSeen, existing.LastSeen, resolvedAt, now)
+	return nil
 }
 
-// GetFingerprint returns the fingerprint for an issue (for event lookup)
+// GetFingerprint returns the fingerprint for an issue (for event lookup).
 func GetFingerprint(ctx context.Context, id string) (string, error) {
 	issue, err := Get(ctx, id)
 	if err != nil {
 		return "", err
 	}
 	return issue.Fingerprint, nil
-}
-
-func getByFingerprint(ctx context.Context, fingerprint string) (*Issue, error) {
-	row := db.Conn.QueryRow(ctx, fmt.Sprintf(
-		"SELECT id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, resolved_at, updated_at FROM %s.issues FINAL WHERE fingerprint = ?",
-		db.Database,
-	), fingerprint)
-
-	var issue Issue
-	if err := row.Scan(&issue.ID, &issue.Fingerprint, &issue.Service, &issue.Name, &issue.Message, &issue.Path, &issue.Status, &issue.OccurrenceCount, &issue.FirstSeen, &issue.LastSeen, &issue.ResolvedAt, &issue.UpdatedAt); err != nil {
-		// "No such issue yet" is an expected outcome, not a failure. Callers must
-		// be able to tell it apart from a real query error, because only the
-		// former should lead to creating an issue.
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &issue, nil
 }
 
 func extractPath(event *structs.Event) string {
