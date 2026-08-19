@@ -35,6 +35,16 @@ type CreateResult struct {
 // cachedKey stores the key ID and scope for fast validation.
 type cachedKey struct {
 	ID    string
+	Name  string
+	Scope Scope
+}
+
+// Identity is the resolved owner of a valid API key. Name is carried so an
+// audited action can be attributed to a recognisable actor ("monitor-mcp")
+// rather than an opaque id.
+type Identity struct {
+	ID    string
+	Name  string
 	Scope Scope
 }
 
@@ -63,7 +73,7 @@ func refreshCache() error {
 		if s != ScopeAdmin && s != ScopeIngest {
 			s = ScopeAdmin // backward compat for keys without scope
 		}
-		newCache[k.KeyHash] = cachedKey{ID: k.ID, Scope: s}
+		newCache[k.KeyHash] = cachedKey{ID: k.ID, Name: k.Name, Scope: s}
 	}
 
 	cacheMu.Lock()
@@ -84,13 +94,26 @@ func Validate(rawKey string) bool {
 // ValidateWithScope checks if a raw API key is valid and returns its scope.
 // Returns empty string if the key is invalid.
 func ValidateWithScope(rawKey string) Scope {
+	identity, ok := ValidateWithIdentity(rawKey)
+	if !ok {
+		return ""
+	}
+	return identity.Scope
+}
+
+// ValidateWithIdentity checks if a raw API key is valid and returns who it
+// belongs to. Prefer this over ValidateWithScope on any path that records an
+// actor — attributing a status change or a comment to "monitor-mcp" is the
+// difference between an audit trail and a shrug.
+func ValidateWithIdentity(rawKey string) (Identity, bool) {
 	hash := hashKey(rawKey)
 	cacheMu.RLock()
 	defer cacheMu.RUnlock()
-	if entry, ok := cache[hash]; ok {
-		return entry.Scope
+	entry, ok := cache[hash]
+	if !ok {
+		return Identity{}, false
 	}
-	return ""
+	return Identity{ID: entry.ID, Name: entry.Name, Scope: entry.Scope}, true
 }
 
 // Create generates a new API key, stores its hash, and returns the raw key (shown once).

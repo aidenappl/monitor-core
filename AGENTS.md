@@ -218,6 +218,27 @@ HS512** via `WithValidMethods` and the keyfunc re-checks the method (defeats
 | `SessionMiddleware` (`Protected`) | `/auth/*`, `/admin/*` | a valid access JWT (Bearer or `mon-access-token`) → loads the active user into context. `RequireAdmin`/`RequireEditor`/`RejectPending` gate on `role`. |
 | `CSRFMiddleware` (global) | all unsafe methods | `mon-csrf` cookie == `X-CSRF-Token` header (constant-time). Safe methods, Bearer clients, `X-Api-Key` clients, and `/auth/{login,register,refresh}` + SSO callbacks are exempt. |
 
+**Actor identity — use `GetActor`, not `GetUserFromContext`, to record who did something.**
+
+Every authenticated request carries a `*structs.Actor` in context, injected by the auth
+middleware and read with `middleware.GetActor(ctx)`. There are three kinds:
+
+| `Kind` | Set by | Carries | Label |
+|---|---|---|---|
+| `user` | `SessionMiddleware` (via `withUser`) | `UserID` | display name → name → email |
+| `api_key` | `QueryAuthMiddleware`, admin-scope DB key | `APIKeyID` | the key's `Name` (e.g. `monitor-mcp`) |
+| `system` | `QueryAuthMiddleware`, env master key; automated transitions | neither | `middleware.EnvMasterKeyLabel`, or a caller-supplied label |
+
+`GetUserFromContext` is **not** a substitute: agents and CI authenticate by API key and have no
+user at all, so a handler that attributes an action to the context user silently records nothing
+for exactly the callers most likely to be acting. `structs.Actor` exists to make that
+unrepresentable.
+
+`Actor.Label` must be **denormalised onto any row that records it**, not looked up by id at read
+time. An API key can be deleted and a user deactivated; the audit row still has to name who
+acted. `apikeys.ValidateWithIdentity` (not `ValidateWithScope`) is what resolves a key to its
+name on the auth path.
+
 **Endpoint surface** (registered in `main.go` + `RegisterSSORoutes.go`):
 
 ```

@@ -20,6 +20,34 @@ import (
 // *structs.User. contextKey is declared in logging.go (same package).
 const UserContextKey contextKey = "mon-user"
 
+// ActorContextKey is where the auth middleware stashes the resolved
+// *structs.Actor — the principal behind the request, whether that is a session
+// user, an API key, or Monitor itself.
+const ActorContextKey contextKey = "mon-actor"
+
+// EnvMasterKeyLabel is the actor label for requests authenticated by the
+// env-based master key (env.IngestKey). It has no database row and therefore no
+// name of its own, so audit rows attribute it to this fixed identifier.
+const EnvMasterKeyLabel = "env-master-key"
+
+// WithActor returns a context carrying the resolved actor.
+func WithActor(ctx context.Context, actor *structs.Actor) context.Context {
+	return context.WithValue(ctx, ActorContextKey, actor)
+}
+
+// GetActor returns the actor resolved by the auth middleware.
+//
+// Handlers that record who did something should use this rather than
+// GetUserFromContext: an API-key caller (monitor-mcp, CI) has no user, and
+// GetUserFromContext returns nothing for them.
+func GetActor(ctx context.Context) (*structs.Actor, bool) {
+	actor, ok := ctx.Value(ActorContextKey).(*structs.Actor)
+	if !ok || actor == nil {
+		return nil, false
+	}
+	return actor, true
+}
+
 // SSOCheckpoint is an injectable hook for periodic SSO-grant revocation checks.
 // It is nil in Phase 2 (checkpoint skipped). Phase 3.4 assigns it to
 // checkpointSSOGrant, which — for users whose session is backed by an SSO
@@ -72,8 +100,12 @@ func SessionMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// withUser stashes the authenticated user and, in the same step, the actor
+// derived from them. The two are set together deliberately: a caller that has a
+// user but no actor would silently produce unattributed audit rows.
 func withUser(ctx context.Context, user *structs.User) context.Context {
-	return context.WithValue(ctx, UserContextKey, user)
+	ctx = context.WithValue(ctx, UserContextKey, user)
+	return WithActor(ctx, structs.UserActor(user))
 }
 
 // validateSessionToken resolves an access JWT to an active user, applying the
