@@ -126,6 +126,13 @@ dev down        # stop the local stack
   - **MariaDB** — `db.RunMigrations()` (`db/sql.go`) embeds `db/migrations/*.sql`, runs
     each once, tracked in a `migrations_applied` table. The DSN needs `multiStatements`
     (added automatically by `ensureDSNParams`).
+- **Every statement in a MariaDB migration must be re-runnable** — `IF NOT EXISTS` on
+  creates and column adds, `DROP … IF EXISTS` before any `ADD CONSTRAINT`. A file is
+  recorded in `migrations_applied` only after a clean `Exec`, and DDL commits implicitly
+  in MariaDB, so a run that dies partway leaves that work durable and is retried **in
+  full** on the next boot. An unguarded `ADD COLUMN` then fails with errno 1060, an
+  unguarded `ADD CONSTRAINT` with errno 121 — and because migrations are fail-fast, that
+  wedges startup rather than degrading. The guarantee is at-least-once, not exactly-once.
 - **Bootstrap runs after MariaDB migrations** (`main.go`): `bootstrap.EnsureAdminUser`
   seeds the first admin from `MON_ADMIN_EMAIL`/`MON_ADMIN_PASSWORD` (no-op once any user
   exists). No SSO provider is seeded from env — providers are created through the admin
