@@ -216,6 +216,14 @@ func main() {
 	v1 := r.PathPrefix("/v1").Subrouter()
 	v1.Use(middleware.QueryAuthMiddleware)
 
+	// Service → source-repository mapping. Monitor watches services across more
+	// than one GitHub org, and several service versions share one repo, so this
+	// is explicit configuration rather than anything derived from the name.
+	v1.HandleFunc("/service-repos", routes.HandleListServiceRepos).Methods(http.MethodGet)
+	v1.HandleFunc("/service-repos/{service}", routes.HandleGetServiceRepo).Methods(http.MethodGet)
+	v1.HandleFunc("/service-repos/{service}", routes.HandleUpsertServiceRepo).Methods(http.MethodPut)
+	v1.HandleFunc("/service-repos/{service}", routes.HandleDeleteServiceRepo).Methods(http.MethodDelete)
+
 	v1.HandleFunc("/events", routes.QueryEventsHandler).Methods(http.MethodGet)
 	v1.HandleFunc("/events/stream", routes.StreamEventsHandler).Methods(http.MethodGet)
 	v1.HandleFunc("/labels/{label}/values", routes.GetLabelValuesHandler).Methods(http.MethodGet)

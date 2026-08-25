@@ -29,9 +29,9 @@ const maxResponseBytes = 2 << 20 // 2 MiB
 
 var httpClient = &http.Client{Timeout: requestTimeout}
 
-// Enabled reports whether API calls are configured. Callers should check this
-// before fetching so an unconfigured install stays silent rather than logging a
-// failure for every link.
+// Enabled reports whether ANY token is configured. Prefer EnabledFor(owner) on
+// paths that already know the owner — a token exists for one org and not another,
+// and this cannot tell them apart.
 func Enabled() bool { return env.GitHubToken != "" }
 
 // Resource is the live state of a linked GitHub object.
@@ -47,7 +47,12 @@ type Resource struct {
 // Returns (nil, nil) when the integration is not configured — "nothing to say"
 // rather than an error, so callers need not special-case it.
 func Fetch(ctx context.Context, ref Ref) (*Resource, error) {
-	if !Enabled() {
+	// Resolved per owner, not globally: a fine-grained PAT is scoped to one org,
+	// so a link into an org with no token is "nothing to say" rather than an
+	// error — the same outcome as an unconfigured install, and for the same
+	// reason. Never fall back to another org's token: it would 404 confusingly at
+	// best, and at worst send a credential somewhere it was not scoped for.
+	if !EnabledFor(ref.Owner) {
 		return nil, nil
 	}
 
@@ -92,7 +97,7 @@ type ghCommit struct {
 func fetchPullRequest(ctx context.Context, ref Ref) (*Resource, error) {
 	var pr ghPullRequest
 	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", ref.Owner, ref.Repo, ref.Number)
-	if err := get(ctx, path, &pr); err != nil {
+	if err := get(ctx, path, TokenFor(ref.Owner), &pr); err != nil {
 		return nil, err
 	}
 	return &Resource{Title: pr.Title, State: pr.State, Merged: pr.Merged, Author: pr.User.Login}, nil
@@ -101,7 +106,7 @@ func fetchPullRequest(ctx context.Context, ref Ref) (*Resource, error) {
 func fetchIssue(ctx context.Context, ref Ref) (*Resource, error) {
 	var issue ghIssue
 	path := fmt.Sprintf("/repos/%s/%s/issues/%d", ref.Owner, ref.Repo, ref.Number)
-	if err := get(ctx, path, &issue); err != nil {
+	if err := get(ctx, path, TokenFor(ref.Owner), &issue); err != nil {
 		return nil, err
 	}
 	return &Resource{Title: issue.Title, State: issue.State, Author: issue.User.Login}, nil
@@ -110,7 +115,7 @@ func fetchIssue(ctx context.Context, ref Ref) (*Resource, error) {
 func fetchCommit(ctx context.Context, ref Ref) (*Resource, error) {
 	var commit ghCommit
 	path := fmt.Sprintf("/repos/%s/%s/commits/%s", ref.Owner, ref.Repo, ref.SHA)
-	if err := get(ctx, path, &commit); err != nil {
+	if err := get(ctx, path, TokenFor(ref.Owner), &commit); err != nil {
 		return nil, err
 	}
 	// A commit has no state, and its "title" is the first line of the message.
@@ -121,14 +126,16 @@ func fetchCommit(ctx context.Context, ref Ref) (*Resource, error) {
 	return &Resource{Title: firstLine(commit.Commit.Message), Author: author}, nil
 }
 
-// get performs an authenticated GET and decodes the JSON body.
-func get(ctx context.Context, path string, out any) error {
+// get performs an authenticated GET and decodes the JSON body. The token is
+// passed in rather than read from env, so each call uses the credential scoped
+// to the owner it is addressing.
+func get(ctx context.Context, path, token string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiBase+path, nil)
 	if err != nil {
 		return fmt.Errorf("failed to build github request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+env.GitHubToken)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	req.Header.Set("User-Agent", "monitor-core")

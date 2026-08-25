@@ -135,3 +135,87 @@ func TestParseURLCanonicalises(t *testing.T) {
 		})
 	}
 }
+
+// TestParseRefShorthand covers the resolver that makes the service→repository
+// mapping pay off: a bare "#42" on an error in auth-service-v2 lands on that
+// service's repo without anyone restating it.
+func TestParseRefShorthand(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         string
+		fallbackOwner string
+		fallbackRepo  string
+		wantOwner     string
+		wantRepo      string
+		wantNumber    int
+		wantKind      structs.IssueLinkKind
+		wantErr       bool
+	}{
+		{
+			name:  "hash number uses the fallback repo",
+			input: "#42", fallbackOwner: "TeamTrailblaze", fallbackRepo: "auth-service",
+			wantOwner: "TeamTrailblaze", wantRepo: "auth-service", wantNumber: 42,
+			wantKind: structs.IssueLinkPullRequest,
+		},
+		{
+			name:  "bare number uses the fallback repo",
+			input: "42", fallbackOwner: "TeamTrailblaze", fallbackRepo: "auth-service",
+			wantOwner: "TeamTrailblaze", wantRepo: "auth-service", wantNumber: 42,
+			wantKind: structs.IssueLinkPullRequest,
+		},
+		{
+			name:  "explicit repo overrides the fallback",
+			input: "aidenappl/monitor-core#7", fallbackOwner: "TeamTrailblaze", fallbackRepo: "auth-service",
+			wantOwner: "aidenappl", wantRepo: "monitor-core", wantNumber: 7,
+			wantKind: structs.IssueLinkPullRequest,
+		},
+		{
+			name:          "full url ignores the fallback entirely",
+			input:         "https://github.com/aidenappl/monitor-core/issues/9",
+			fallbackOwner: "TeamTrailblaze", fallbackRepo: "auth-service",
+			wantOwner: "aidenappl", wantRepo: "monitor-core", wantNumber: 9,
+			wantKind: structs.IssueLinkIssue,
+		},
+		{
+			name:      "host-relative url still parses",
+			input:     "github.com/aidenappl/monitor-core/pull/3",
+			wantOwner: "aidenappl", wantRepo: "monitor-core", wantNumber: 3,
+			wantKind: structs.IssueLinkPullRequest,
+		},
+
+		// A shorthand with no mapping must REFUSE rather than guess — attaching a
+		// link to the wrong repository is worse than declining to attach one.
+		{name: "shorthand with no fallback is refused", input: "#42", wantErr: true},
+		{name: "bare number with no fallback is refused", input: "42", wantErr: true},
+		{name: "partial fallback is refused", input: "#42", fallbackOwner: "TeamTrailblaze", wantErr: true},
+
+		{name: "empty", input: "", wantErr: true},
+		{name: "not a number", input: "#abc", fallbackOwner: "o", fallbackRepo: "r", wantErr: true},
+		{name: "zero", input: "#0", fallbackOwner: "o", fallbackRepo: "r", wantErr: true},
+		{name: "prose", input: "see the PR", fallbackOwner: "o", fallbackRepo: "r", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ref, err := ParseRef(tt.input, tt.fallbackOwner, tt.fallbackRepo)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ParseRef(%q) = %+v, want an error", tt.input, ref)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseRef(%q) failed: %v", tt.input, err)
+			}
+			if ref.Owner != tt.wantOwner || ref.Repo != tt.wantRepo {
+				t.Errorf("repo = %s/%s, want %s/%s", ref.Owner, ref.Repo, tt.wantOwner, tt.wantRepo)
+			}
+			if ref.Number != tt.wantNumber {
+				t.Errorf("Number = %d, want %d", ref.Number, tt.wantNumber)
+			}
+			if ref.Kind != tt.wantKind {
+				t.Errorf("Kind = %q, want %q", ref.Kind, tt.wantKind)
+			}
+		})
+	}
+}

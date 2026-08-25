@@ -151,6 +151,16 @@ func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	dedupeKey := fmt.Sprintf("gh:%s/%s#%d:%s", owner, repo, number, entryType)
 	body_ := prTimelineBody(entryType, owner, repo, number, title)
 
+	// Which services this repo builds. Best-effort context on the entry: a merge
+	// in one repo can affect several services (auth-service-v1 and -v2 share a
+	// repo), and the reader of a timeline usually wants to know which. A failure
+	// here must not cost the entry itself.
+	affected, err := query.ListServicesForRepo(db.SQL, owner, repo)
+	if err != nil {
+		log.Printf("github webhook: failed to resolve services for %s/%s: %v", owner, repo, err)
+		affected = nil
+	}
+
 	for _, issueID := range issueIDs {
 		if _, err := query.AppendTimelineEntry(db.SQL, query.AppendTimelineEntryRequest{
 			IssueID: issueID,
@@ -158,14 +168,15 @@ func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 			Actor:   structs.SystemActor(webhookActorLabel),
 			Body:    &body_,
 			Metadata: map[string]any{
-				"owner":       owner,
-				"repo":        repo,
-				"number":      number,
-				"state":       state,
-				"merged":      merged,
-				"author":      author,
-				"base_branch": payload.PullRequest.Base.Ref,
-				"url":         payload.PullRequest.HTMLURL,
+				"owner":             owner,
+				"repo":              repo,
+				"number":            number,
+				"state":             state,
+				"merged":            merged,
+				"author":            author,
+				"base_branch":       payload.PullRequest.Base.Ref,
+				"url":               payload.PullRequest.HTMLURL,
+				"affected_services": affected,
 			},
 			DedupeKey: &dedupeKey,
 		}); err != nil {

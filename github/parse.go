@@ -15,6 +15,7 @@ package github
 import (
 	"fmt"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -114,6 +115,64 @@ func ParseURL(raw string) (Ref, error) {
 	}
 
 	return Ref{}, fmt.Errorf("unsupported github url type %q", kind)
+}
+
+// shorthandRe matches "#42", "42", and "owner/repo#42".
+var shorthandRe = regexp.MustCompile(`^(?:([\w.-]+)/([\w.-]+))?#?(\d+)$`)
+
+// ParseRef resolves a link the way a person would write one, falling back to a
+// repository when the input does not name its own.
+//
+// Accepts, in order:
+//   - a full GitHub URL (any form ParseURL takes)
+//   - "owner/repo#42" — explicit repo, shorthand number
+//   - "#42" or "42"   — resolved against fallbackOwner/fallbackRepo
+//
+// The fallback is the issue's own service→repository mapping, which is what
+// makes the shorthand usable: an error in `auth-service-v2` gets linked to
+// `#42` and lands on the right repo without anyone restating it. A shorthand
+// with no fallback is an error rather than a guess — silently attaching a link
+// to the wrong repository is worse than refusing.
+//
+// A shorthand number is always treated as a PULL REQUEST. GitHub's own
+// /pull/{n} and /issues/{n} share one numbering sequence, so the number alone is
+// ambiguous; pull request is the overwhelmingly common intent here, and anyone
+// meaning the issue can paste its URL.
+func ParseRef(input, fallbackOwner, fallbackRepo string) (Ref, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return Ref{}, fmt.Errorf("a url or number is required")
+	}
+
+	// Anything URL-shaped goes through the strict parser. A scheme-less
+	// "github.com/..." gets one PREPENDED rather than the host stripped — the
+	// host is what ParseURL validates against, and removing it would leave a path
+	// that parses as a relative reference and fails on an empty scheme.
+	if strings.Contains(input, "://") {
+		return ParseURL(input)
+	}
+	if strings.HasPrefix(input, "github.com/") || strings.HasPrefix(input, "www.github.com/") {
+		return ParseURL("https://" + input)
+	}
+
+	m := shorthandRe.FindStringSubmatch(input)
+	if m == nil {
+		return Ref{}, fmt.Errorf("expected a github url, owner/repo#number, or #number")
+	}
+
+	owner, repo, numStr := m[1], m[2], m[3]
+	if owner == "" || repo == "" {
+		owner, repo = fallbackOwner, fallbackRepo
+	}
+	if owner == "" || repo == "" {
+		return Ref{}, fmt.Errorf("this service is not mapped to a repository, so %q is ambiguous — paste the full url or use owner/repo#number", input)
+	}
+
+	n, err := strconv.Atoi(numStr)
+	if err != nil || n <= 0 {
+		return Ref{}, fmt.Errorf("invalid number %q", numStr)
+	}
+	return Ref{Kind: structs.IssueLinkPullRequest, Owner: owner, Repo: repo, Number: n}, nil
 }
 
 // isHexSHA reports whether s looks like a git object id — 7 to 40 hex digits,

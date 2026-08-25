@@ -203,6 +203,30 @@ IdP means filling in the form at `/admin/sso`, not shipping a build.
 | `monitor.issues` | one row per fingerprint — identity, counts, first/last seen, and the mutable triage state (status, priority, title, assignee) |
 | `monitor.issue_timeline` | append-only polymorphic feed: comments, status transitions, regressions, assignment, PR events |
 | `monitor.issue_links` | linked GitHub PRs/issues/commits with a cached state, refreshed by webhook |
+| `monitor.service_repos` | which source repository each reporting service is built from |
+
+**Monitor watches many services across more than one GitHub org**, so an issue in
+`scraper-service` and an issue in `website` do not belong to the same repo — and neither belongs
+to `monitor-core`. `monitor.service_repos` is what makes an issue know where its code lives.
+
+The mapping is **many-to-one and explicit**. The estate runs `auth-service-v1` beside
+`auth-service-v2`, and `team-service` at v1/v2/v3 — all versions of one service, each reporting
+under its own name, all built from one repo. Stripping a `-vN` suffix would be a guess that
+silently mislabels anything off-convention, so nothing is derived from the service name. A service
+with no row is simply unmapped: links still work, they just cannot be resolved from a bare `#123`.
+
+**Tokens are per-owner**, because a fine-grained PAT is scoped to a single org. `github.TokenFor`
+derives the env var name from the owner — `TeamTrailblaze` → `MON_GITHUB_TOKEN_TEAMTRAILBLAZE`,
+`aidenappl` → `MON_GITHUB_TOKEN_AIDENAPPL` — and falls back to `MON_GITHUB_TOKEN_TRAILBLAZE`, so
+adding an org is one Keyring secret with a derivable name and no code change. **Never fall back to
+another org's token**: it 404s confusingly at best, and at worst sends a credential somewhere it
+was not scoped for.
+
+`github.ParseRef(input, fallbackOwner, fallbackRepo)` is what makes the mapping pay off — `#42` on
+an `auth-service-v2` issue resolves against that service's repo. A shorthand with no mapping is
+**refused, never guessed**: attaching a link to the wrong repository is worse than declining to
+attach one. A bare number always means a pull request, since GitHub shares one numbering sequence
+between PRs and issues and the number alone cannot disambiguate.
 
 `issues.id` is **not** auto-increment — it is the deterministic UUIDv5 from
 `issues.issueIDFor(fingerprint)`, so concurrent creators converge on one row. That namespace must
@@ -302,6 +326,10 @@ POST   /admin/sso-providers                 create a provider                   
 PUT    /admin/sso-providers/{slug}          update a provider                     [Protected + RequireAdmin]
 DELETE /admin/sso-providers/{slug}          delete a provider                     [Protected + RequireAdmin]
 POST   /webhooks/github                     GitHub pull_request deliveries        [public — HMAC signature IS the auth]
+GET    /v1/service-repos                    every service → repository mapping    [QueryAuthMiddleware]
+GET    /v1/service-repos/{service}          one mapping (404 when unmapped)       [QueryAuthMiddleware]
+PUT    /v1/service-repos/{service}          create/replace a mapping              [QueryAuthMiddleware]
+DELETE /v1/service-repos/{service}          remove a mapping                      [QueryAuthMiddleware]
 ```
 
 Native flows: `HandleLogin` returns a neutral 401 on every failure (no email
@@ -559,7 +587,8 @@ Both are wrapped in `recover()` and cancelled via the shutdown context.
   | `MON_PUBLIC_URL` | `https://monitor.appleby.cloud` | origin used to build each SSO `redirect_uri` (`{base}/auth/sso/{slug}/callback`) — must match the IdP registration byte-for-byte |
   | `MON_ADMIN_EMAIL` / `MON_ADMIN_PASSWORD` | `` | seed the first admin on a fresh DB; empty = no seed |
   | `MON_ALLOW_REGISTRATION` | `false` | gates `POST /auth/register` |
-  | `MON_GITHUB_TOKEN_TRAILBLAZE` | `` | fine-grained PAT for fetching linked PR state. **Optional** — unset means links store fine but carry no live state. Scoped to one org: a link outside it degrades to a bare URL rather than failing |
+  | `MON_GITHUB_TOKEN_TRAILBLAZE` | `` | default fine-grained PAT for fetching linked PR state. **Optional** — unset means links store fine but carry no live state |
+  | `MON_GITHUB_TOKEN_<OWNER>` | `` | per-org token, name derived from the GitHub owner (`TeamTrailblaze` → `MON_GITHUB_TOKEN_TEAMTRAILBLAZE`). Takes precedence over the default; adding an org needs no code change |
   | `MON_GITHUB_WEBHOOK_SECRET_TRAILBLAZE` | `` | shared secret GitHub signs deliveries with. **Optional, but unset REJECTS every delivery** — it never fails open. Generate with `openssl rand -hex 32` and paste the same value into the repo's webhook config |
   | `BATCH_SIZE` / `FLUSH_INTERVAL` / `QUEUE_SIZE` / `MAX_SSE_SUBSCRIBERS` | `1000` / `5s` / `100000` / `100` | ingestion/SSE tuning |
 
