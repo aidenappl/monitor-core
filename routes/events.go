@@ -61,6 +61,12 @@ func IngestEventsHandler(w http.ResponseWriter, r *http.Request) {
 	// actually accepted; dropped events are reflected in /health's `dropped`.
 	accepted := 0
 	for _, event := range events {
+		// Stamp the issue id BEFORE enqueueing, so it lands on the stored row.
+		// Always assigned, never merged: an issue_id supplied by a client is
+		// overwritten (with "" for non-error levels), so no caller can file its
+		// events under another issue.
+		event.IssueID = issues.IssueIDForEvent(event)
+
 		if Queue.Enqueue(event) {
 			accepted++
 		}

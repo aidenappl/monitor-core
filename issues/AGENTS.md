@@ -12,6 +12,7 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
   `structs.Issue`.
 - `backfill.go` — one-time `BackfillFromClickHouse`, run via the `backfill-issues`
   subcommand.
+- `history.go` — `GetOccurrenceHistory`, reading the no-TTL daily rollup.
 - `issues_test.go` — unit tests for `normalizeMessage` + `generateFingerprint`.
 - `grouping_test.go` — regression tests for the three grouping bugs fixed
   2026-08-07: fingerprint-derived issue ids, status-code preservation in
@@ -50,6 +51,19 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
 - **`FingerprintForEvent(event)`** is the exported way to ask which issue an event
   belongs to. Anything matching events to issues must use it — `service`+`name`
   alone is only a pre-filter, since many issues share one event name.
+- **`issue_id` is stamped on the event row at ingest.** `IssueIDForEvent` runs
+  *synchronously* in `routes/events.go` before the event is enqueued (fingerprinting is
+  a pure sha256 with no I/O — the worker pool exists for `processError`'s database
+  round-trip, not for this). It is always assigned and never merged, so an `issue_id`
+  supplied by a client is overwritten and no caller can file events under another
+  issue. Non-error levels get `""`.
+- **`GET /issues/{id}/events` is an indexed equality match**, not a scan. The old path
+  pre-filtered on `service`+`name`(+`path`) then recomputed each candidate's fingerprint
+  in Go, bounded by `candidateScanLimit` — which truncated and logged when a sparse issue
+  was buried among high-volume siblings. That legacy scan survives only as a fallback,
+  restricted to `issue_id = ''` so it can return only rows the fast path could not, and
+  **is removable 30 days after the deploy of `004`** once the events TTL has aged out
+  every unstamped row.
 - **Message/path extraction** pulls `path`/`uri`, `error`/`error_message`/`message`,
   and `method` out of the event's `data` map to build a descriptive title.
 - **Storage: MariaDB `monitor.issues`** (moved off ClickHouse). The table is created by

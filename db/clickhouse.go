@@ -81,7 +81,8 @@ func WriteBatch(ctx context.Context, events []*structs.Event) error {
 			user_id,
 			name,
 			level,
-			data
+			data,
+			issue_id
 		)
 	`, Database))
 	if err != nil {
@@ -100,6 +101,7 @@ func WriteBatch(ctx context.Context, events []*structs.Event) error {
 			event.Name,
 			event.Level,
 			event.DataJSON(),
+			event.IssueID,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to append event to batch: %w", err)

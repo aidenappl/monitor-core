@@ -123,6 +123,10 @@ dev down        # stop the local stack
 - **Both schemas migrate automatically at startup, fail-fast:**
   - **ClickHouse** — `migrations.RunMigrations(ctx)` (`migrations/embed.go`) embeds
     `migrations/*.sql`, runs each in sorted order (all `IF NOT EXISTS`, no tracking table).
+    Every file runs on **every boot**, and files are split naively on `;` — so never put
+    a semicolon inside a comment, and never leave a comment after the final statement.
+    Either produces a comment-only fragment that ClickHouse rejects, which is fatal at
+    startup.
   - **MariaDB** — `db.RunMigrations()` (`db/sql.go`) embeds `db/migrations/*.sql`, runs
     each once, tracked in a `migrations_applied` table. The DSN needs `multiStatements`
     (added automatically by `ensureDSNParams`).
@@ -469,7 +473,13 @@ Both are wrapped in `recover()` and cancelled via the shutdown context.
 
 ### External systems
 
-- **ClickHouse** — events/analytics. DB `monitor`, table `events` (30-day TTL).
+- **ClickHouse** — events/analytics. DB `monitor`, table `events` (30-day TTL), plus
+  `issue_occurrences_daily` — an `AggregatingMergeTree` rollup with **no TTL**, fed by a
+  materialized view on `events` keyed by `issue_id`. It is what lets an issue's history
+  outlive the events that produced it: after 30 days the totals and the seen-window
+  survive even though every raw event is gone. Read it with the `-Merge` combinators
+  (`countMerge`, `minMerge`, `maxMerge`) — the stored columns are partial aggregation
+  states, not numbers.
 - **MariaDB** — two schemas on one host, one `db.SQL` pool (`mariadb:11.4`, host port 3336
   locally). `monitor_auth` holds the auth layer; `monitor` holds issue-tracking state
   (`issues`, `issue_timeline`, `issue_links`). Cross-schema joins between them are native.

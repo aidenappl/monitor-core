@@ -367,6 +367,27 @@ func FingerprintForEvent(event *structs.Event) string {
 	return generateFingerprint(event.Service, event.Name, message, path)
 }
 
+// IssueIDForEvent returns the id of the issue an event belongs to, or "" if the
+// event is not an error/fatal and therefore groups into no issue.
+//
+// Called synchronously on the ingest path so the id can be stored on the event
+// row. That is deliberate and cheap — fingerprinting is a pure sha256 over a few
+// regex substitutions, with no I/O. The worker pool exists for the database
+// round-trip in processError, not for this.
+func IssueIDForEvent(event *structs.Event) string {
+	if event == nil || !isErrorLevel(event.Level) {
+		return ""
+	}
+	return issueIDFor(FingerprintForEvent(event))
+}
+
+// isErrorLevel reports whether a level groups into issues. Kept in one place so
+// the ingest stamp and the tracking hook can never disagree about which events
+// belong to an issue.
+func isErrorLevel(level string) bool {
+	return level == "error" || level == "fatal"
+}
+
 func generateFingerprint(service, name, message, path string) string {
 	normalized := normalizeMessage(message)
 	raw := service + "|" + name + "|" + path + "|" + normalized

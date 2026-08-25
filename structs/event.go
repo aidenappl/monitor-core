@@ -22,6 +22,15 @@ type Event struct {
 	Name      string                 `json:"name"`
 	Level     string                 `json:"level"`
 	Data      map[string]interface{} `json:"data"`
+
+	// IssueID is the issue this event belongs to, stamped server-side at ingest
+	// for error/fatal events and empty otherwise. It is DERIVED, never trusted
+	// from the client: the ingest path overwrites whatever arrives here, so a
+	// caller cannot file its events under someone else's issue.
+	//
+	// It exists so an issue's events can be looked up by an indexed equality
+	// match instead of rescanning candidates and recomputing fingerprints in Go.
+	IssueID string `json:"issue_id,omitempty"`
 }
 
 // Validate checks that all required fields are present and IDs are valid UUIDs
