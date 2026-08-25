@@ -295,6 +295,16 @@ func main() {
 	v1.HandleFunc("/issues/{id}", routes.HandleGetIssue).Methods(http.MethodGet)
 	v1.HandleFunc("/issues/{id}", routes.HandleUpdateIssue).Methods(http.MethodPut)
 	v1.HandleFunc("/issues/{id}/events", routes.HandleGetIssueEvents).Methods(http.MethodGet)
+	// Timeline, comments and links. The comment path is how agents leave notes as
+	// they work; every write here records its actor.
+	v1.HandleFunc("/issues/{id}/timeline", routes.HandleGetIssueTimeline).Methods(http.MethodGet)
+	v1.HandleFunc("/issues/{id}/history", routes.HandleGetIssueHistory).Methods(http.MethodGet)
+	v1.HandleFunc("/issues/{id}/comments", routes.HandleAddIssueComment).Methods(http.MethodPost)
+	v1.HandleFunc("/issues/{id}/comments/{commentID}", routes.HandleEditIssueComment).Methods(http.MethodPatch)
+	v1.HandleFunc("/issues/{id}/comments/{commentID}", routes.HandleDeleteIssueComment).Methods(http.MethodDelete)
+	v1.HandleFunc("/issues/{id}/links", routes.HandleListIssueLinks).Methods(http.MethodGet)
+	v1.HandleFunc("/issues/{id}/links", routes.HandleCreateIssueLink).Methods(http.MethodPost)
+	v1.HandleFunc("/issues/{id}/links/{linkID}", routes.HandleDeleteIssueLink).Methods(http.MethodDelete)
 
 	// CORS Middleware
 	corsMiddleware := cors.New(cors.Options{

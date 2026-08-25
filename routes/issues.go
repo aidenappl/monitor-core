@@ -4,46 +4,206 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/issues"
+	"github.com/aidenappl/monitor-core/middleware"
+	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
 	"github.com/aidenappl/monitor-core/structs"
 	"github.com/gorilla/mux"
 )
 
+// issueQueryParams parses the shared filter/sort surface of GET /v1/issues.
+//
+// Every filter is a pointer so "not supplied" stays distinguishable from a zero
+// value — `assignee=0` must not silently mean "unassigned", and `service=` must
+// not filter to the empty string.
+func issueQueryParams(r *http.Request) (query.ListIssuesRequest, error) {
+	q := r.URL.Query()
+	req := query.ListIssuesRequest{
+		Sort:       query.IssueSort(q.Get("sort")),
+		Descending: !strings.EqualFold(q.Get("order"), "asc"),
+	}
+
+	if v := q.Get("status"); v != "" {
+		status := structs.IssueStatus(v)
+		if !status.IsValid() {
+			return req, fmt.Errorf("invalid status %q (expected unresolved, in_progress, resolved or ignored)", v)
+		}
+		req.Status = &status
+	}
+	if v := q.Get("service"); v != "" {
+		req.Service = &v
+	}
+	if v := q.Get("q"); v != "" {
+		req.Search = &v
+	}
+	if v := q.Get("assignee"); v != "" {
+		// "none" is how the UI asks for unassigned issues; an id cannot express
+		// that, and omitting the filter means "any".
+		if strings.EqualFold(v, "none") || strings.EqualFold(v, "unassigned") {
+			req.Unassigned = true
+		} else {
+			id, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return req, fmt.Errorf("invalid assignee %q (expected a user id or \"none\")", v)
+			}
+			req.AssigneeUserID = &id
+		}
+	}
+	if v := q.Get("has_pr"); v != "" {
+		hasPR, err := strconv.ParseBool(v)
+		if err != nil {
+			return req, fmt.Errorf("invalid has_pr %q (expected true or false)", v)
+		}
+		req.HasPR = &hasPR
+	}
+	if v := q.Get("from"); v != "" {
+		t, err := parseTimeParam(v)
+		if err != nil {
+			return req, fmt.Errorf("invalid from: %w", err)
+		}
+		req.From = &t
+	}
+	if v := q.Get("to"); v != "" {
+		t, err := parseTimeParam(v)
+		if err != nil {
+			return req, fmt.Errorf("invalid to: %w", err)
+		}
+		req.To = &t
+	}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return req, fmt.Errorf("invalid limit %q", v)
+		}
+		req.Limit = n
+	}
+	if v := q.Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return req, fmt.Errorf("invalid offset %q", v)
+		}
+		req.Offset = n
+	}
+
+	if !req.Sort.IsValid() {
+		return req, fmt.Errorf("invalid sort %q (expected last_seen, first_seen or occurrences)", q.Get("sort"))
+	}
+	return req, nil
+}
+
+// parseTimeParam accepts RFC3339 or a unix timestamp, matching the rest of the
+// query API.
+func parseTimeParam(v string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t.UTC(), nil
+	}
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		return time.Unix(secs, 0).UTC(), nil
+	}
+	return time.Time{}, fmt.Errorf("expected an RFC3339 timestamp or unix seconds, got %q", v)
+}
+
+// HandleListIssues returns a filtered, sorted page of issues.
+//
+// Rows are enriched with their links, assignee and service repository in THREE
+// bulk queries regardless of page size — rendering 100 issues must not become
+// 300 round trips.
 func HandleListIssues(w http.ResponseWriter, r *http.Request) {
-	status := r.URL.Query().Get("status")
-	service := r.URL.Query().Get("service")
-	limit := 50
-	offset := 0
-
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil {
-			limit = parsed
-		}
-	}
-	if o := r.URL.Query().Get("offset"); o != "" {
-		if parsed, err := strconv.Atoi(o); err == nil {
-			offset = parsed
-		}
+	req, err := issueQueryParams(r)
+	if err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
-	list, total, err := issues.List(r.Context(), status, service, limit, offset)
+	total, err := query.CountIssues(db.SQL, req)
+	if err != nil {
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to count issues", err)
+		return
+	}
+
+	list, err := query.ListIssues(db.SQL, req)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to list issues", err)
 		return
 	}
-	if list == nil {
-		list = []issues.Issue{}
+	if err := enrichIssues(list); err != nil {
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to enrich issues", err)
+		return
 	}
+
 	responder.NewWithCount(w, list, total, "", "")
 }
 
+// enrichIssues attaches links, assignees and repositories to a page of issues.
+//
+// Enrichment is best-effort per concern: a failure to resolve, say, the service
+// repository must not fail the whole listing, because the core issue data is
+// already correct and useful without it.
+func enrichIssues(list []structs.Issue) error {
+	if len(list) == 0 {
+		return nil
+	}
+
+	ids := make([]string, 0, len(list))
+	services := make([]string, 0, len(list))
+	assignees := make([]int64, 0, len(list))
+	seenService := map[string]bool{}
+	seenAssignee := map[int64]bool{}
+
+	for _, issue := range list {
+		ids = append(ids, issue.ID)
+		if !seenService[issue.Service] {
+			seenService[issue.Service] = true
+			services = append(services, issue.Service)
+		}
+		if issue.AssigneeUserID != nil && !seenAssignee[*issue.AssigneeUserID] {
+			seenAssignee[*issue.AssigneeUserID] = true
+			assignees = append(assignees, *issue.AssigneeUserID)
+		}
+	}
+
+	linksByIssue, err := query.ListIssueLinksForIssues(db.SQL, ids)
+	if err != nil {
+		return err
+	}
+	reposByService, err := query.ListServiceReposFor(db.SQL, services)
+	if err != nil {
+		return err
+	}
+	usersByID, err := query.ListUsersByIDs(db.SQL, assignees)
+	if err != nil {
+		return err
+	}
+
+	for i := range list {
+		issue := &list[i]
+		issue.Links = linksByIssue[issue.ID]
+		if repo, ok := reposByService[issue.Service]; ok {
+			r := repo
+			issue.Repository = &r
+		}
+		if issue.AssigneeUserID != nil {
+			if user, ok := usersByID[*issue.AssigneeUserID]; ok {
+				u := user
+				issue.Assignee = &u
+			}
+		}
+	}
+	return nil
+}
+
+// HandleGetIssue returns one issue with everything the detail view renders:
+// links, assignee, repository, comment count and the occurrence sparkline.
 func HandleGetIssue(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	if id == "" {
@@ -51,15 +211,55 @@ func HandleGetIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	issue, err := issues.Get(r.Context(), id)
+	issue, err := query.GetIssue(db.SQL, id)
 	if err != nil {
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to fetch issue", err)
+		return
+	}
+	if issue == nil {
 		responder.Error(w, http.StatusNotFound, "issue not found")
 		return
+	}
+
+	one := []structs.Issue{*issue}
+	if err := enrichIssues(one); err != nil {
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to enrich issue", err)
+		return
+	}
+	issue = &one[0]
+
+	commentType := structs.TimelineComment
+	if count, err := query.CountTimeline(db.SQL, query.ListTimelineRequest{
+		IssueID: id, Type: &commentType,
+	}); err == nil {
+		issue.CommentCount = &count
+	}
+
+	// The sparkline reads the no-TTL rollup, so it still has shape for an issue
+	// whose raw events have long since expired.
+	to := time.Now().UTC()
+	from := to.AddDate(0, 0, -defaultHistoryDays)
+	if history, err := issues.GetOccurrenceHistory(r.Context(), id, from, to); err == nil {
+		issue.History = history
+	} else {
+		log.Printf("issues: failed to load history for %s: %v", id, err)
 	}
 
 	responder.New(w, issue)
 }
 
+// defaultHistoryDays is the sparkline window on the detail view.
+const defaultHistoryDays = 30
+
+// maxIssueBody caps an issue mutation body. Titles and comments are the largest
+// fields and are bounded well below this.
+const maxIssueBody = 1 << 20
+
+// HandleUpdateIssue applies a partial update and records each changed field as
+// its own timeline entry, attributed to the caller.
+//
+// This is where the actor plumbing pays off: a status change made by monitor-mcp
+// is recorded against "monitor-mcp", not left anonymous as it was before.
 func HandleUpdateIssue(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	if id == "" {
@@ -67,24 +267,202 @@ func HandleUpdateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var body struct {
-		Status string `json:"status"`
+	actor, ok := middleware.GetActor(r.Context())
+	if !ok {
+		responder.Error(w, http.StatusUnauthorized, "authentication required")
+		return
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+
+	// The body is read once and decoded twice: into a typed struct for values,
+	// and into a raw map to tell an explicit JSON null from an omitted key. A
+	// single pointer cannot express both "leave alone" and "clear", and the
+	// difference matters — {"priority": null} means unset it, while omitting the
+	// key must not.
+	rawBody, err := io.ReadAll(io.LimitReader(r.Body, maxIssueBody))
+	if err != nil {
+		responder.Error(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	var body struct {
+		Status         *string `json:"status"`
+		Priority       *string `json:"priority"`
+		Title          *string `json:"title"`
+		AssigneeUserID *int64  `json:"assignee_user_id"`
+	}
+	if err := json.Unmarshal(rawBody, &body); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if body.Status == "" {
-		responder.Error(w, http.StatusBadRequest, "status is required")
+
+	present := map[string]json.RawMessage{}
+	if err := json.Unmarshal(rawBody, &present); err != nil {
+		responder.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	isNull := func(key string) bool {
+		v, ok := present[key]
+		return ok && string(v) == "null"
+	}
+
+	before, err := query.GetIssue(db.SQL, id)
+	if err != nil {
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to fetch issue", err)
+		return
+	}
+	if before == nil {
+		responder.Error(w, http.StatusNotFound, "issue not found")
 		return
 	}
 
-	if err := issues.UpdateStatus(r.Context(), id, body.Status); err != nil {
-		responder.Error(w, http.StatusBadRequest, err.Error())
+	req := query.UpdateIssueRequest{}
+
+	if body.Status != nil {
+		status := structs.IssueStatus(*body.Status)
+		if !status.IsValid() {
+			responder.Error(w, http.StatusBadRequest,
+				fmt.Sprintf("invalid status %q (expected unresolved, in_progress, resolved or ignored)", *body.Status))
+			return
+		}
+		req.Status = &status
+	}
+	req.ClearPriority = isNull("priority")
+	req.ClearTitle = isNull("title")
+	req.ClearAssignee = isNull("assignee_user_id")
+
+	if body.Priority != nil {
+		priority := structs.IssuePriority(*body.Priority)
+		if !priority.IsValid() {
+			responder.Error(w, http.StatusBadRequest,
+				fmt.Sprintf("invalid priority %q (expected low, medium, high or critical)", *body.Priority))
+			return
+		}
+		req.Priority = &priority
+	}
+	if body.Title != nil {
+		req.Title = body.Title
+	}
+	if body.AssigneeUserID != nil {
+		req.AssigneeUserID = body.AssigneeUserID
+	}
+
+	if req.IsEmpty() {
+		responder.Error(w, http.StatusBadRequest, "no updatable fields supplied")
 		return
 	}
 
-	responder.New(w, nil, "issue status updated")
+	updated, err := query.UpdateIssue(db.SQL, id, req)
+	if err != nil {
+		responder.ErrorWithCause(w, http.StatusBadRequest, "failed to update issue", err)
+		return
+	}
+	if updated == nil {
+		responder.Error(w, http.StatusNotFound, "issue not found")
+		return
+	}
+
+	appendUpdateTimeline(id, actor, before, updated)
+	responder.New(w, updated, "issue updated")
+}
+
+// appendUpdateTimeline records one entry per field that actually changed.
+//
+// Comparing before/after rather than trusting the request body means a no-op
+// write (setting status to what it already was) leaves no entry, so the timeline
+// reflects changes rather than attempts. Failures are logged, never propagated:
+// the update is already durable, and losing an entry must not report the whole
+// operation as failed.
+func appendUpdateTimeline(issueID string, actor *structs.Actor, before, after *structs.Issue) {
+	type entry struct {
+		typ      structs.TimelineEntryType
+		body     string
+		metadata map[string]any
+	}
+	var entries []entry
+
+	if before.Status != after.Status {
+		entries = append(entries, entry{
+			typ:      structs.TimelineStatusChanged,
+			body:     fmt.Sprintf("Status changed from %s to %s.", before.Status, after.Status),
+			metadata: map[string]any{"from": string(before.Status), "to": string(after.Status)},
+		})
+	}
+	if !equalPriority(before.Priority, after.Priority) {
+		entries = append(entries, entry{
+			typ:      structs.TimelinePriorityChanged,
+			body:     fmt.Sprintf("Priority changed from %s to %s.", priorityLabel(before.Priority), priorityLabel(after.Priority)),
+			metadata: map[string]any{"from": priorityLabel(before.Priority), "to": priorityLabel(after.Priority)},
+		})
+	}
+	if !equalStringPtr(before.Title, after.Title) {
+		entries = append(entries, entry{
+			typ:      structs.TimelineTitleChanged,
+			body:     "Title updated.",
+			metadata: map[string]any{"from": derefString(before.Title), "to": derefString(after.Title)},
+		})
+	}
+	if !equalInt64Ptr(before.AssigneeUserID, after.AssigneeUserID) {
+		if after.AssigneeUserID == nil {
+			entries = append(entries, entry{
+				typ:      structs.TimelineUnassigned,
+				body:     "Unassigned.",
+				metadata: map[string]any{"from": before.AssigneeUserID},
+			})
+		} else {
+			entries = append(entries, entry{
+				typ:      structs.TimelineAssigned,
+				body:     "Assigned.",
+				metadata: map[string]any{"to": *after.AssigneeUserID},
+			})
+		}
+	}
+
+	for _, e := range entries {
+		if _, err := query.AppendTimelineEntry(db.SQL, query.AppendTimelineEntryRequest{
+			IssueID:  issueID,
+			Type:     e.typ,
+			Actor:    actor,
+			Body:     &e.body,
+			Metadata: e.metadata,
+		}); err != nil {
+			log.Printf("issues: failed to record %s on %s: %v", e.typ, issueID, err)
+		}
+	}
+}
+
+func equalStringPtr(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func equalInt64Ptr(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func equalPriority(a, b *structs.IssuePriority) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func priorityLabel(p *structs.IssuePriority) string {
+	if p == nil {
+		return "none"
+	}
+	return string(*p)
+}
+
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {

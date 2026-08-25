@@ -6,15 +6,12 @@ import (
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/structs"
 )
 
-// OccurrenceDay is one day's worth of an issue's activity.
-type OccurrenceDay struct {
-	Day         time.Time `json:"day"`
-	Occurrences uint64    `json:"occurrences"`
-	FirstSeen   time.Time `json:"first_seen"`
-	LastSeen    time.Time `json:"last_seen"`
-}
+// OccurrenceDay is one day's worth of an issue's activity. Aliased to the
+// canonical shape in structs, which Issue.History embeds.
+type OccurrenceDay = structs.OccurrenceDay
 
 // GetOccurrenceHistory returns per-day counts for an issue between from and to
 // (inclusive), oldest first.

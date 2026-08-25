@@ -156,3 +156,37 @@ func UpdateUser(engine db.Queryable, id int64, req UpdateUserRequest) (*structs.
 	}
 	return GetUserByID(engine, id)
 }
+
+// ListUsersByIDs fetches several users in ONE query, keyed by id.
+//
+// Used to resolve issue assignees for a page of issues: rendering 100 issues
+// must not become 100 user lookups. Ids with no matching user are simply absent
+// from the map — assignee_user_id has no foreign key precisely so a deleted user
+// cannot block anything, so a dangling id is an expected state, not an error.
+func ListUsersByIDs(engine db.Queryable, ids []int64) (map[int64]structs.User, error) {
+	if len(ids) == 0 {
+		return map[int64]structs.User{}, nil
+	}
+
+	qStr, args, err := sq.Select(userColumns...).From("users").
+		Where(sq.Eq{"users.id": ids}).ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build sql query: %w", err)
+	}
+
+	rows, err := engine.Query(qStr, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute sql query: %w", err)
+	}
+	defer rows.Close()
+
+	byID := map[int64]structs.User{}
+	for rows.Next() {
+		user, err := scanUser(rows)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan user: %w", err)
+		}
+		byID[user.ID] = *user
+	}
+	return byID, rows.Err()
+}

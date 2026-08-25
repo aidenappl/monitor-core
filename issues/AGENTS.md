@@ -106,9 +106,20 @@ This is the primary error-investigation surface (mirrored by
 
 | Sev | Where | Issue |
 |---|---|---|
-| 🟢 | `GET /issues` | **Filters/sort not yet exposed on the route.** `query.ListIssues` supports status, service, assignee, search, `has_pr`, `from`/`to` and sort, but `routes/issues.go` still passes only status+service and a fixed `last_seen DESC`. Wiring them up is Phase 4. |
 | 🟢 | subsystem-wide | **No auto-resolve.** Regression reopen exists but nothing ages an issue out after N days of silence. |
-| 🟢 | `UpdateStatus` | **Records no actor**, so a status change lands without a timeline entry naming who made it. Handlers should call `query.UpdateIssue` with `middleware.GetActor` instead; the shim stays only until the routes are cut over. |
+| 🟢 | `issues.UpdateStatus` | **Records no actor** — a legacy shim kept only for callers not yet moved. `routes/issues.go` no longer uses it; `HandleUpdateIssue` calls `query.UpdateIssue` with `middleware.GetActor`. Delete the shim once nothing calls it. |
+
+**Resolved 2026-08-25:** the full filter/sort surface and every mutation endpoint are wired.
+`GET /v1/issues` takes status, service, assignee (`none` for unassigned), `has_pr`, `q`, `from`,
+`to`, `sort` and `order`; the detail read returns links, assignee, repository, comment count and
+the sparkline. **Every mutation records its actor** — a status change from monitor-mcp is
+attributed to `monitor-mcp` rather than left anonymous.
+
+Two things worth knowing about the write path. `HandleUpdateIssue` reads the body **twice** — once
+typed, once as a raw map — because a single pointer cannot distinguish an explicit
+`{"priority": null}` (clear it) from an omitted key (leave it). And `appendUpdateTimeline`
+compares before/after rather than trusting the request, so setting status to what it already was
+leaves no entry: the timeline records changes, not attempts.
 
 **Resolved 2026-08-19:** occurrence-count drift is **fixed**, not mitigated. The issue
 row moved to MariaDB and the fold became a single atomic statement, so concurrent

@@ -80,8 +80,27 @@ type Issue struct {
 	// foreign key behind AssigneeUserID, so this can be nil for a user that no
 	// longer exists.
 	Assignee *User `json:"assignee,omitempty"`
-	// Links is populated by the detail read, not the list read.
+	// Links is attached by the read layer, in bulk for a page of issues.
 	Links []IssueLink `json:"links,omitempty"`
+	// Repository is the service's source repo, joined from monitor.service_repos.
+	// Nil when the service is unmapped, which is a normal state.
+	Repository *ServiceRepo `json:"repository,omitempty"`
 	// CommentCount counts non-deleted timeline entries of type comment.
 	CommentCount *int `json:"comment_count,omitempty"`
+	// History is the per-day occurrence sparkline, read from the no-TTL rollup so
+	// it still has shape after the raw events have expired. Detail view only.
+	History []OccurrenceDay `json:"history,omitempty"`
+}
+
+// OccurrenceDay is one day of an issue's activity, read back from the no-TTL
+// ClickHouse rollup (monitor.issue_occurrences_daily).
+//
+// It lives here rather than in the issues package because structs cannot import
+// issues — issues already imports structs — and Issue.History needs the concrete
+// type rather than an interface.
+type OccurrenceDay struct {
+	Day         time.Time `json:"day"`
+	Occurrences uint64    `json:"occurrences"`
+	FirstSeen   time.Time `json:"first_seen"`
+	LastSeen    time.Time `json:"last_seen"`
 }

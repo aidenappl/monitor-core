@@ -218,6 +218,13 @@ const (
 	IssueSortOccurrences IssueSort = "occurrences"
 )
 
+// IsValid reports whether the sort names an allow-listed column. Exported so
+// handlers can reject a bad value with a 400 before any query is built.
+func (s IssueSort) IsValid() bool {
+	_, ok := s.column()
+	return ok
+}
+
 func (s IssueSort) column() (string, bool) {
 	switch s {
 	case IssueSortLastSeen, "":
@@ -236,14 +243,19 @@ type ListIssuesRequest struct {
 	Status         *structs.IssueStatus
 	Service        *string
 	AssigneeUserID *int64
-	Search         *string
-	HasPR          *bool
-	From           *time.Time
-	To             *time.Time
-	Sort           IssueSort
-	Descending     bool
-	Limit          int
-	Offset         int
+	// Unassigned filters to issues with no assignee. A separate field rather than
+	// a sentinel id: "no assignee" is a different question from "assignee = N",
+	// and encoding it as a magic number produces a query that silently matches
+	// nothing instead of failing loudly.
+	Unassigned bool
+	Search     *string
+	HasPR      *bool
+	From       *time.Time
+	To         *time.Time
+	Sort       IssueSort
+	Descending bool
+	Limit      int
+	Offset     int
 }
 
 func applyIssueFilters(q sq.SelectBuilder, req ListIssuesRequest) sq.SelectBuilder {
@@ -253,7 +265,9 @@ func applyIssueFilters(q sq.SelectBuilder, req ListIssuesRequest) sq.SelectBuild
 	if req.Service != nil {
 		q = q.Where(sq.Eq{"monitor.issues.service": *req.Service})
 	}
-	if req.AssigneeUserID != nil {
+	if req.Unassigned {
+		q = q.Where(sq.Eq{"monitor.issues.assignee_user_id": nil})
+	} else if req.AssigneeUserID != nil {
 		q = q.Where(sq.Eq{"monitor.issues.assignee_user_id": *req.AssigneeUserID})
 	}
 	if req.From != nil {
