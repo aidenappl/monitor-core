@@ -22,6 +22,16 @@ var csrfExemptPaths = map[string]bool{
 	"/auth/login":    true,
 	"/auth/register": true,
 	"/auth/refresh":  true,
+
+	// GitHub webhook deliveries are server-to-server POSTs carrying no cookie,
+	// no Bearer token and no X-Api-Key, so every exemption above misses them and
+	// CSRF would reject the delivery outright.
+	//
+	// Exempting is sound rather than a hole: CSRF defends against a browser
+	// auto-attaching a session cookie, and this route has no cookie auth at all.
+	// Its authentication is the HMAC-SHA256 signature over the body, which a
+	// cross-site form cannot produce. See github.VerifySignature.
+	"/webhooks/github": true,
 }
 
 // SSO callbacks are /auth/sso/{slug}/callback — a top-level IdP redirect that

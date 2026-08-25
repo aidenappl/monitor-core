@@ -53,6 +53,42 @@ func TestCSRFExemptsBackchannelLogout(t *testing.T) {
 	}
 }
 
+// TestCSRFExemptsGitHubWebhook is the SAME failure shape as the test above, and
+// it is here because that precedent is what caught it.
+//
+// GitHub deliveries are server-to-server POSTs with no cookie, no Bearer token
+// and no X-Api-Key — identical to Forta's back-channel logout. Without an
+// explicit exemption every delivery would be refused 403 before the handler ran,
+// GitHub would retry, then disable the webhook, and PR links would silently stop
+// updating while the endpoint looked like a broken receiver.
+//
+// Exempting is sound rather than a hole: CSRF defends against a browser
+// auto-attaching a session cookie, and this route has no cookie auth at all. Its
+// authentication is the HMAC-SHA256 signature over the body, which a cross-site
+// form cannot produce.
+func TestCSRFExemptsGitHubWebhook(t *testing.T) {
+	reached := false
+	h := CSRFMiddleware(okHandler(&reached))
+
+	// Exactly what GitHub sends.
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/github",
+		strings.NewReader(`{"action":"closed"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-Hub-Signature-256", "sha256=deadbeef")
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if !reached {
+		t.Fatalf("CSRF middleware refused the GitHub webhook POST (status %d, body %s).\n\n"+
+			"GitHub sends this with no cookie, no Bearer token and no X-Api-Key, so without an "+
+			"exemption it can never pass. Deliveries would be retried, the webhook eventually "+
+			"disabled, and linked PR state would quietly stop updating.",
+			rr.Code, strings.TrimSpace(rr.Body.String()))
+	}
+}
+
 // TestCSRFStillProtectsOtherUnsafeRequests pins that the exemption above is
 // NARROW.
 //
@@ -69,6 +105,10 @@ func TestCSRFStillProtectsOtherUnsafeRequests(t *testing.T) {
 		// Adjacent to the exempt path but NOT it.
 		"/auth/sso/forta/backchannel-logout/extra",
 		"/auth/sso/backchannel-logout-something",
+		// Same, for the GitHub webhook exemption.
+		"/webhooks/github/extra",
+		"/webhooks/github-something",
+		"/webhooks",
 	}
 
 	for _, path := range protected {

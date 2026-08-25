@@ -206,6 +206,12 @@ func main() {
 	// Event ingestion — authenticated by X-Api-Key (used by go-monitor)
 	r.HandleFunc("/v1/events", middleware.IngestAuthMiddleware(routes.IngestEventsHandler)).Methods(http.MethodPost)
 
+	// GitHub webhook — deliberately on the ROOT router, not the v1 subrouter, so
+	// QueryAuthMiddleware does not run on it: GitHub cannot present an API key or
+	// a session. Its authentication is the HMAC-SHA256 signature over the body
+	// (github.VerifySignature), and it is CSRF-exempt for the same reason.
+	r.HandleFunc("/webhooks/github", routes.HandleGitHubWebhook).Methods(http.MethodPost)
+
 	// V1 API routes — protected by API key or a Monitor session
 	v1 := r.PathPrefix("/v1").Subrouter()
 	v1.Use(middleware.QueryAuthMiddleware)

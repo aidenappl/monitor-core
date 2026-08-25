@@ -63,6 +63,16 @@ var (
 	AdminEmail        string
 	AdminPassword     string
 	AllowRegistration bool
+
+	// GitHub integration for issue links. Both are OPTIONAL — with neither set,
+	// links are still stored and rendered, they just carry no live state and no
+	// webhook updates. GitHub must never be required for issue triage to work.
+	//
+	// The token is scoped to one org (Trailblaze, hence the suffix). A link to a
+	// repo outside that scope degrades to a bare URL rather than failing; adding
+	// another org means adding another token and a lookup by owner.
+	GitHubToken         string
+	GitHubWebhookSecret string
 )
 
 // Load reads all configuration from environment variables.
@@ -103,6 +113,11 @@ func Load() {
 	AdminEmail = getEnv("MON_ADMIN_EMAIL", "")
 	AdminPassword = getEnv("MON_ADMIN_PASSWORD", "")
 	AllowRegistration = getEnv("MON_ALLOW_REGISTRATION", "false") == "true"
+
+	// Sourced from Keyring in production. No dev fallback and no panic: absent
+	// means the GitHub features are simply inactive.
+	GitHubToken = getEnv("MON_GITHUB_TOKEN_TRAILBLAZE", "")
+	GitHubWebhookSecret = getEnv("MON_GITHUB_WEBHOOK_SECRET_TRAILBLAZE", "")
 }
 
 // RequireProductionSecrets returns an error if the process is running in a

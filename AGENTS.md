@@ -90,6 +90,9 @@ monitor-core/
     HandleSSOConfig/Login/Callback.router.go, HandleAdminSSOProviders.router.go, RegisterSSORoutes.go
     cookies.go session.go  # mon-* cookie writing; issueSession (mint + persist refresh-token family)
     events.go query.go analytics.go stream.go api_keys.go dashboards.go views.go issues.go alerts.go
+    HandleGitHubWebhook.router.go  # POST /webhooks/github — root-mounted, HMAC-authenticated
+  github/                  # GitHub link parsing, live-state client, webhook signature verification
+    parse.go client.go verify.go
   apikeys/                 # API-key cache (now backed by MariaDB, was ClickHouse)
   alerts/ issues/ dashboards/ views/   # Subsystems (each Init()s from main.go)
   migrations/              # ClickHouse DDL (001_schema, 002_add_user_id, 003_api_keys) + embed.go (in-app runner)
@@ -298,6 +301,7 @@ GET    /admin/sso-providers                 list providers (secrets never return
 POST   /admin/sso-providers                 create a provider                     [Protected + RequireAdmin]
 PUT    /admin/sso-providers/{slug}          update a provider                     [Protected + RequireAdmin]
 DELETE /admin/sso-providers/{slug}          delete a provider                     [Protected + RequireAdmin]
+POST   /webhooks/github                     GitHub pull_request deliveries        [public — HMAC signature IS the auth]
 ```
 
 Native flows: `HandleLogin` returns a neutral 401 on every failure (no email
@@ -336,6 +340,29 @@ or one of them silently tests a URL that no longer exists.
 ⚠️ **It does NOT replace the checkpoint.** Back-channel logout is best-effort *by specification* —
 notifications can be lost and retries can be exhausted — so the 5-minute poll stays the guarantee
 and this is the fast path. Do not relax `CheckpointInterval` because this exists.
+
+**GitHub webhook (`POST /webhooks/github`) — the same shape, and the precedent above is why it
+works.** Deliveries are server-to-server POSTs with no cookie, no Bearer token and no `X-Api-Key`,
+so they land in exactly the trap that made back-channel logout silently dead. It is therefore
+mounted on the **root router** (never the `v1` subrouter, so `QueryAuthMiddleware` cannot run on
+it) and listed in `csrfExemptPaths`. `middleware/csrf_test.go` pins both halves.
+
+⚠️ **The HMAC-SHA256 signature is the only authentication.** `github.VerifySignature` compares
+with `hmac.Equal` — constant-time, because a byte-wise early return leaks through response timing
+how much of a forged signature was right, which is enough to recover a valid one. An **unset**
+`MON_GITHUB_WEBHOOK_SECRET_TRAILBLAZE` **rejects** every delivery rather than accepting it: failing
+open would leave an unauthenticated write into the issue timeline.
+
+⚠️ **A webhook never changes issue status.** A merged PR appends a `pr_merged` timeline entry and
+refreshes the link's cached state — nothing more. GitHub itself only honours closing keywords on
+the default branch, and silently resolving someone's issue is a surprising thing for a webhook to
+do; resolution stays a deliberate human or agent action. `TestWebhookNeverEmitsStatusChange` pins
+this.
+
+Unknown event types return **200**, not 4xx: GitHub retries on failure and eventually disables a
+webhook that keeps erroring, so acknowledging what we ignore is what keeps the ones we care about
+flowing. Timeline writes are keyed on `gh:{owner}/{repo}#{n}:{type}`, so GitHub's at-least-once
+redelivery collapses to one entry.
 
 **The public SSO config contract (`GET /auth/sso/config`) — shared shape:**
 
@@ -532,6 +559,8 @@ Both are wrapped in `recover()` and cancelled via the shutdown context.
   | `MON_PUBLIC_URL` | `https://monitor.appleby.cloud` | origin used to build each SSO `redirect_uri` (`{base}/auth/sso/{slug}/callback`) — must match the IdP registration byte-for-byte |
   | `MON_ADMIN_EMAIL` / `MON_ADMIN_PASSWORD` | `` | seed the first admin on a fresh DB; empty = no seed |
   | `MON_ALLOW_REGISTRATION` | `false` | gates `POST /auth/register` |
+  | `MON_GITHUB_TOKEN_TRAILBLAZE` | `` | fine-grained PAT for fetching linked PR state. **Optional** — unset means links store fine but carry no live state. Scoped to one org: a link outside it degrades to a bare URL rather than failing |
+  | `MON_GITHUB_WEBHOOK_SECRET_TRAILBLAZE` | `` | shared secret GitHub signs deliveries with. **Optional, but unset REJECTS every delivery** — it never fails open. Generate with `openssl rand -hex 32` and paste the same value into the repo's webhook config |
   | `BATCH_SIZE` / `FLUSH_INTERVAL` / `QUEUE_SIZE` / `MAX_SSE_SUBSCRIBERS` | `1000` / `5s` / `100000` / `100` | ingestion/SSE tuning |
 
 - **Monitoring:** Monitor monitors itself — `mcp__monitor__monitor_service_overview` on
