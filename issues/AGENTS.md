@@ -12,7 +12,10 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
   `structs.Issue`.
 - `backfill.go` — one-time `BackfillFromClickHouse`, run via the `backfill-issues`
   subcommand.
-- `history.go` — `GetOccurrenceHistory`, reading the no-TTL daily rollup.
+- `history.go` — `GetOccurrenceHistory` (one issue) and `GetOccurrenceHistoryBulk` (many, in
+  ONE grouped query). The list view renders an activity strip per row, so per-issue fetching
+  would be a query per row; `GET /v1/issues?history=true` opts into the bulk read, and callers
+  that only want counts do not pay for it.
 - `issues_test.go` — unit tests for `normalizeMessage` + `generateFingerprint`.
 - `grouping_test.go` — regression tests for the three grouping bugs fixed
   2026-08-07: fingerprint-derived issue ids, status-code preservation in

@@ -141,6 +141,28 @@ func HandleListIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ?history=true attaches the per-row activity strip. Opt-in because it costs
+	// an extra ClickHouse read, and callers that only want counts (the MCP, an
+	// alert rule) should not pay for it. One grouped query covers the whole page.
+	if r.URL.Query().Get("history") == "true" && len(list) > 0 {
+		ids := make([]string, 0, len(list))
+		for _, issue := range list {
+			ids = append(ids, issue.ID)
+		}
+		to := time.Now().UTC()
+		from := to.AddDate(0, 0, -listHistoryDays)
+
+		if byIssue, err := issues.GetOccurrenceHistoryBulk(r.Context(), ids, from, to); err != nil {
+			// Best-effort: the strip is a scanning aid, and losing it must not
+			// cost the listing it decorates.
+			log.Printf("issues: failed to load bulk history: %v", err)
+		} else {
+			for i := range list {
+				list[i].History = byIssue[list[i].ID]
+			}
+		}
+	}
+
 	responder.NewWithCount(w, list, total, "", "")
 }
 
@@ -603,6 +625,11 @@ func queryEventsByIssueID(ctx context.Context, issueID string, limit int) ([]*st
 	}
 	return events, rows.Err()
 }
+
+// listHistoryDays is the activity-strip window on the list. Shorter than the
+// detail view's window because a row is a few pixels tall and a longer span
+// would compress each day past the point of being readable.
+const listHistoryDays = 14
 
 // candidateScanLimit sizes the pre-filter window. Events for one issue can be
 // heavily diluted by siblings sharing its service+name, so scan well past the

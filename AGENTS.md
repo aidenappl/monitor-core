@@ -326,7 +326,7 @@ POST   /admin/sso-providers                 create a provider                   
 PUT    /admin/sso-providers/{slug}          update a provider                     [Protected + RequireAdmin]
 DELETE /admin/sso-providers/{slug}          delete a provider                     [Protected + RequireAdmin]
 POST   /webhooks/github                     GitHub pull_request deliveries        [public — HMAC signature IS the auth]
-GET    /v1/issues?status=&service=&assignee=&has_pr=&q=&from=&to=&sort=&order=  filtered list  [QueryAuthMiddleware]
+GET    /v1/issues?status=&service=&assignee=&has_pr=&q=&from=&to=&sort=&order=&history=  filtered list  [QueryAuthMiddleware]
 GET    /v1/issues/{id}                      verbose detail (+links, assignee, repo, history)  [QueryAuthMiddleware]
 PUT    /v1/issues/{id}                      status / priority / title / assignee  [QueryAuthMiddleware]
 GET    /v1/issues/{id}/timeline             the activity feed, oldest first       [QueryAuthMiddleware]

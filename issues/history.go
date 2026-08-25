@@ -55,3 +55,45 @@ func GetOccurrenceHistory(ctx context.Context, issueID string, from, to time.Tim
 	}
 	return history, rows.Err()
 }
+
+// GetOccurrenceHistoryBulk returns per-day counts for MANY issues in ONE query.
+//
+// The list view renders an activity strip per row, which is the difference
+// between "5 occurrences" and knowing whether those five were this morning or
+// spread over a month. Fetching that per row would be a query per issue; this is
+// a single grouped read over the rollup, so a hundred-row page costs one round
+// trip rather than a hundred.
+//
+// Issues with no recorded days are absent from the map rather than present with
+// an empty slice — the caller renders "no breakdown" differently from "quiet".
+func GetOccurrenceHistoryBulk(ctx context.Context, issueIDs []string, from, to time.Time) (map[string][]OccurrenceDay, error) {
+	if len(issueIDs) == 0 {
+		return map[string][]OccurrenceDay{}, nil
+	}
+
+	const q = `SELECT
+			issue_id,
+			day,
+			countMerge(occurrences) AS occurrences
+		FROM %s.issue_occurrences_daily
+		WHERE issue_id IN (?) AND day >= ? AND day <= ?
+		GROUP BY issue_id, day
+		ORDER BY issue_id, day ASC`
+
+	rows, err := db.Conn.Query(ctx, fmt.Sprintf(q, db.Database), issueIDs, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query bulk occurrence history: %w", err)
+	}
+	defer rows.Close()
+
+	byIssue := map[string][]OccurrenceDay{}
+	for rows.Next() {
+		var issueID string
+		var d OccurrenceDay
+		if err := rows.Scan(&issueID, &d.Day, &d.Occurrences); err != nil {
+			return nil, fmt.Errorf("failed to scan occurrence day: %w", err)
+		}
+		byIssue[issueID] = append(byIssue[issueID], d)
+	}
+	return byIssue, rows.Err()
+}
