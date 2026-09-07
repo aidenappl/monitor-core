@@ -10,6 +10,8 @@ import (
 	"net/smtp"
 	"strings"
 	"time"
+
+	"github.com/aidenappl/monitor-core/structs"
 )
 
 // Notifier dispatches notifications to different channel types
@@ -25,7 +27,7 @@ func NewNotifier() *Notifier {
 }
 
 // Send dispatches a notification to the appropriate channel type
-func (n *Notifier) Send(channel *Channel, alertName, message string, value float64) error {
+func (n *Notifier) Send(channel *structs.NotificationChannel, alertName, message string, value float64) error {
 	switch channel.Type {
 	case "webhook":
 		return n.sendWebhook(channel, alertName, message, value)
@@ -41,7 +43,7 @@ func (n *Notifier) Send(channel *Channel, alertName, message string, value float
 }
 
 // SendResolved dispatches a resolved notification (relevant for PagerDuty auto-resolve)
-func (n *Notifier) SendResolved(channel *Channel, alertName, message string, value float64) error {
+func (n *Notifier) SendResolved(channel *structs.NotificationChannel, alertName, message string, value float64) error {
 	switch channel.Type {
 	case "pagerduty":
 		return n.sendPagerDuty(channel, alertName, message, value, "resolve")
@@ -51,7 +53,7 @@ func (n *Notifier) SendResolved(channel *Channel, alertName, message string, val
 }
 
 // SendTest sends a test notification to verify channel configuration
-func (n *Notifier) SendTest(channel *Channel) error {
+func (n *Notifier) SendTest(channel *structs.NotificationChannel) error {
 	testAlert := "Test Alert"
 	testMessage := "This is a test notification from Monitor. If you received this, your notification channel is configured correctly."
 	testValue := 0.0
@@ -64,7 +66,7 @@ func (n *Notifier) SendTest(channel *Channel) error {
 	}
 }
 
-func (n *Notifier) sendWebhook(channel *Channel, alertName, message string, value float64) error {
+func (n *Notifier) sendWebhook(channel *structs.NotificationChannel, alertName, message string, value float64) error {
 	var config struct {
 		URL string `json:"url"`
 	}
@@ -100,7 +102,7 @@ func (n *Notifier) sendWebhook(channel *Channel, alertName, message string, valu
 	return nil
 }
 
-func (n *Notifier) sendSlack(channel *Channel, alertName, message string, value float64) error {
+func (n *Notifier) sendSlack(channel *structs.NotificationChannel, alertName, message string, value float64) error {
 	var config struct {
 		WebhookURL string `json:"webhook_url"`
 	}
@@ -167,7 +169,7 @@ type emailConfig struct {
 	To           string `json:"to"`
 }
 
-func (n *Notifier) sendEmail(channel *Channel, alertName, message string, value float64) error {
+func (n *Notifier) sendEmail(channel *structs.NotificationChannel, alertName, message string, value float64) error {
 	var config emailConfig
 	if err := json.Unmarshal([]byte(channel.Config), &config); err != nil {
 		return fmt.Errorf("invalid email config: %w", err)
@@ -216,7 +218,7 @@ func (n *Notifier) sendEmail(channel *Channel, alertName, message string, value 
 	return nil
 }
 
-func (n *Notifier) sendPagerDuty(channel *Channel, alertName, message string, value float64, action string) error {
+func (n *Notifier) sendPagerDuty(channel *structs.NotificationChannel, alertName, message string, value float64, action string) error {
 	var config struct {
 		RoutingKey string `json:"routing_key"`
 		Severity   string `json:"severity"`

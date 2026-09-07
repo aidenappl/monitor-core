@@ -32,6 +32,19 @@ It **owns**:
 It **does not** own: the UI (that's `monitor-web`) or the client SDKs (`go-monitor`,
 `monitor-js`).
 
+Those responsibilities divide into **two planes**, and since Phase 2 the binary says which
+of them it is running via **`MON_ROLE`** (`app` / `zone` / `both`, default `both`):
+
+- **Control plane (`app`)** — identity and configuration: accounts, sessions, SSO, the
+  admin bootstrap and the tenancy seeder. Holds **no ClickHouse connection at all**.
+- **Data plane (`zone`)** — events: ingestion, the batcher, both SSE hubs, the alert
+  evaluator, the issue tracker. Verifies sessions but issues none.
+- **`both`** — one process doing both jobs. **This is the deployed configuration and the
+  default**, and it behaves exactly as it did before roles existed.
+
+See §6 *Roles — the two planes* for what each one runs, which routes it registers, and
+what is deliberately **not** built yet.
+
 ---
 
 ## 2. Stack & dependencies
@@ -45,10 +58,14 @@ It **does not** own: the UI (that's `monitor-web`) or the client SDKs (`go-monit
     otherwise — the name is checked by `db.ValidateDatabaseName` before it is used and
     the migration runner follows it (§4) — accessed via the ClickHouse connection in
     `db/clickhouse.go`.
-  - **MariaDB** (`github.com/go-sql-driver/mysql`) — the **relational auth data layer**
-    (users, identities, refresh_tokens, sso_providers, sso_sessions, settings, api_keys).
-    DB `monitor_auth`, accessed via `db.SQL` (`db/sql.go`). This is the standard-shape
-    `db.Queryable` + squirrel-against-`database/sql` stack.
+  - **MariaDB** (`github.com/go-sql-driver/mysql`) — everything that is a **row** rather
+    than an event, across two schemas on one connection: `monitor_auth` (identity and
+    tenancy — users, identities, refresh_tokens, sso_providers, sso_sessions, settings,
+    api_keys, zones, projects) and `monitor` (issue tracking, service_repos, and since
+    migrations 119-124 the whole alerting/dashboard **configuration**). Accessed via
+    `db.SQL` (`db/sql.go`); this is the standard-shape `db.Queryable` +
+    squirrel-against-`database/sql` stack. **Which store owns what, and why, is §6
+    *Stores — configuration vs facts*.**
 - **CORS:** `github.com/rs/cors`.
 - **Sessions/JWT:** `github.com/golang-jwt/jwt/v5` (Monitor-owned HS512 tokens).
 - **SSO:** `github.com/aidenappl/go-forta/sso` **v1.6.0** — the shared SSO module. It brings
@@ -70,19 +87,21 @@ Flat, package-per-concern layout (no `cmd/`/`internal/`/`pkg/`).
 
 ```
 monitor-core/
-  main.go                  # Entry: config, both DB connects + migrations, bootstrap, sso.Install(), router, goroutines, shutdown
+  main.go                  # Entry: config, MON_ROLE validation, both DB connects + migrations, bootstrap, sso.Install(), router, goroutines, shutdown
+  router.go                # buildRouter(role) — the whole HTTP surface, with each route gated on the plane that can serve it (§6 Roles)
   env/env.go               # Env config (getEnv/getEnvInt/getEnvDuration) + RequireProductionSecrets fail-fast guard
+  env/role.go              # MON_ROLE: the Role type (app/zone/both), ParseRole, RunsControlPlane/RunsDataPlane, RequireValidRole
   db/
     clickhouse.go          # ClickHouse connection (db.Connect/db.Close) + batch Writer + ValidateDatabaseName + the per-query max_memory_usage ceiling
     sql.go                 # MariaDB connection (db.SQL), db.Queryable, db.RunMigrations (embeds db/migrations/*.sql)
-    migrations/            # MariaDB DDL: identity + tenancy (100_users … 118_issues_project)
+    migrations/            # MariaDB DDL: identity + tenancy + issues + alert/dashboard config (100_users … 124_saved_views)
   jwt/jwt.go               # Monitor-owned HS512 access/refresh JWTs (mint + validate, alg-pinned)
   tools/                   # Password.tool.go (bcrypt 12), Crypto.go (AES-256-GCM), Validate.tool.go (SSRF guard), Slug.tool.go (zone/project slug rule + reserved names)
   bootstrap/               # First-run seeding: admin.go (first admin user), registry.go (the single zone + default project)
   sso/                     # Thin wiring onto go-forta/sso — see §6
-  query/                   # MariaDB query layer (squirrel): users, identities, refresh_tokens, sso_providers, sso_sessions, settings, api_keys, zones, projects
+  query/                   # MariaDB query layer (squirrel): users, identities, refresh_tokens, sso_providers, sso_sessions, settings, api_keys, zones, projects, issues, service_repos, alert_rules, notification_channels, notification_policies, service_groups, dashboards, saved_views
   scope/scope.go           # The request's project: context key + WithProject/GetProject, ProjectPredicate (the SQL every event read must carry) and Matches (its in-memory twin for the SSE hub)
-  structs/                 # User/Identity/SSOProvider/SSOSession/RefreshToken/APIKey/Zone/Project (.struct.go) + event.go + analytics.go + columns.go (shared identifier regex & column allowlists)
+  structs/                 # User/Identity/SSOProvider/SSOSession/RefreshToken/APIKey/Zone/Project/Issue/AlertRule/NotificationChannel/NotificationPolicy/ServiceGroup/Dashboard/SavedView (.struct.go) + event.go + analytics.go + columns.go (shared identifier regex & column allowlists)
   middleware/
     session.go             # Monitor session auth (Bearer/mon-access-token JWT) + Protected/RequireAdmin/RequireEditor/RejectPending
     csrf.go                # Double-submit CSRF (mon-csrf ↔ X-CSRF-Token); Bearer/X-Api-Key/safe-method exempt
@@ -102,7 +121,10 @@ monitor-core/
     parse.go client.go verify.go
   apikeys/                 # API-key cache (backed by MariaDB, was ClickHouse) + a 30s background refresher
   registry/registry.go     # Tenancy-registry cache: this install's zone + its active projects, same 30s ticker shape as apikeys — what a session's ?project selector is validated against
-  alerts/ issues/ dashboards/ views/   # Subsystems (each Init()s from main.go)
+  alerts/ issues/          # Subsystems (each Init()s from main.go). alerts/ keeps only what did not move to MariaDB: the evaluator, router, notifier, hub, and the ClickHouse alert_states/alert_history
+  dashboards/ views/       # EMPTY — their tables moved to MariaDB (123/124); the files are tombstones that say where everything went
+  cutover/config.go        # One-time ClickHouse → MariaDB copy for the six config tables (`monitor-core backfill-config`). Its own package so it can be deleted whole
+  cutover/guard.go         # Boot refusal when that copy has not run — the only thing that makes a mis-ordered cutover loud (§8)
   migrations/              # ClickHouse DDL (001_schema … 006_events_project) + embed.go (in-app runner, rewrites the database name)
     manual/                # one-off reconciliation SQL — NOT embedded, NOT rewritten, run by hand
   Devfile.yaml Dockerfile docker-compose.yml docker-compose.dev.yml
@@ -124,10 +146,19 @@ dev run         # sources .env then `go run .`
 dev build       # go build -o bin/monitor-core .
 dev check       # gofmt -w -s . && go vet ./... && go test ./...
 dev down        # stop the local stack
+
+# One-time cutovers, as argv subcommands (never a second `package main` — §9).
+# Both apply the migrations first, then copy, then exit without serving.
+go run . backfill-issues   # legacy ClickHouse issues  → monitor.issues        (324f612)
+go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
+                           # notification_channels, notification_policies,
+                           # service_groups, dashboards, saved_views (§8 — ORDER MATTERS)
 ```
 
 - **No `.env` is created for you** — set the vars in §6/§8. The server **refuses to
-  start** if `MONITOR_API_KEY` is unset, and (in a non-dev profile) if
+  start** if `MON_ROLE` names something that is not a role (`env.RequireValidRole`, the
+  first guard `main` applies after `env.Load` — unset is fine and means `both`), if
+  `MONITOR_API_KEY` is unset, and (in a non-dev profile) if
   `MON_JWT_SIGNING_KEY` / `MON_CRYPTO_KEY` are unset or still the committed dev
   defaults, or `MON_CRYPTO_KEY` isn't exactly 32 bytes (`env.RequireProductionSecrets`,
   called from `main.go`). Set `MON_COOKIE_INSECURE=true` for local dev to permit the
@@ -158,7 +189,11 @@ dev down        # stop the local stack
   full** on the next boot. An unguarded `ADD COLUMN` then fails with errno 1060, an
   unguarded `ADD CONSTRAINT` with errno 121 — and because migrations are fail-fast, that
   wedges startup rather than degrading. The guarantee is at-least-once, not exactly-once.
-- **Bootstrap runs after MariaDB migrations** (`main.go`): `bootstrap.EnsureAdminUser`
+- **Both connects are role-gated** (§6 *Roles*): ClickHouse — connection, migrations and
+  boot probe — happens only on the data plane, so under `MON_ROLE=app` `db.Conn` stays
+  `nil` by design. MariaDB is opened and migrated in every role.
+- **Bootstrap runs after MariaDB migrations, on the control plane only** (`main.go`,
+  skipped under `MON_ROLE=zone`): `bootstrap.EnsureAdminUser`
   seeds the first admin from `MON_ADMIN_EMAIL`/`MON_ADMIN_PASSWORD` (no-op once any user
   exists), then `bootstrap.EnsureZoneAndProject` seeds the single zone
   (`MON_ZONE_SLUG`) and its default project (`MON_DEFAULT_PROJECT`) — also a no-op once
@@ -177,6 +212,14 @@ dev down        # stop the local stack
 - **The tests that pin a contract rather than a function** are worth knowing about before
   changing the thing they guard, because each one exists because the failure it catches is
   invisible at runtime:
+  - `router_test.go` — the **route inventory per role**, and above all the full `both`
+    surface. `MON_ROLE` defaults to `both`, so that list *is* production: gating a route
+    behind a role and deleting it from the running install are the same edit until this
+    test refuses it. It also asserts that `both` is exactly the union of `app` and `zone`,
+    so no route can fall out of the gating and 404 only in a split deployment.
+  - `env/role_test.go` — that an unset `MON_ROLE` resolves to `both` and a typo does
+    **not**. A parser that fell back on junk would turn every misspelling into a working
+    process — running the control plane on a host meant to be a zone.
   - `services/hub_test.go` — the *whole* SSE filter contract, known keys included, so
     adding a filter key without a `matchesFilters` case fails here instead of in
     production (see the SSE note in `services/AGENTS.md`).
@@ -226,6 +269,26 @@ dev down        # stop the local stack
     overwritten unconditionally, in both halves: that the value genuinely reaches the
     parsed struct first (without which the test would pass vacuously), and that it is gone
     by the time the event is queued.
+  - `query/notification_policies_query_test.go` — that the reorder is
+    **lock, vacate, then assign, in one transaction**. Under `UNIQUE (position)` the
+    obvious loop (`SET position = i+1` per row) violates the key on almost every
+    permutation, because InnoDB checks a unique index per *row* and MariaDB has no
+    deferrable constraints. The test asserts statement ORDER, so dropping the negating
+    `UPDATE`, moving it after the assignments, or taking the whole thing out of its
+    transaction each fail here rather than the first time somebody drags a policy. It also
+    pins that the seeder fires only on an empty table — the condition that keeps it and
+    `backfill-config` from both populating the routing list.
+  - `query/alert_rules_query_test.go` — that `condition` is **backticked** wherever it
+    appears unqualified. It is a MariaDB reserved word; the reads all keep working, so the
+    first symptom of losing the quotes is a 500 the next time somebody edits a rule. Also
+    that the partial `UPDATE` touches only the columns the caller named (the omitted
+    `enabled` must not disable a rule), and that no MariaDB read carries a leftover
+    `FINAL`.
+  - `query/config_tables_query_test.go` — that JSON validation applies to the columns the
+    **server** parses (`config`, `services`) and deliberately **not** to the client-owned
+    blobs (`dashboards.config`, `saved_views.query_params`). "Making them consistent" would
+    either start rejecting dashboard configs monitor-web has always sent, or stop catching
+    a policy that can never route.
   - `db/clickhouse_test.go`'s `TestEventInsertColumnsMatchRowOrder` — that
     `eventInsertColumns` and `eventInsertRow` stay paired position-for-position. Every event
     column is a string, so a transposition inserts cleanly and shows up only as wrong data.
@@ -270,14 +333,20 @@ dev down        # stop the local stack
     — pending account → web redirects to `/pending`), and CSRF **`4030`** (missing cookie) /
     **`4031`** (token mismatch).
   - Three endpoints bypass `responder`: `GET /health`
-    (`{status,enqueued,dropped,pending,clickhouse_ok,mariadb_ok,last_flush_at}`),
-    `GET /ready` (`{status,clickhouse_ok,mariadb_ok[,failing]}`) and `POST /v1/events`
+    (`{status,enqueued,dropped,pending,clickhouse_ok,mariadb_ok,last_flush_at,role}`),
+    `GET /ready` (`{status,clickhouse_ok,mariadb_ok,role[,failing]}`) and `POST /v1/events`
     (`{accepted:<int>}`). Ingest errors are plain text.
   - **`/health` is liveness, `/ready` is readiness — do not merge them.** `/health` always
     returns **200** with `status:"ok"`, even with both stores dead, because the container
     HEALTHCHECK points at it and restarting the process cannot repair ClickHouse; the
     dependency booleans there are diagnostics, not a verdict. `/ready` returns **503** and
-    names the failing store in `failing`. Both ping with a 2s timeout
+    names the failing store in `failing`. **`/ready`'s verdict is role-aware:** ClickHouse
+    counts as a dependency in every role *except* `app`, which holds no connection by
+    design and would otherwise be permanently un-ready for doing exactly what it was
+    configured to do. `clickhouse_ok` still reports `false` there — it is the true answer —
+    which is why `role` is on this response too. The condition is written as "unless the
+    role is exactly `app`" so it fails **closed**: any other value keeps ClickHouse
+    required. Both ping with a 2s timeout
     (`routes.DEPENDENCY_PING_TIMEOUT`), concurrently, so a total outage costs one timeout.
     The first four `/health` keys are frozen — monitor-web's transport and the container
     healthcheck read that exact shape; extend it additively.
@@ -458,7 +527,10 @@ overwrites it. `Name` is where this was learned; `ProjectID`/`ProjectSlug` are t
 with a worse blast radius, because an omitted project files the key's first 30 seconds of
 events under no tenant at all, and nothing downstream errors on a blank one.
 
-**Endpoint surface** (registered in `main.go` + `RegisterSSORoutes.go`):
+**Endpoint surface** (registered in `router.go` + `RegisterSSORoutes.go`). Every route
+below exists under the default `MON_ROLE=both`; which of them a single-plane process
+registers is the table in §6 *Roles*, and a route this role cannot serve is **not
+registered at all**, so it answers `404` rather than failing on a nil dependency:
 
 ```
 POST   /auth/login                          native email/password → session      [public, CSRF-exempt]
@@ -658,6 +730,71 @@ What remains is everything the library refuses to know:
   (`client_secret_enc`). The admin API exposes only a `has_secret` boolean.
 - **SSRF guard:** every provider URL in the admin create/update body is checked by
   `tools.ValidateExternalURL` before it is saved.
+
+### Roles — the two planes (`MON_ROLE`)
+
+`monitor-core` is one binary doing two unrelated jobs, and `MON_ROLE` makes which one
+explicit. It is **not** two binaries on purpose: two `main`s drift, and the way they drift
+is that a route added to one and forgotten in the other stays invisible until somebody
+deploys the split topology and finds a 404 in production. One router, gated at the line of
+registration, cannot drift that way.
+
+| | `app` (control plane) | `zone` (data plane) | `both` (default, deployed) |
+|---|---|---|---|
+| ClickHouse connection + migrations + boot probe | **no** (`db.Conn` stays nil) | yes | yes |
+| MariaDB + its migrations | yes | yes | yes |
+| `bootstrap.EnsureAdminUser`, `bootstrap.EnsureZoneAndProject` | yes | **no** | yes |
+| `sso.Install()` (revocation checkpoint) | yes | **no** | yes |
+| `apikeys.Init` (key cache + refresher) | yes | yes | yes |
+| `registry.Init` (zone/project cache) | yes | yes | yes |
+| `alerts`/`issues` `Init` | **no** | yes | yes |
+| Event hub, queue, batcher, alert hub, alert evaluator | **no** | yes | yes |
+| `/auth/*`, `/admin/sso-providers` routes | yes | **no** | yes |
+| Ingest, query, analytics, dashboards, views, alerts, issues, `/webhooks/github` routes | **no** | yes | yes |
+| `/health`, `/ready`, `/v1/zones*`, `/v1/service-repos*`, `/v1/api-keys*` | yes | yes | yes |
+
+- **The default is `both`, and it must stay `both`.** An unset `MON_ROLE` on the live
+  install has to keep the process doing exactly what it does today; a default that changed
+  behaviour on deploy would make the first rollout of the split an outage.
+- **An unrecognised value refuses to boot** (`env.RequireValidRole`, called from `main`
+  straight after `env.Load`). It does *not* fall back. A typo that degraded to the default
+  would run the **control plane** on a machine meant to be a zone — seeding a zone row,
+  minting sessions, installing SSO — while the operator reads their config back and sees a
+  data plane. That is a second control plane, not a degraded one.
+- **Registration is the gate, not a check inside the handler.** `db.Conn` is an interface,
+  so a nil one does not return an error — it panics on the method call, and `net/http`
+  answers a panicking handler by closing the connection with no response at all. A route
+  that cannot work in this role is therefore not registered, and answers `404`.
+- **`/ready` is role-aware** so an `app` process is not permanently 503: ClickHouse counts
+  as a readiness dependency in every role except `app`. Written as "unless the role is
+  exactly `app`", so it fails closed.
+- **The role is visible in two places on purpose**: one `log.Printf` at the very top of
+  boot (before the first fatal, so a process that dies still says what it was trying to
+  be) and a `role` key on `GET /health`. The risk this design carries is that `both`
+  becomes an unexamined permanent default; neither of those fixes that, but they make it a
+  state someone can see.
+- **Asymmetry worth knowing:** a zone still *verifies* access tokens — `QueryAuthMiddleware`
+  falls back to `SessionMiddleware` on `/v1` — it just does not *issue* them. Issuing and
+  verifying are different jobs; the control plane issues, both planes verify.
+- **The three shared `/v1` surfaces** (`zones`, `service-repos`, `api-keys`) are pure
+  MariaDB and stay registered in **both** roles. That is a deferral, not a verdict: which
+  plane *owns* them is the config-pull question, and inventing an answer with no second
+  zone to test it against would be worse than leaving today's behaviour alone.
+- **Deliberately NOT built in this phase** — do not add them speculatively: a config-pull
+  protocol, a zone agent, per-zone credentials, zone fan-out, cross-zone queries, per-user
+  project memberships, or a second zone. Consequently a `zone`-only process today expects
+  its zone/project rows and its `users` rows to already be present in its MariaDB; nothing
+  yet replicates them from the control plane.
+- **`backfill-issues` and `backfill-config` need the data plane** and refuse to run under
+  `MON_ROLE=app`, naming the variable — both read legacy ClickHouse tables.
+- **`alerts.Init` is still data-plane, and it now seeds MariaDB.** The four default
+  notification policies are a MariaDB write made from the data-plane block rather than from
+  `bootstrap/`, so that the set of processes creating those rows is exactly what it was
+  before the tables moved. Moving it to the control plane would be a silent behaviour
+  change dressed as tidying.
+- Pinned by `router_test.go` (the full `both` inventory, the app/zone splits, and that
+  `both` is exactly the union of the two) and `env/role_test.go` (parsing, the fail-fast
+  refusal, the capability table).
 
 ### Tenancy — zones and projects
 
@@ -981,6 +1118,93 @@ Handlers resolve it through `routes.requireProject`, which 500s exactly as
   was written: an unscoped list handed out any tenant's issue id, which these reads turn into
   that tenant's per-day counts. See the `KNOWN GAP` header on `issues/history.go`.
 
+### Stores — configuration vs facts
+
+There are two datastores and one rule for deciding which a table belongs in. It is worth
+stating explicitly because the repo got it wrong at first and paid for it twice.
+
+**A table belongs in ClickHouse if it holds FACTS: rows written by machines, appended at
+volume, read as a series, and expired by a TTL.** Events, issue occurrences, alert states,
+alert history. Nothing edits them.
+
+**A table belongs in MariaDB if it holds CONFIGURATION: rows a human edits, that reference
+each other, and whose correctness depends on constraints.** Users, api keys, the tenancy
+registry, issues (the triage state on them is edited), service→repo mappings, and — since
+migrations 119-124 — every alerting and dashboard setting.
+
+| Table | Store | Why |
+|---|---|---|
+| `events`, `issue_occurrences_daily` | ClickHouse | facts, columnar, TTL'd |
+| `alert_states` | ClickHouse | one row per rule, rewritten by a 15s timer |
+| `alert_history` | ClickHouse | append-only transitions, **90-day TTL** (no MariaDB equivalent) |
+| `monitor.issues`, `issue_timeline`, `issue_links` | MariaDB | triage state, uniqueness, FKs (111-114) |
+| `monitor.service_repos` | MariaDB | explicit mapping (115) |
+| `monitor.alert_rules`, `notification_channels`, `notification_policies`, `service_groups` | MariaDB | alerting configuration (119-122) |
+| `monitor.dashboards`, `monitor.saved_views` | MariaDB | saved UI state (123-124) |
+| `monitor_auth.*` | MariaDB | identity + tenancy (100-109, 116-117) |
+
+**What getting it wrong cost, both times.** Eight tables were originally created by ad-hoc
+`CREATE TABLE IF NOT EXISTS` inside package `Init()` functions at boot, with no migration
+file, all `MergeTree`/`ReplacingMergeTree ORDER BY (id)`. That engine cannot enforce
+uniqueness and deduplicates only when a background merge happens to run:
+
+- **Issues (fixed in 324f612, migrations 111-114):** four rows for one fingerprint in
+  production, and `occurrence_count` drift under concurrent workers that was only ever
+  mitigated process-locally by a 64-way mutex shard.
+- **Notification policies (fixed by migration 121):** `position` is an evaluation order and
+  had no uniqueness at all. `getNextPosition` was a racy `max(position) + 1`, and
+  `ReorderPolicies` rewrote rows one at a time with no transaction — ClickHouse has none —
+  so a mid-loop failure left the list half-renumbered with duplicates by construction. Two
+  policies at one position give `alerts/router.go` a non-deterministic first match, which
+  silently changes **where alerts are sent**, per evaluation, with nothing logged.
+
+The full argument, table by table, is in the header of `db/migrations/119_create_alert_rules.sql`.
+
+**How reordering works under the new UNIQUE key**, because the obvious implementation does
+not: InnoDB checks a unique index **per row**, and MariaDB has no deferrable constraints, so
+assigning `1..N` in a loop collides the moment a policy moves onto a slot another has not
+vacated. `query.ReorderNotificationPolicies` runs one transaction that (1) locks the whole
+list `FOR UPDATE`, (2) `UPDATE … SET position = -position` in a single statement — negation
+is injective and its image is disjoint from its domain, so it can never violate the key —
+and (3) assigns `1..N` into the now-empty positive range. That is why
+`structs.NotificationPolicy.Position` is a **signed** int and why the column carries no
+`CHECK (position > 0)`. A caller may name a subset: those lead, the rest keep their relative
+order and follow. `query/notification_policies_query_test.go` fails if the vacate step is
+dropped, reordered, or taken out of its transaction.
+
+**Two known inconsistencies, recorded rather than left to be found:**
+
+- `alert_states` and `alert_history` are still created by an ad-hoc `CREATE TABLE` in
+  `alerts.Init`, which is exactly the pattern 119 condemns. They are the last two in the
+  repo created that way; giving them files means a ClickHouse migration (`migrations/007…`),
+  a different runner with its own re-runnability story, and it is a separate change.
+- **None of the six moved tables has a `project` column.** Adding one would partition six
+  live configuration sets between tenants that share them today — a behaviour change, not a
+  move — and it is the same question as the evaluator's zone-wide gap. What the move does is
+  make it cheap: one migration per table, against a store that can enforce the result.
+
+**Legacy ClickHouse tables are left in place, unread.** `monitor-core backfill-config` can
+only be re-run while they exist. Drop them by hand once a release has passed, along with
+`cutover/` and the `dashboards/`/`views/` tombstones.
+
+**Booting before that copy has run DISABLES ALERTING — loudly — rather than crash-looping.**
+`cutover.RequireConfigBackfill` runs first in main()'s data-plane block, ahead of
+`alerts.Init` so the default-policy seed cannot fire on an un-migrated instance. When a
+legacy table holds rows the MariaDB table does not, the process **starts anyway**, logs a
+banner, does **not start the alert evaluator**, sets `routes.AlertingDisabledReason`, and
+reports `alerting_ok: false` on `/health` plus a **503 naming `alerting`** on `/ready`.
+
+That is a deliberate trade and the reasoning must survive: a fatal guard crash-loops the
+container, and CI redeploys this image on every push to `main`, so fatal would take
+**ingestion** down on the DEFAULT path — swapping a rare silent failure for a common loud
+outage in the one system whose job is to still be recording when everything else breaks.
+Alerting is the thing that would be silently wrong, so alerting is the thing that stops;
+ingest, queries and issues are untouched. `routes/health_test.go` pins the visibility,
+because degrading is only defensible while the degraded state is impossible to miss.
+
+The guard is gated on a `settings` marker the backfill stamps, so it can fire only once,
+never on a fresh install, and never again after a real cutover. §8 carries the runbook.
+
 ### Request flow — ingestion (unchanged by the auth overhaul)
 
 ```
@@ -1025,6 +1249,9 @@ monitor-web → Next.js proxy (mon-* cookies + X-CSRF-Token) → GET/POST /v1/* 
 ```
 
 ### Background goroutines (started in `main.go`)
+
+The first two are **data plane only** — they do not start under `MON_ROLE=app`. The
+API-key refresher starts in every role, because both planes authenticate API keys.
 
 - **Batcher** — drains the queue into ClickHouse.
 - **Alert evaluator** — 15s ticker; evaluates every enabled rule against ClickHouse,
@@ -1089,11 +1316,178 @@ deviating.
   URL — `?container=` is what separates them. A green CI run with no visible change means
   checking the token's `last_used_at`: if it's `null`, CI never reached Lattice.
 - Do **not** deploy by hand from here (repo guardrails).
+
+- **⚠️ CUTOVER DEPLOY — migrations 119-124 (one-time, THE ORDER MATTERS).**
+
+  The six alerting/dashboard configuration tables moved from ClickHouse to MariaDB (§6
+  *Stores*). The new binary reads them from MariaDB; the legacy ClickHouse tables are left
+  in place and unread. **`monitor-core backfill-config` must run before the new binary
+  serves.**
+
+  **`cutover.RequireConfigBackfill` catches that at boot** — first thing in main()'s
+  data-plane block, before `alerts.Init`. If a legacy ClickHouse table holds rows, the
+  MariaDB table that replaced it is empty, and the backfill has never recorded a completed
+  run, the process **starts but refuses to evaluate alerts**, naming every stranded table
+  and the command that fixes it, and failing `/ready` until it is run. Without it both
+  failure modes below are entirely silent, and CI makes the bad ordering the default rather
+  than the exception:
+
+  - **Alerting stops, invisibly.** `alert_rules` is empty, so `listEnabledRules` returns
+    nothing and the evaluator has nothing to evaluate. No error, no log line, no alert —
+    there is no code path that distinguishes "no rules configured" from "six rules gone".
+  - **The default notification policies double.** `alerts.Init` seeds four defaults into an
+    empty policies table; the backfill then appends the four ClickHouse originals after them
+    (nothing collides — positions are renumbered from `MAX+1`), leaving eight policies of
+    which four match every alert by priority and route it nowhere. Running the guard *before*
+    `alerts.Init` means this state is never created rather than created and then explained.
+
+  The guard is a **one-shot, not a permanent tripwire**. It short-circuits on a
+  `cutover:config_backfill_completed_at` row in `settings`, stamped by `BackfillConfig` only
+  after all six tables have copied — so once the cutover has happened, row counts stop
+  mattering and deleting your last alert rule through the UI can never bring the refusal
+  back. It also never fires on a fresh install or after the legacy tables are dropped
+  (existence is probed through `system.tables`, so an absent table reads as zero rather than
+  as an error). A ClickHouse probe that errors **fails open with a warning** — in the state
+  being guarded, ClickHouse is healthy by construction, so refusing over a probe error would
+  invent a new way for a deploy to fail; the MariaDB count fails closed.
+
+  The safe sequence:
+
+  0. **Take the census first.** Before anything is merged, record what the old build is
+     serving — `GET /v1/alert-rules`, `GET /v1/notification-policies`,
+     `/v1/notification-channels`, `/v1/service-groups`, `/v1/dashboards`, `/v1/views` — and
+     keep the rule *names*, not just the counts. Step 5 is a comparison, and a comparison
+     with nothing to compare against is a vibe. This is cheap insurance rather than a hard
+     prerequisite: the cutover never writes to ClickHouse, so the same numbers are
+     recoverable from the untouched legacy tables at any later point (see the queries in
+     step 5) — but recovering them under time pressure, from a store you are in the middle
+     of migrating off, is not where you want to be first learning that `count()` and
+     `count() FINAL` disagree.
+  1. **Pause CI's auto-redeploy of the `monitor-core` container, or be ready to run step 3
+     immediately.** `build-and-deploy.yml` builds *and* redeploys on a push to `main`, and
+     the subcommand only exists in the new image — so by default the new binary starts
+     before anyone can run it. With the guard in place that is a **visibly degraded start,
+     not a silent outage and not an ingest outage**: the container serves, ingestion and
+     queries continue, `/ready` returns 503 naming `alerting`, and only alert evaluation is
+     off until step 3 runs. Pausing the redeploy is still the tidier path, but the default
+     ordering is now survivable rather than an incident.
+  2. Merge. CI builds `registry.appleby.cloud/monitor-core:latest`.
+  2a. **Rehearse it first: `monitor-core backfill-config --dry-run`.** Reads, validates and
+     reports exactly what would be copied and what would be REFUSED, writing nothing and
+     stamping no marker. Worth running every time — the refusals are the failure that
+     actually bites (a duplicate `name` against the new `UNIQUE` keys, an empty enum), and
+     finding them in a rehearsal beats finding them halfway through a hand-run cutover on a
+     deploy that currently has alerting switched off. A clean dry run exercises every read,
+     every enum check and every duplicate-key decision — only the write is skipped.
+     The dry run is enforced at ONE chokepoint (`cutover.insertRow`), so a seventh table
+     added later is covered by default; `cutover/guard_test.go` pins both that it writes
+     nothing AND, via a negative control, that the guard is not simply always on.
+  3. Run the cutover from the **new image**, with the same env (`MON_DB_DSN`, the
+     `CLICKHOUSE_*` vars, `MONITOR_API_KEY`) and a role that includes the data plane:
+     `monitor-core backfill-config`. It applies migrations 119-124 itself (the runner runs
+     before the subcommand), then copies. Each table is reported twice — once by
+     `cutover.BackfillConfig` as it finishes
+     (`cutover: alert_rules — copied 6, skipped 0 (already present)`) and again in `main.go`'s
+     end-of-run summary (`alert_rules   copied 6, skipped 0`), the second of which prints
+     **even when the run then fails**, so a partial cutover still says how far it got.
+     **Read those lines before moving on** — they are the only place the per-table outcome
+     is stated, and a table that copied 0 rows when the step-0 census said otherwise is the
+     failure this whole runbook exists to catch, visible here a full step before it becomes
+     an alerting outage.
+  4. Redeploy the serving container. On boot `RequireConfigBackfill` finds the marker and
+     passes, and the policies table is non-empty so `alerts.Init` seeds nothing.
+  5. **Verify — the alert rules specifically, and by count on both sides.** Everything else
+     that moved is visible in the UI the moment someone looks at it; a missing alert rule is
+     visible only when an outage fails to page anyone, which is exactly when nobody is
+     reading a runbook. So check it directly and check it numerically:
+
+     ```
+     GET /v1/alert-rules                                     # what the new build serves
+     SELECT COUNT(*) FROM monitor.alert_rules;               # MariaDB — the new source of truth
+     SELECT count() FROM monitor.alert_rules FINAL;          # ClickHouse — what should have moved
+     ```
+
+     The three must agree (**6 at the time of writing** — re-derive it, do not trust that
+     figure), and the rule names must match the step-0 census, not merely the totals: six
+     rows of which one is the wrong rule is still a page that never fires.
+
+     **`FINAL` is not optional in that third query.** The legacy `alert_rules` is a
+     `ReplacingMergeTree(updated_at)`, so every edit ever made to a rule may still be sitting
+     there as an un-merged row until a background merge collapses it. Without `FINAL` the
+     ClickHouse side over-counts — sometimes by a lot on a heavily-edited rule — and you will
+     spend the deploy window hunting rows that were never missing. `cutover/config.go` reads
+     the legacy `alert_rules`, `service_groups`, `notification_policies` and `dashboards`
+     `FINAL` for the same reason, and reads `notification_channels` and `saved_views`
+     *without* it because those two are plain `MergeTree`s that never deduplicated at all.
+     Match the copy when you check the copy.
+
+     **If the counts do not match — the ladder, cheapest first.** All four rungs are
+     non-destructive to ClickHouse, which still holds the originals:
+
+     1. **MariaDB has fewer rows than ClickHouse `FINAL`.** Re-run
+        `monitor-core backfill-config`. This is the ordinary repair and usually the whole
+        answer — already-present ids are skipped, so a re-run copies exactly the rows that
+        did not make it and touches nothing else. Re-running is safe an unlimited number of
+        times.
+     2. **The re-run copies nothing and the shortfall persists.** Read its output: a row it
+        refuses names itself. The designed refusal is the `UNIQUE (name)` collision (errno
+        1062) that migrations 119/120/122 introduced and ClickHouse never had — two rules
+        genuinely sharing a name. Rename one **in ClickHouse** and re-run; nothing already
+        copied is redone.
+     3. **MariaDB is empty across the board and the guard let the process boot anyway.** The
+        marker was stamped by an earlier run — check
+        ``SELECT * FROM settings WHERE `key` = 'cutover:config_backfill_completed_at';``.
+        Note the table is **unqualified**: `settings` is migration 105 and lives in the
+        DSN's own default schema (`monitor_auth`), unlike the six tables that just moved,
+        which are explicitly `monitor.*`. Running that query against `monitor` returns a
+        "table doesn't exist" that reads exactly like "the marker was never written".
+        Deleting the row restores the boot guard's protection; the backfill re-stamps it on
+        the next complete run. Do not delete it as routine hygiene: without it, every future
+        boot re-counts six tables against ClickHouse for no benefit.
+     4. **`GET /v1/notification-policies` returns eight rows.** Step 3 ran after the new
+        binary had already served: `alerts.Init` seeded four defaults into the empty table
+        and the backfill appended the four originals behind them (positions renumber from
+        `MAX+1`, so nothing collided and nothing errored). Four policies now match every
+        alert by priority and route it nowhere. Delete the **seeded** four — they are the
+        rows whose ids are *not* in `monitor.notification_policies`' ClickHouse counterpart
+        — and the list is correct again. This is the one failure mode that leaves no error
+        anywhere, which is why the boot guard exists to prevent it rather than to report it.
+
+     **Nothing here is a reason to roll back on its own.** ClickHouse is untouched, so the
+     old image still serves the complete configuration — but see *Rollback is clean but
+     one-way* below before reaching for it, because any edit made through the new build is
+     invisible to the old one.
+
+  Properties worth knowing:
+
+  - **Re-running is safe and is the repair.** A row whose id is already in MariaDB is
+    SKIPPED, never overwritten — deliberately *unlike* `backfill-issues`, whose conflict
+    rule is monotonic and can therefore merge. These are rows a human edits, so an upsert on
+    a re-run would silently restore an old threshold from a store nobody writes to any more.
+    A config edit made between step 3 and step 4 lands in ClickHouse and is missed; re-run
+    step 3 after step 4 to pick it up.
+  - **It can abort, on purpose.** Migrations 119, 120 and 122 add `UNIQUE (name)` keys the
+    ClickHouse tables never had. A duplicate rule/channel/group name stops the copy with
+    errno 1062, wrapped with the table, the row and the remedy. Rename one and re-run;
+    everything already copied is skipped.
+  - **Rollback is clean but one-way.** The old binary reads ClickHouse, which is untouched,
+    so reverting the image works — but any configuration edited through the new build lives
+    only in MariaDB and the old one will not see it.
+  - **A partial run leaves no marker.** `BackfillConfig` stamps
+    `cutover:config_backfill_completed_at` only after all six tables have copied, so an
+    abort part-way keeps the boot guard refusing until the rest is copied — which is the
+    correct reading of "half the configuration is still in ClickHouse".
+  - **Drop the legacy ClickHouse tables by hand once a release has passed**, together with
+    `cutover/` (guard included) and the `dashboards/`/`views/` tombstone files. Dropping the
+    tables ends the ability to re-run the backfill, and also clears the guard permanently —
+    which is the escape hatch if the legacy rows are genuinely being abandoned. Delete the
+    `settings` marker row in the same pass.
 - **Config (env vars, defaults from `env/env.go`):**
 
   | Var | Default | Notes |
   |---|---|---|
   | `HTTP_PORT` | `8080` | |
+  | `MON_ROLE` | `both` | which plane this process runs: `app` (control), `zone` (data) or `both`. **Unset must stay `both`** — that is the deployed configuration and the default exists so a deploy of this feature changes nothing. Case and surrounding whitespace are normalised; anything else **refuses to boot** rather than falling back, because a typo that degraded to the default would run the control plane on a host meant to be a zone. Gates the ClickHouse connect, the bootstrap seeders, `sso.Install`, the ingest/alerting goroutines **and route registration** — see §6 *Roles* |
   | `CLICKHOUSE_ADDR` / `_DATABASE` / `_USERNAME` / `_PASSWORD` | `localhost:9000` / `monitor` / `default` / `` | events store. `_DATABASE` must match `^[a-z][a-z0-9_]{2,62}$` (`db.ValidateDatabaseName`) — it is interpolated into SQL, never bound, so a name outside that shape refuses to boot |
   | `CLICKHOUSE_MAX_MEMORY_USAGE` | `2147483648` (2 GiB) | per-**query** memory ceiling in bytes, sent as the `max_memory_usage` setting. Sized for the ~8 GB host; ClickHouse's own default (10 GiB) exceeds the machine, so unset it is no limit and one high-cardinality `GROUP BY` OOM-kills the server and ingest with it. Over the limit, that single query fails with `MEMORY_LIMIT_EXCEEDED` and nothing else is affected |
   | `MONITOR_API_KEY` | *(required)* | env master ingest/query key (`X-Api-Key`); refuses to boot without it |
@@ -1156,6 +1550,12 @@ deviating.
 - **Monitoring:** Monitor monitors itself — `mcp__monitor__monitor_service_overview` on
   `monitor-core`; `lattice_get_container_logs` for the container.
 - **Common failure modes:**
+  - *Refuses to start: "MON_ROLE=… is not a recognised role"* → a typo in `MON_ROLE`. Unset
+    it (that means `both`) or set exactly `app`, `zone` or `both`. It refuses on purpose;
+    see §6 *Roles*.
+  - *A route that used to work now 404s, everything else is fine* → check the `role` on
+    `GET /health` and the role line at the top of the boot log. A single-plane process does
+    not register the other plane's routes, and a 404 is what that is designed to look like.
   - *Refuses to start: "MON_JWT_SIGNING_KEY … dev default" / "MON_CRYPTO_KEY must be
     exactly 32 bytes"* → set real secrets (or `MON_COOKIE_INSECURE=true` for dev).
   - *Startup aborts on ClickHouse/MariaDB migrations* → the store is unreachable or a bad
@@ -1168,6 +1568,26 @@ deviating.
     `CLICKHOUSE_MAX_MEMORY_USAGE`. That is the limit working: before it, that query would
     have climbed until the node OOM-killed ClickHouse. Narrow the group-by/time range first;
     only raise the ceiling if the host actually has the headroom.
+  - *Boot logs `⚠️  ALERTING IS DISABLED`, `/ready` is 503 naming `alerting`, `/health`
+    reports `alerting_ok: false`* → exactly what it says, and the guard doing its job.
+    Ingest and queries are FINE; only evaluation is off. Run `monitor-core backfill-config`
+    from the same image and env (see the cutover section above), then restart the service.
+    If those legacy rows are being abandoned on purpose, drop the ClickHouse tables it names
+    instead.
+  - *No alerts firing at all, nothing in `alert_history`, `GET /v1/alert-rules` returns `[]`*
+    → the config cutover has not run **and the guard did not catch it** — which means either
+    the ClickHouse existence probe failed open (look for the `WARNING: could not check
+    whether …` line at boot) or the legacy tables are already gone. Run
+    `monitor-core backfill-config`. An empty rule set is indistinguishable from a quiet
+    system from the outside, which is why it is listed here rather than left to be noticed.
+  - *Eight notification policies where there should be four, four of them routing nowhere*
+    → `backfill-config` ran after the new binary had already seeded a fresh install. The
+    boot guard now prevents this (it runs before `alerts.Init`), so reaching it means the
+    seed happened on a build without the guard. Delete the four seeded rows (the ids not
+    present in the ClickHouse table).
+  - *`ERROR 1062 … uq_alert_rules_name` during `backfill-config`* → two rules share a name.
+    Migrations 119/120/122 add uniqueness the ClickHouse tables never had. Rename one and
+    re-run; copied rows are skipped.
   - *Events silently missing under load* → queue overflow (`QUEUE_SIZE`); `/health` reports
     `dropped`. That counter now also covers batches the Batcher abandoned (5 failed writes,
     or shutdown mid-retry), so a rising `dropped` with a stale/absent `last_flush_at` means
@@ -1199,6 +1619,23 @@ deviating.
   and extend `services/hub_test.go`, which asserts the full contract.
 - **Keep `/health` returning 200.** It is liveness, the container HEALTHCHECK points at it,
   and a dependency verdict belongs in `/ready` (§5).
+- **Never create a table from an `Init()`.** Eight tables in this repo were created by
+  ad-hoc `CREATE TABLE IF NOT EXISTS` inside package `Init()` functions with no migration
+  file, and six of them had to be moved out of ClickHouse afterwards for exactly the reasons
+  §6 *Stores* lists. A schema with no migration file has no history, no review and — as the
+  discarded `_ = db.Conn.Exec(ctx, "ALTER TABLE …alert_rules ADD COLUMN … priority")` in the
+  old `alerts.Init` showed — no way to report that it failed. MariaDB DDL goes in
+  `db/migrations/`, ClickHouse DDL in `migrations/`. The two survivors (`alert_states`,
+  `alert_history`) are a recorded exception, not a precedent.
+- **Configuration goes in MariaDB, facts go in ClickHouse** (§6 *Stores* has the rule and
+  the table). If a human edits the row, or two rows must not collide, it is not a ClickHouse
+  table — that engine cannot enforce uniqueness and deduplicates only when a background
+  merge happens to run.
+- **`condition` is a MariaDB reserved word.** `monitor.alert_rules.condition` is legal bare
+  in a SELECT (a word after a period in a qualified name is always an identifier), but any
+  UNQUALIFIED use — an INSERT column list, an UPDATE SET clause — must be backticked or the
+  statement is a syntax error that only shows up on the write path.
+  `TestAlertRuleSQLQuotesReservedWords` pins it.
 - **New ClickHouse migration files are written against the literal `monitor.` prefix**, not
   an unqualified table name and not `db.Database` — the runner rewrites that prefix to the
   configured database (§4), and an unqualified name would resolve against the connection

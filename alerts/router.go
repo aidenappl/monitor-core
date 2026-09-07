@@ -7,6 +7,8 @@ import (
 	"log"
 	"strings"
 
+	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/structs"
 )
 
@@ -30,7 +32,7 @@ func NewRouter() *Router {
 	return &Router{notifier: NewNotifier()}
 }
 
-func BuildAlertContext(ctx context.Context, rule *Rule, status string, value float64, message string) *AlertContext {
+func BuildAlertContext(ctx context.Context, rule *structs.AlertRule, status string, value float64, message string) *AlertContext {
 	ac := &AlertContext{
 		RuleID:   rule.ID,
 		RuleName: rule.Name,
@@ -78,8 +80,8 @@ func BuildAlertContext(ctx context.Context, rule *Rule, status string, value flo
 	return ac
 }
 
-func (r *Router) Route(ctx context.Context, alertCtx *AlertContext, rule *Rule) error {
-	policies, err := ListPolicies(ctx)
+func (r *Router) Route(ctx context.Context, alertCtx *AlertContext, rule *structs.AlertRule) error {
+	policies, err := query.ListNotificationPolicies(db.SQL)
 	if err != nil {
 		return fmt.Errorf("failed to list policies: %w", err)
 	}
@@ -129,9 +131,21 @@ func (r *Router) Route(ctx context.Context, alertCtx *AlertContext, rule *Rule) 
 	}
 
 	for chID := range matched {
-		ch, err := GetChannel(ctx, chID)
+		// A channel id that no longer resolves is LOGGED AND SKIPPED, which is
+		// what it did before and is worth naming now that the store can tell the
+		// two cases apart: query.GetNotificationChannel returns (nil, nil) for a
+		// deleted channel and an error for a broken read. Both end here, because
+		// neither is a reason to abandon the remaining channels of a firing
+		// alert. The dangling id itself has no fix at this layer — it lives in a
+		// JSON array with no foreign key behind it (see
+		// query.DeleteNotificationChannel).
+		ch, err := query.GetNotificationChannel(db.SQL, chID)
 		if err != nil {
 			log.Printf("alert router: failed to get channel %s: %v", chID, err)
+			continue
+		}
+		if ch == nil {
+			log.Printf("alert router: channel %s no longer exists, skipping", chID)
 			continue
 		}
 
@@ -144,7 +158,7 @@ func (r *Router) Route(ctx context.Context, alertCtx *AlertContext, rule *Rule) 
 		ruleName := alertCtx.RuleName
 		message := alertCtx.Message
 		value := alertCtx.Value
-		go func(ch *Channel) {
+		go func(ch *structs.NotificationChannel) {
 			defer func() {
 				if rec := recover(); rec != nil {
 					log.Printf("alert router: panic sending to channel %s: %v", ch.ID, rec)

@@ -137,6 +137,36 @@ caller's project** and 404s otherwise. A new `/v1/issues/{id}/…` route must go
 `requireIssue` too — fetching the issue any other way reintroduces the leak for that route
 alone, and no test in this package would notice.
 
+## Issues are ZONE-owned — the whole subsystem is data plane
+
+`MON_ROLE` (root `../AGENTS.md` §6 *Roles*) splits the binary into a control plane (`app`:
+identity, SSO, account config) and a data plane (`zone`: events, ingest, alerting, issues).
+**This package is entirely data plane.** `issues.Init` — and therefore the `trackWorkers`
+pool that drains `TrackError` — starts only when `role.RunsDataPlane()`, `buildRouter`
+registers the twelve `/v1/issues…` routes only under the same condition, and
+`backfill-issues` refuses to run under `MON_ROLE=app`, naming the variable. Under
+`MON_ROLE=both`, which is the default and the deployed configuration, all of that is
+unchanged; nothing here behaves differently.
+
+Two of those gates are worth the argument, because the naive reading of "issues live in
+MariaDB, and the app plane has MariaDB" would put them on the wrong side:
+
+- **The route gate is not about which store the handler touches.** Several issue handlers
+  are MariaDB-only and would technically run in an app process — but `GET /v1/issues` with
+  `?history=true` and `GET /v1/issues/{id}` both decorate their rows from the ClickHouse
+  occurrence rollup, so they would panic on a nil `db.Conn` (an app process never connects
+  to ClickHouse; the global stays nil). More decisively, an issue is a **zone-owned** record
+  by design: it is a fingerprinted rollup of that zone's events and cannot be answered
+  without them. Registering the surface per-handler on store-access grounds would have split
+  one coherent API across two processes on an incidental criterion. The whole surface is
+  gated together, in `router.go`, with that reasoning in a comment beside it.
+- **`POST /webhooks/github` is data plane despite touching only MariaDB.** Every write it
+  makes lands on the zone-owned issue tracker — PR link state on `monitor.issue_links` and
+  the issue's timeline. On an app process it would find a database holding no issues, write
+  nothing meaningful, and **return 200 to GitHub**, which retires the delivery. A silently
+  discarded webhook is worse than a 404 GitHub will retry, so the route is not registered
+  there at all.
+
 ## Known issues & gaps (2026-07-23)
 
 | Sev | Where | Issue |

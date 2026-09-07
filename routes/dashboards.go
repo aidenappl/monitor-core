@@ -4,29 +4,27 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/aidenappl/monitor-core/dashboards"
+	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
 	"github.com/gorilla/mux"
 )
 
+// Dashboards moved from ClickHouse to MariaDB in migration 123, so these
+// handlers now call the query layer directly against db.SQL. The `dashboards`
+// package they used to go through held nothing but the forwarding.
+
 func HandleListDashboards(w http.ResponseWriter, r *http.Request) {
-	list, err := dashboards.List(r.Context())
+	list, err := query.ListDashboards(db.SQL)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to list dashboards", err)
 		return
-	}
-	if list == nil {
-		list = []dashboards.Dashboard{}
 	}
 	responder.New(w, list)
 }
 
 func HandleCreateDashboard(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Name        string `json:"name"`
-		Description string `json:"description"`
-		Config      string `json:"config"`
-	}
+	var body query.CreateDashboardRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -36,7 +34,7 @@ func HandleCreateDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dashboard, err := dashboards.Create(r.Context(), body.Name, body.Description, body.Config)
+	dashboard, err := query.CreateDashboard(db.SQL, body)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to create dashboard", err)
 		return
@@ -52,8 +50,12 @@ func HandleGetDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dashboard, err := dashboards.Get(r.Context(), id)
+	dashboard, err := query.GetDashboard(db.SQL, id)
 	if err != nil {
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to fetch dashboard", err)
+		return
+	}
+	if dashboard == nil {
 		responder.Error(w, http.StatusNotFound, "dashboard not found")
 		return
 	}
@@ -68,17 +70,13 @@ func HandleUpdateDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var body struct {
-		Name        string `json:"name"`
-		Description string `json:"description"`
-		Config      string `json:"config"`
-	}
+	var body query.UpdateDashboardRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	dashboard, err := dashboards.Update(r.Context(), id, body.Name, body.Description, body.Config)
+	dashboard, err := query.UpdateDashboard(db.SQL, id, body)
 	if err != nil {
 		responder.Error(w, http.StatusNotFound, "dashboard not found")
 		return
@@ -94,7 +92,7 @@ func HandleDeleteDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := dashboards.Delete(r.Context(), id); err != nil {
+	if _, err := query.DeleteDashboard(db.SQL, id); err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to delete dashboard", err)
 		return
 	}

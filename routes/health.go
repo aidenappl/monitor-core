@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/env"
 )
 
 // DEPENDENCY_PING_TIMEOUT bounds each store ping. A probe that hangs is worse
@@ -29,12 +30,39 @@ const DEPENDENCY_PING_TIMEOUT = 2 * time.Second
 func ReadyHandler(w http.ResponseWriter, r *http.Request) {
 	clickhouseOK, mariadbOK := cachedPingDependencies(r.Context())
 
+	// WHICH STORES COUNT DEPENDS ON THE ROLE. A control-plane-only process
+	// (MON_ROLE=app) holds no ClickHouse connection by design, so judging it
+	// against one would leave it permanently 503 — un-routable behind any load
+	// balancer, for doing exactly what it was configured to do. MariaDB is a
+	// dependency of every role and is always judged.
+	//
+	// `clickhouse_ok` is still REPORTED in that case, and reports false, because
+	// false is the true answer: there is no reachable ClickHouse from here. The
+	// `role` key beside it is what makes that readable rather than alarming — and
+	// is why it is reported here as well as on /health, which an operator chasing
+	// a 503 may not think to call.
+	//
+	// Written as "unless the role is exactly app" rather than
+	// `!env.MonRole.RunsDataPlane()`, so it FAILS CLOSED: every value other than
+	// the one role that provably has no event store — including the empty string a
+	// process would hold if it somehow served before env.Load, and any role added
+	// later — keeps ClickHouse as a hard readiness dependency. The direction of
+	// that default matters: being wrongly un-ready costs a routing decision, while
+	// being wrongly ready hands traffic to a replica that shreds what it accepts.
+	clickhouseRequired := env.MonRole != env.RoleApp
+
 	var failing []string
-	if !clickhouseOK {
+	if clickhouseRequired && !clickhouseOK {
 		failing = append(failing, "clickhouse")
 	}
 	if !mariadbOK {
 		failing = append(failing, "mariadb")
+	}
+	// A process ingesting fine but not evaluating alerts IS running, so /health
+	// stays 200 and Docker leaves it alone — but it is not fully functional, and
+	// readiness is the endpoint that gets to say so.
+	if AlertingDisabledReason != "" {
+		failing = append(failing, "alerting")
 	}
 
 	status := http.StatusOK
@@ -42,6 +70,11 @@ func ReadyHandler(w http.ResponseWriter, r *http.Request) {
 		"status":        "ready",
 		"clickhouse_ok": clickhouseOK,
 		"mariadb_ok":    mariadbOK,
+		"role":          string(env.MonRole),
+		"alerting_ok":   AlertingDisabledReason == "",
+	}
+	if AlertingDisabledReason != "" {
+		body["alerting_disabled_reason"] = AlertingDisabledReason
 	}
 	if len(failing) > 0 {
 		status = http.StatusServiceUnavailable
@@ -125,8 +158,10 @@ func pingDependencies(ctx context.Context) (clickhouseOK, mariadbOK bool) {
 }
 
 // pingClickHouse reports whether the event store is reachable. A nil Conn means
-// the process is serving before db.Connect ran (or after Close), which is not
-// ready either.
+// the process is serving before db.Connect ran (or after Close) — or that it is
+// a control plane, which never connects at all. Either way there is nothing to
+// ping and nothing to report but false; ReadyHandler is where the role decides
+// whether that false is a failure.
 func pingClickHouse(ctx context.Context) bool {
 	if db.Conn == nil {
 		return false

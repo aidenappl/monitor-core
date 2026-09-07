@@ -166,7 +166,7 @@ func TestAggQueryScopesWhenContextCarriesAProject(t *testing.T) {
 	withDefaultProject(t, "default")
 
 	ctx := scope.WithProject(context.Background(), "atlas")
-	sql, args, err := buildAggQuery(ctx, &Rule{}, "toFloat64(count())", time.Unix(0, 0), time.Unix(60, 0))
+	sql, args, err := buildAggQuery(ctx, &structs.AlertRule{}, "toFloat64(count())", time.Unix(0, 0), time.Unix(60, 0))
 	if err != nil {
 		t.Fatalf("buildAggQuery: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestAggQueryScopesWhenContextCarriesAProject(t *testing.T) {
 func TestAggQueryStaysZoneWideForTheTimer(t *testing.T) {
 	withDefaultProject(t, "default")
 
-	sql, args, err := buildAggQuery(context.Background(), &Rule{}, "toFloat64(count())", time.Unix(0, 0), time.Unix(60, 0))
+	sql, args, err := buildAggQuery(context.Background(), &structs.AlertRule{}, "toFloat64(count())", time.Unix(0, 0), time.Unix(60, 0))
 	if err != nil {
 		t.Fatalf("buildAggQuery: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestAggQueryStaysZoneWideForTheTimer(t *testing.T) {
 func TestAggQueryBindsFiltersAfterTheProject(t *testing.T) {
 	withDefaultProject(t, "default")
 
-	rule := &Rule{QueryFilters: `[{"field":"service","operator":"eq","value":"atlas-api"}]`}
+	rule := &structs.AlertRule{QueryFilters: `[{"field":"service","operator":"eq","value":"atlas-api"}]`}
 	ctx := scope.WithProject(context.Background(), "atlas")
 
 	sql, args, err := buildAggQuery(ctx, rule, "toFloat64(count())", time.Unix(0, 0), time.Unix(60, 0))
@@ -250,7 +250,7 @@ func TestAggQueryMatchesUnstampedRowsOnlyForTheDefaultProject(t *testing.T) {
 	withDefaultProject(t, "default")
 
 	ctx := scope.WithProject(context.Background(), "default")
-	sql, _, err := buildAggQuery(ctx, &Rule{}, "toFloat64(count())", time.Unix(0, 0), time.Unix(60, 0))
+	sql, _, err := buildAggQuery(ctx, &structs.AlertRule{}, "toFloat64(count())", time.Unix(0, 0), time.Unix(60, 0))
 	if err != nil {
 		t.Fatalf("buildAggQuery: %v", err)
 	}

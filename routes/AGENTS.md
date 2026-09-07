@@ -1,8 +1,14 @@
 # AGENTS.md — routes/ (monitor-core)
 
-HTTP handlers. Handlers are **thin**: parse the request, call a service/subsystem
+HTTP handlers. Handlers are **thin**: parse the request, call a query/service/subsystem
 function, hand the result to `responder`. Business logic lives in `services/` and the
 subsystem packages, not here. Read the root `../AGENTS.md` first.
+
+**A handler calls `query.*` directly unless the operation genuinely needs orchestration.**
+Since migrations 119-124 that is the shape for dashboards, saved views and most of the
+alerting surface; the surviving `alerts.*` calls are the three that touch MariaDB and
+ClickHouse together. A package that only forwards a handler to one SQL statement is the
+service layer the repo's rules say not to build.
 
 ## Files → routes
 
@@ -14,9 +20,9 @@ subsystem packages, not here. Read the root `../AGENTS.md` first.
 | `analytics.go` | `POST/GET /v1/analytics`, `POST/GET /v1/timeseries`, `POST /v1/topn`, `/v1/gauge`, `/v1/compare` |
 | `stream.go` | `GET /v1/events/stream` (SSE) — subscriber filters come from a hardcoded `service`/`env`/`level`/`name` allowlist |
 | `api_keys.go` | `GET/POST /v1/api-keys`, `DELETE /v1/api-keys/{id}` — `POST` takes an optional `project_slug`, defaulting to `MON_DEFAULT_PROJECT`; the response carries `project_id`/`project_slug` |
-| `dashboards.go` | `GET/POST /v1/dashboards`, `GET/PUT/DELETE /v1/dashboards/{id}` |
-| `views.go` | `GET/POST /v1/views`, `DELETE /v1/views/{id}` |
-| `alerts.go` | alert-rules, alert-history, notification-channels, service-groups, notification-policies CRUD + `/v1/alerts/stream` (SSE) |
+| `dashboards.go` | `GET/POST /v1/dashboards`, `GET/PUT/DELETE /v1/dashboards/{id}` — straight to `query.*` since migration 123 moved the table to MariaDB; the `dashboards` package is now empty |
+| `views.go` | `GET/POST /v1/views`, `DELETE /v1/views/{id}` — straight to `query.*` since migration 124; the `views` package is now empty |
+| `alerts.go` | alert-rules, alert-history, notification-channels, service-groups, notification-policies CRUD + `/v1/alerts/stream` (SSE). **Two layers on purpose:** `query.*` for the pure-MariaDB CRUD (migrations 119-122), `alerts.*` only for the operations that span both stores — `ListRules`/`GetRule`/`DeleteRule`, which join or remove a MariaDB rule alongside its ClickHouse `alert_states` row, plus `ListHistory`, which is ClickHouse-only |
 | `issues.go` | `GET /v1/issues`, `GET/PUT /v1/issues/{id}`, `GET /v1/issues/{id}/events` + `requireProject` |
 | `issue_timeline.go` | `GET /v1/issues/{id}/timeline`, `/history`, the three `comments` verbs and the three `links` verbs — all behind `requireIssue` |
 | `service_repos.go` | `GET /v1/service-repos`, `GET/PUT/DELETE /v1/service-repos/{service}` |
@@ -43,10 +49,18 @@ of registration. Auth details (cookies, JWT, SSO flow, roles) live in `../AGENTS
   See root §5.
 - **Liveness vs readiness:** `/health` (`events.go`) always returns **200 / `status:"ok"`**
   — the container HEALTHCHECK points at it, and killing the process does not fix a dead
-  ClickHouse. It reports `clickhouse_ok`, `mariadb_ok` and `last_flush_at` as diagnostics
-  only, additively after the frozen `status`/`enqueued`/`dropped`/`pending` keys that
-  monitor-web reads. `/ready` (`health.go`) is the one that returns **503**, naming the
+  ClickHouse. It reports `clickhouse_ok`, `mariadb_ok`, `last_flush_at` and `role` as
+  diagnostics only, additively after the frozen `status`/`enqueued`/`dropped`/`pending` keys
+  that monitor-web reads. `/ready` (`health.go`) is the one that returns **503**, naming the
   down store in `failing`. Do not make `/health` fail on a dependency.
+- **Both probes are role-aware, in opposite directions.** `/health` nil-checks `Queue`
+  before `Stats()` and reports zeroes when it is nil — an app process runs no queue, and a
+  panic here would restart a container that is working. `/ready` requires ClickHouse for
+  every role **except exactly `app`** (`env.MonRole != env.RoleApp`, not
+  `!RunsDataPlane()`), so it fails closed: an unset or future role keeps the event store a
+  hard dependency, because being wrongly un-ready costs a routing decision while being
+  wrongly ready hands traffic to a replica that drops what it accepts. Both report `role`,
+  since the boot log line that also states it scrolls away and these can be curled.
 - **Never call `pingDependencies` from a handler — use `cachedPingDependencies`.** Both
   routes are unauthenticated and unthrottled, and a raw ping costs one ClickHouse
   connection (from the pool the batcher writes through) plus one MariaDB connection per
@@ -60,9 +74,41 @@ of registration. Auth details (cookies, JWT, SSO flow, roles) live in `../AGENTS
   authenticated user via `middleware.GetUserFromContext`.
 - **Package-level dependencies are injected from `main.go`** via exported vars:
   `routes.Queue`, `routes.Batcher`, `routes.EventHub`, `routes.AlertNotifHub`. Handlers use these
-  globals; they are set once at startup.
+  globals; they are set once at startup — **and only on the data plane**. All four are nil
+  under `MON_ROLE=app`, which constructs none of them. That is safe only because
+  `buildRouter` registers no route that reads them in that role; the exception is `/health`,
+  which exists in every role and therefore checks. A new global of this kind must be
+  paired with either a data-plane route gate or a nil-tolerant reader — "main.go sets it" is
+  not true in every role, and a nil interface method call is answered by net/http closing
+  the connection with no response at all, which debugs like a network fault rather than a
+  bug.
 - **Pagination:** events + issues return a `pagination` block. Events prebuild
   `next`/`previous` URLs; issues return empty next/prev (client pages via limit/offset).
+
+## Which of these routes a process registers
+
+**Registration is not in this package.** `buildRouter(role)` in the repo root owns the whole
+HTTP surface and decides, per `MON_ROLE`, which handlers here are reachable: `/auth/*` and
+the SSO set are control plane, ingest/query/analytics/dashboards/views/alerting/issues and
+`POST /webhooks/github` are data plane, and `/health`, `/ready`, the zone/project reads,
+`/v1/service-repos` and `/v1/api-keys` are registered in every role. Under the default
+`MON_ROLE=both` every route in the tables above is registered, in the order it always was —
+`router_test.go` pins that inventory, and pins that `both` is exactly the union of the two
+planes, so a route cannot silently fall out of the gating and 404 only in a split deploy.
+The full per-subsystem breakdown, including why the three MariaDB-only groups stay in both
+roles, is root `../AGENTS.md` §6 *Roles*.
+
+Two consequences for work in this package:
+
+- **A gated route does not degrade, it disappears.** In a role that does not register it the
+  request 404s. That is deliberate — the alternative for a data-plane handler in an app
+  process is a nil `db.Conn` and a panic — but it means "this endpoint 404s" has a second
+  possible cause now, and the first thing to check is the `role` on `/health`.
+- **Adding a route means choosing its plane.** Ask what the handler *touches*, then what the
+  data it serves *belongs to* — the second question is the one that decides. `POST
+  /webhooks/github` writes only MariaDB and would run anywhere, but everything it writes
+  belongs to the zone-owned issue tracker, so on an app process it would find no issues,
+  write nothing, and still answer 200 — retiring a delivery GitHub would otherwise retry.
 
 ## SSE handler pattern (and the current breakage)
 

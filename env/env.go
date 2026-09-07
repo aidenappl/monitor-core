@@ -126,6 +126,12 @@ var (
 // Call this after injecting secrets (e.g. via go-keyring) so that
 // any Keyring-provided values are present in os.Getenv before this runs.
 func Load() {
+	// Which plane this process runs. Read FIRST because it decides what the rest
+	// of boot even does — see role.go for the type, the default, and why an
+	// unrecognised value must stop the process rather than degrade to one.
+	// Parsing is total; RequireValidRole is what rejects.
+	MonRole = ParseRole(os.Getenv(ROLE_ENV_VAR))
+
 	Port = getEnv("HTTP_PORT", "8080")
 	ClickHouseAddr = getEnv("CLICKHOUSE_ADDR", "localhost:9000")
 	ClickHouseDatabase = getEnv("CLICKHOUSE_DATABASE", "monitor")

@@ -13,6 +13,37 @@ query/analytics SQL engines. Read the root `../AGENTS.md` first.
 | `query.go` | Event search + label/data-value autocomplete SQL (squirrel → ClickHouse). |
 | `analytics.go` | Aggregation / time series / top-N / gauge / compare SQL engine. |
 
+## This package is the data plane
+
+`MON_ROLE` (root `../AGENTS.md` §6 *Roles*) splits the binary into a control plane (`app`)
+and a data plane (`zone`), and **everything in this package is data plane** — it is very
+nearly the definition of one. Under `MON_ROLE=app` `main.go` constructs no `Hub`, no `Queue`
+and no `Batcher`, starts neither the batcher goroutine nor the alert evaluator, and never
+opens the ClickHouse connection `query.go` and `analytics.go` issue their SQL over. Under
+the default `MON_ROLE=both`, which is the deployed configuration, all of it runs exactly as
+before; nothing in this package changed shape.
+
+The consequence that reaches into other packages: **`routes.Queue`, `routes.Batcher` and
+`routes.EventHub` are nil in an app process.** `buildRouter` registers no route that reads
+them, so the nil is unreachable over HTTP — with one exception, and it is the one that
+matters operationally. `/health` is registered in **every** role (a liveness probe that
+disappears when a process is configured differently is not a probe), and it reads
+`Queue.Stats()`. `HealthHandler` therefore nil-checks and reports zeroes, which is the
+honest answer for a process that runs no queue: nothing has been enqueued, dropped, or is
+pending. Without that check the nil dereference would panic on every request to the endpoint
+the container `HEALTHCHECK` polls, and Docker would restart a control plane that was working
+perfectly. **Anything else added here that `main.go` wires into a `routes` global inherits
+the same rule** — either gate its route to the data plane, or make the reader tolerate nil;
+a package-level `var` that only main sets is not a guarantee that main set it.
+
+`/ready` makes the matching judgement in the other direction: `pingClickHouse` returns false
+on a nil `Conn`, so an app process would be permanently 503 and un-routable. `ReadyHandler`
+requires ClickHouse for every role *except* exactly `app`, deliberately spelled as
+`env.MonRole != env.RoleApp` rather than `!RunsDataPlane()` so that an unset or
+not-yet-invented role keeps the event store as a hard readiness dependency. Being wrongly
+un-ready costs a routing decision; being wrongly ready hands live traffic to a replica that
+drops everything it accepts.
+
 ## Ingestion pipeline
 
 ```

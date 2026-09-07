@@ -2,7 +2,8 @@
 
 The event ingestion, query, and observability API for the Monitor platform — a
 high-performance service that ingests monitoring events into ClickHouse and owns
-identity/authentication (native accounts + pluggable SSO) in MariaDB.
+everything relational in MariaDB: identity/authentication (native accounts + pluggable
+SSO), the tenancy registry, issue tracking, and the alerting and dashboard configuration.
 
 > **Monitor platform** · Go API · `monitor.appleby.cloud` (Lattice)
 
@@ -12,9 +13,18 @@ identity/authentication (native accounts + pluggable SSO) in MariaDB.
 go services (go-monitor / monitor-js SDK)          monitor-web (Next.js)
   ↓ (batched NDJSON over HTTP, X-Api-Key)             ↓ (proxy: mon-* cookies + X-CSRF-Token)
 monitor-core ──────────────────────────────────────────────────────────
-  ↓ (batched inserts)          ↓ (auth: users, identities, sessions, SSO)
-ClickHouse (events)          MariaDB (monitor_auth)
+  ↓ (batched inserts)          ↓ (rows: identity, tenancy, issues, alert + dashboard config)
+ClickHouse (events)          MariaDB (monitor_auth + monitor)
 ```
+
+**Which store owns what** — the rule is *facts vs configuration*. ClickHouse holds rows
+written by machines, appended at volume and expired by a TTL: `events`,
+`issue_occurrences_daily`, `alert_states`, `alert_history`. MariaDB holds rows a human
+edits and whose correctness depends on constraints: users, api keys, zones/projects,
+issues, service→repo mappings, and — since migrations 119-124 — alert rules, notification
+channels, notification policies, service groups, dashboards and saved views. See
+[AGENTS.md](AGENTS.md) §6 *Stores — configuration vs facts* for the argument and for the
+two production defects that produced it.
 
 ## Features
 
@@ -123,14 +133,16 @@ Response:
   "pending": 0,
   "clickhouse_ok": true,
   "mariadb_ok": true,
-  "last_flush_at": "2026-09-06T12:00:00Z"
+  "last_flush_at": "2026-09-06T12:00:00Z",
+  "role": "both"
 }
 ```
 
 `/health` is **liveness** — it always returns `200 / "ok"`, even with a store down (the
 container healthcheck points here, and a restart cannot repair ClickHouse). The
 dependency booleans and `last_flush_at` are diagnostics; `dropped` counts both queue
-overflow and batches the writer gave up on.
+overflow and batches the writer gave up on. `role` echoes `MON_ROLE` (see **Roles** under
+Configuration) so the plane a process thinks it is can be asked rather than inferred.
 
 ### Readiness
 
@@ -141,8 +153,12 @@ curl -i http://localhost:8080/ready
 `200` when ClickHouse and MariaDB both answer a 2s ping, otherwise `503`:
 
 ```json
-{ "status": "not_ready", "clickhouse_ok": false, "mariadb_ok": true, "failing": ["clickhouse"] }
+{ "status": "not_ready", "clickhouse_ok": false, "mariadb_ok": true, "role": "both", "failing": ["clickhouse"] }
 ```
+
+Under `MON_ROLE=app` there is no ClickHouse connection at all, so it is not counted as a
+dependency and `clickhouse_ok: false` does not make the process un-ready — that is what
+`role` on this response is for. Every other role still requires it.
 
 ### Ingest Events
 
@@ -557,7 +573,12 @@ credential kinds coexist:
 
 Auth/identity data lives in MariaDB (`monitor_auth`): `users`, `identities`
 (`UNIQUE(provider, provider_user_id)` — true account linking, one user ↔ many sign-in
-methods), `refresh_tokens`, `sso_providers`, `sso_sessions`, `settings`, `api_keys`.
+methods), `refresh_tokens`, `sso_providers`, `sso_sessions`, `settings`, `api_keys`, plus
+the tenancy registry (`zones`, `projects`). The second MariaDB schema, `monitor`, holds
+observability data on the same connection: `issues`, `issue_timeline`, `issue_links`,
+`service_repos`, and the alerting/dashboard configuration (`alert_rules`,
+`notification_channels`, `notification_policies`, `service_groups`, `dashboards`,
+`saved_views`).
 
 Endpoint surface (browser/cookie-oriented, outside `/v1`):
 
@@ -584,6 +605,7 @@ verified. Full details in [AGENTS.md](./AGENTS.md) §6.
 | Environment Variable  | Default          | Description                                   |
 | --------------------- | ---------------- | --------------------------------------------- |
 | `HTTP_PORT`           | `8080`           | HTTP server port                              |
+| `MON_ROLE`            | `both`           | Which plane this process runs: `app` (control plane — identity/config, **no ClickHouse**), `zone` (data plane — events, ingest, alerts, issues) or `both`. Leave it unset unless you are deliberately splitting the planes; an unrecognised value **refuses to boot** rather than falling back. See **Roles** below |
 | `CLICKHOUSE_ADDR`     | `localhost:9000` | ClickHouse server address                     |
 | `CLICKHOUSE_DATABASE` | `monitor`        | ClickHouse database name; must match `^[a-z][a-z0-9_]{2,62}$` (it is interpolated into SQL, and the migrations are rewritten to it) |
 | `CLICKHOUSE_USERNAME` | `default`        | ClickHouse username                           |
@@ -603,6 +625,30 @@ verified. Full details in [AGENTS.md](./AGENTS.md) §6.
 | `MON_ALLOW_REGISTRATION` | `false`       | Gates `POST /auth/register` (self-registration) |
 | `MON_ZONE_SLUG`       | `trailblaze`     | Slug of the single zone seeded at boot. Slugs are immutable — changing it later seeds a second zone, it does not rename the first |
 | `MON_DEFAULT_PROJECT` | `default`        | Slug of the project seeded inside that zone; every API key binds to it, the env master key stamps events with it, and it is the project the master key and dashboard sessions **read**. Also the only project whose reads still match pre-006 events (see Tenancy). **Not boot-only — do not change it on a running install:** it is read on every request, query, streamed event and error fingerprint, and repointing it hides every event the manual backfill has not stamped |
+
+### Roles — the two planes
+
+`monitor-core` does two unrelated jobs in one binary, and `MON_ROLE` says which of them a
+process is running.
+
+| | `app` | `zone` | `both` *(default)* |
+| --- | --- | --- | --- |
+| Identity: `/auth/*`, SSO, admin bootstrap, tenancy seeder | ✅ | — | ✅ |
+| Events: ClickHouse, ingest, batcher, SSE hubs, alert evaluator, issues | — | ✅ | ✅ |
+| MariaDB, API-key cache, `/health` + `/ready` | ✅ | ✅ | ✅ |
+
+- **Unset means `both`**, which is exactly what the service did before roles existed — so
+  deploying this changes nothing until someone opts in.
+- **A route the current role cannot serve is not registered**, so it answers `404` instead
+  of failing on a dependency the process does not have. Under `MON_ROLE=app` there is no
+  ClickHouse connection at all.
+- **A typo stops the boot.** `MON_ROLE=zonr` is refused by name rather than quietly
+  defaulting — a silent fallback would run the control plane on a host meant to be a zone.
+- The resolved role is logged once at startup and reported by `GET /health`.
+- Splitting the planes across hosts needs more than this switch (config distribution and
+  per-zone credentials are not built); today `both` is the supported topology.
+
+Full per-subsystem breakdown in [AGENTS.md](AGENTS.md) §6 *Roles — the two planes*.
 
 ### Tenancy — every event read is project-scoped
 
@@ -672,29 +718,37 @@ dev up                    # Start local ClickHouse + MariaDB
 dev run                   # Run the app (auto-migrates both schemas at startup)
 dev check                 # Format, vet, and test
 dev down                  # Stop the local stack
+
+# One-time cutovers (argv subcommands — they migrate, copy, then exit)
+go run . backfill-issues  # legacy ClickHouse issues → monitor.issues
+go run . backfill-config  # legacy ClickHouse alerting/dashboard config → MariaDB.
+                          # Must run BEFORE the new binary serves — the server REFUSES
+                          # TO BOOT until it has. See AGENTS.md §8
 ```
 
 ## Project Structure
 
 ```
 monitor-core/
-  main.go                     # Entry: config, DB connects + migrations, bootstrap, sso.Install(), routes
+  main.go                     # Entry: config, MON_ROLE validation, DB connects + migrations, bootstrap, sso.Install(), goroutines
+  router.go                   # buildRouter(role) — the HTTP surface, each route gated on the plane that can serve it
   Devfile.yaml                # Dev CLI commands
-  Dockerfile                  # Multi-stage production build (builds ./main.go)
+  Dockerfile                  # Multi-stage production build (builds the package, `go build .`)
   docker-compose.yml          # Production stack: monitor-core + ClickHouse + MariaDB (+ monitor-web)
   docker-compose.dev.yml      # Local development stack
   db/
     clickhouse.go             # ClickHouse connection and batch writer (events)
     sql.go                    # MariaDB connection (db.SQL), db.Queryable, db.RunMigrations
-    migrations/               # MariaDB DDL: identity + tenancy (100_users … 118_issues_project)
+    migrations/               # MariaDB DDL: identity + tenancy + issues + alert/dashboard config (100_users … 124_saved_views)
   env/env.go                  # Environment configuration + RequireProductionSecrets guard
+  env/role.go                 # MON_ROLE: the Role type (app/zone/both) and the fail-fast RequireValidRole guard
   jwt/jwt.go                  # Monitor-owned HS512 access/refresh JWTs (alg-pinned)
   tools/                      # Password.tool.go (bcrypt 12), Crypto.go (AES-256-GCM), Validate.tool.go, Slug.tool.go
   bootstrap/                  # First-run seeding: admin.go (first admin user), registry.go (zone + default project)
   sso/                        # Pluggable SSO wiring onto go-forta/sso: config.go, resolve.go, checkpoint.go, statestore.go, sessionstore.go, backchannel.go
-  query/                      # MariaDB query layer (squirrel): users/identities/refresh_tokens/sso_*/api_keys/zones/projects
+  query/                      # MariaDB query layer (squirrel): users/identities/refresh_tokens/sso_*/api_keys/zones/projects/issues/service_repos/alert_rules/notification_channels/notification_policies/service_groups/dashboards/saved_views
   scope/                      # The request's project: context plumbing + the predicate every event read must carry
-  structs/                    # User/Identity/SSOProvider/SSOSession/RefreshToken/APIKey/Zone/Project + event/analytics + columns.go (shared identifier regex + column allowlists)
+  structs/                    # User/Identity/SSOProvider/SSOSession/RefreshToken/APIKey/Zone/Project/Issue/AlertRule/NotificationChannel/NotificationPolicy/ServiceGroup/Dashboard/SavedView + event/analytics + columns.go (shared identifier regex + column allowlists)
   middleware/
     session.go                # Monitor session auth + Protected/RequireAdmin/RequireEditor/RejectPending
     csrf.go                   # Double-submit CSRF (mon-csrf ↔ X-CSRF-Token)
@@ -705,7 +759,10 @@ monitor-core/
   routes/                     # HTTP handlers (thin) — auth + SSO + events/query/analytics/… (see routes/AGENTS.md)
   services/                   # queue.go batcher.go hub.go query.go analytics.go (ingestion + query engines)
   registry/                   # Tenancy-registry cache (zone + active projects, 30s refresher) — validates a session's ?project selector
-  apikeys/ alerts/ issues/ dashboards/ views/   # Subsystems (each Init()s from main.go)
+  apikeys/ alerts/ issues/    # Subsystems (each Init()s from main.go)
+  dashboards/ views/          # EMPTY — their tables moved to MariaDB (123/124); the files are tombstones pointing at query/ and structs/
+  cutover/config.go           # One-time ClickHouse → MariaDB copy of the six config tables (`monitor-core backfill-config`)
+  cutover/guard.go            # Refuses the boot while that copy is outstanding — a mis-ordered cutover would otherwise be silent
   migrations/
     embed.go                  # In-app ClickHouse migration runner (//go:embed *.sql), rewrites the database name
     001_schema.sql 002_add_user_id.sql 003_api_keys.sql 004_events_issue_id.sql

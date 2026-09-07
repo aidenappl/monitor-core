@@ -6,73 +6,38 @@ import (
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/query"
+	"github.com/aidenappl/monitor-core/structs"
 	"github.com/google/uuid"
 )
 
-// Priority levels
-const (
-	PriorityCritical = "P0"
-	PriorityHigh     = "P1"
-	PriorityMedium   = "P2"
-	PriorityLow      = "P3"
-)
+// WHAT IS LEFT IN THIS FILE, AND WHY IT IS ONLY THIS.
+//
+// The alerting CONFIGURATION — rules, notification channels, routing policies and
+// service groups — moved to MariaDB in migrations 119-122 and its SQL now lives
+// in query/*.query.go. What remains here is the half that did not move:
+//
+//   * alert_states and alert_history, which stay in ClickHouse. They are
+//     per-evaluation FACTS: a state row is rewritten by a timer every 15 seconds
+//     and a history row is appended on every transition, so they are time-series
+//     shaped in the way issue occurrences are, and alert_history carries a 90-day
+//     TTL that has no MariaDB equivalent short of a scheduled DELETE. Migration
+//     119's header states the split in full.
+//   * ListRules, GetRule and DeleteRule, which are the three operations that
+//     touch BOTH stores. They are not a service layer over query/ — every other
+//     rule operation goes straight from handler to query — they are the specific
+//     cases where a MariaDB row and a ClickHouse row have to be read or written
+//     together, which is the one situation the house rules keep a layer for.
+//
+// KNOWN INCONSISTENCY, recorded rather than left to be found: the two tables
+// below are still created by an ad-hoc CREATE TABLE at boot, with no migration
+// file, which is exactly the pattern migration 119 condemns for the six that
+// moved. They are the last two in the repo created that way. Giving them files
+// means a ClickHouse migration (migrations/007…), which is a different runner
+// with its own re-runnability story, and it is a separate change.
 
-var ValidPriorities = map[string]bool{
-	PriorityCritical: true,
-	PriorityHigh:     true,
-	PriorityMedium:   true,
-	PriorityLow:      true,
-}
-
-// Rule represents an alert rule
-type Rule struct {
-	ID                     string    `json:"id"`
-	Name                   string    `json:"name"`
-	Description            string    `json:"description"`
-	Type                   string    `json:"type"`
-	Priority               string    `json:"priority"`
-	QueryFilters           string    `json:"query_filters"`
-	Metric                 string    `json:"metric"`
-	Field                  string    `json:"field"`
-	Condition              string    `json:"condition"`
-	Threshold              float64   `json:"threshold"`
-	EvaluationIntervalSecs uint32    `json:"evaluation_interval_seconds"`
-	ForSeconds             uint32    `json:"for_seconds"`
-	CooldownSeconds        uint32    `json:"cooldown_seconds"`
-	NotificationChannelIDs string    `json:"notification_channel_ids"`
-	Enabled                bool      `json:"enabled"`
-	CreatedAt              time.Time `json:"created_at"`
-	UpdatedAt              time.Time `json:"updated_at"`
-}
-
-// UpdateRuleRequest is the partial-update payload for PUT /v1/alert-rules/{id}.
-// Every field is a pointer so an ABSENT field (nil) is distinguishable from a
-// zero/false value. Only non-nil fields are applied; omitting a field preserves
-// the current value — critically, omitting `enabled` no longer disables the rule.
-type UpdateRuleRequest struct {
-	Name                   *string  `json:"name"`
-	Description            *string  `json:"description"`
-	Type                   *string  `json:"type"`
-	Priority               *string  `json:"priority"`
-	QueryFilters           *string  `json:"query_filters"`
-	Metric                 *string  `json:"metric"`
-	Field                  *string  `json:"field"`
-	Condition              *string  `json:"condition"`
-	Threshold              *float64 `json:"threshold"`
-	EvaluationIntervalSecs *uint32  `json:"evaluation_interval_seconds"`
-	ForSeconds             *uint32  `json:"for_seconds"`
-	CooldownSeconds        *uint32  `json:"cooldown_seconds"`
-	NotificationChannelIDs *string  `json:"notification_channel_ids"`
-	Enabled                *bool    `json:"enabled"`
-}
-
-// RuleWithState combines a rule with its current state
-type RuleWithState struct {
-	Rule
-	State *State `json:"state,omitempty"`
-}
-
-// State represents the current state of an alert rule
+// State represents the current state of an alert rule. ClickHouse
+// (alert_states), one row per rule, rewritten on every evaluation.
 type State struct {
 	RuleID         string     `json:"rule_id"`
 	Status         string     `json:"status"`
@@ -83,7 +48,8 @@ type State struct {
 	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
-// HistoryEntry represents an alert history entry
+// HistoryEntry is one firing/resolved transition. ClickHouse (alert_history),
+// append-only, expired by a 90-day TTL.
 type HistoryEntry struct {
 	ID        string    `json:"id"`
 	RuleID    string    `json:"rule_id"`
@@ -94,50 +60,25 @@ type HistoryEntry struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// Channel represents a notification channel
-type Channel struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Type      string    `json:"type"`
-	Config    string    `json:"config"`
-	CreatedAt time.Time `json:"created_at"`
+// RuleWithState is a rule joined to its current state — one row from MariaDB and
+// one from ClickHouse. The embedded struct is what keeps the JSON flat, so the
+// wire shape is identical to when both halves lived in one ClickHouse table.
+type RuleWithState struct {
+	structs.AlertRule
+	State *State `json:"state,omitempty"`
 }
 
-// Init creates all alert-related tables
+// Init creates the two ClickHouse tables that did NOT move, and seeds the default
+// notification policies on a fresh install.
+//
+// The seeding is a MariaDB write and sits here rather than in bootstrap/ for one
+// reason: bootstrap runs on the CONTROL plane and this runs on the DATA plane,
+// and the alerting surface has always been data-plane. Moving the seed would
+// change which processes create those four rows, which is precisely the kind of
+// silent behaviour change this move must not make. It is called from main.go's
+// data-plane block, after both migration runners.
 func Init(ctx context.Context) error {
 	err := db.Conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS `+db.Database+`.alert_rules (
-			id String,
-			name String,
-			description String DEFAULT '',
-			type String,
-			priority String DEFAULT 'P2',
-			query_filters String,
-			metric String DEFAULT 'count',
-			field String DEFAULT '',
-			condition String,
-			threshold Float64,
-			evaluation_interval_seconds UInt32 DEFAULT 60,
-			for_seconds UInt32 DEFAULT 0,
-			cooldown_seconds UInt32 DEFAULT 300,
-			notification_channel_ids String DEFAULT '[]',
-			enabled UInt8 DEFAULT 1,
-			created_at DateTime64(3, 'UTC') DEFAULT now64(3),
-			updated_at DateTime64(3, 'UTC') DEFAULT now64(3)
-		) ENGINE = ReplacingMergeTree(updated_at)
-		ORDER BY (id)
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create alert_rules table: %w", err)
-	}
-
-	// Migration: add priority column for existing tables
-	_ = db.Conn.Exec(ctx, fmt.Sprintf(
-		"ALTER TABLE %s.alert_rules ADD COLUMN IF NOT EXISTS priority String DEFAULT 'P2'",
-		db.Database,
-	))
-
-	err = db.Conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS `+db.Database+`.alert_states (
 			rule_id String,
 			status String DEFAULT 'ok',
@@ -153,6 +94,10 @@ func Init(ctx context.Context) error {
 		return fmt.Errorf("failed to create alert_states table: %w", err)
 	}
 
+	// The TTL is deliberate and must survive any edit to this statement: alert
+	// history is unbounded otherwise, one row per transition per rule forever.
+	// It is also the single strongest reason this table stayed in ClickHouse —
+	// MariaDB has no expression for it.
 	err = db.Conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS `+db.Database+`.alert_history (
 			id String,
@@ -170,128 +115,74 @@ func Init(ctx context.Context) error {
 		return fmt.Errorf("failed to create alert_history table: %w", err)
 	}
 
-	err = db.Conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS `+db.Database+`.notification_channels (
-			id String,
-			name String,
-			type String,
-			config String,
-			created_at DateTime64(3, 'UTC') DEFAULT now64(3)
-		) ENGINE = MergeTree
-		ORDER BY (id)
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create notification_channels table: %w", err)
-	}
-
-	if err := InitServiceGroups(ctx); err != nil {
-		return fmt.Errorf("failed to initialize service_groups: %w", err)
-	}
-
-	if err := InitPolicies(ctx); err != nil {
-		return fmt.Errorf("failed to initialize notification_policies: %w", err)
+	if err := query.SeedDefaultNotificationPolicies(db.SQL); err != nil {
+		return fmt.Errorf("failed to seed default notification policies: %w", err)
 	}
 
 	return nil
 }
 
-// CreateRule creates a new alert rule
-func CreateRule(ctx context.Context, rule Rule) (*Rule, error) {
-	if rule.Name == "" {
-		return nil, fmt.Errorf("name is required")
-	}
-	if rule.Type == "" {
-		return nil, fmt.Errorf("type is required")
-	}
-	validTypes := map[string]bool{"threshold": true, "absence": true, "rate_change": true}
-	if !validTypes[rule.Type] {
-		return nil, fmt.Errorf("invalid type: %s (must be threshold, absence, or rate_change)", rule.Type)
-	}
-	if rule.Condition == "" {
-		return nil, fmt.Errorf("condition is required")
-	}
-	validConditions := map[string]bool{"gt": true, "lt": true, "gte": true, "lte": true, "eq": true}
-	if !validConditions[rule.Condition] {
-		return nil, fmt.Errorf("invalid condition: %s", rule.Condition)
-	}
-
-	rule.ID = uuid.New().String()
-	now := time.Now().UTC()
-	rule.CreatedAt = now
-	rule.UpdatedAt = now
-
-	if rule.Priority == "" || !ValidPriorities[rule.Priority] {
-		rule.Priority = PriorityMedium
-	}
-	if rule.Metric == "" {
-		rule.Metric = "count"
-	}
-	if rule.EvaluationIntervalSecs == 0 {
-		rule.EvaluationIntervalSecs = 60
-	}
-	if rule.CooldownSeconds == 0 {
-		rule.CooldownSeconds = 300
-	}
-	if rule.QueryFilters == "" {
-		rule.QueryFilters = "[]"
-	}
-	if rule.NotificationChannelIDs == "" {
-		rule.NotificationChannelIDs = "[]"
-	}
-
-	enabled := uint8(0)
-	if rule.Enabled {
-		enabled = 1
-	}
-
-	err := db.Conn.Exec(ctx, fmt.Sprintf(
-		`INSERT INTO %s.alert_rules (id, name, description, type, priority, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		db.Database,
-	), rule.ID, rule.Name, rule.Description, rule.Type, rule.Priority, rule.QueryFilters, rule.Metric, rule.Field, rule.Condition, rule.Threshold, rule.EvaluationIntervalSecs, rule.ForSeconds, rule.CooldownSeconds, rule.NotificationChannelIDs, enabled, rule.CreatedAt, rule.UpdatedAt)
-	if err != nil {
-		return nil, fmt.Errorf("failed to insert alert rule: %w", err)
-	}
-
-	return &rule, nil
-}
-
-// ListRules returns all alert rules with their current state
+// ListRules returns every rule with its current state.
+//
+// Cross-store: the rules come from MariaDB and the states from ClickHouse, in
+// two queries rather than N+1. A failed state fetch is non-fatal — the rules are
+// still returned, with nil states — because the configuration is the answer the
+// caller asked for and the state is decoration on it.
 func ListRules(ctx context.Context) ([]RuleWithState, error) {
-	rows, err := db.Conn.Query(ctx, fmt.Sprintf(
-		"SELECT id, name, description, type, priority, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at FROM %s.alert_rules FINAL ORDER BY created_at DESC",
-		db.Database,
-	))
+	ruleList, err := query.ListAlertRules(db.SQL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list alert rules: %w", err)
-	}
-	defer rows.Close()
-
-	var ruleList []Rule
-	for rows.Next() {
-		var r Rule
-		var enabled uint8
-		if err := rows.Scan(&r.ID, &r.Name, &r.Description, &r.Type, &r.Priority, &r.QueryFilters, &r.Metric, &r.Field, &r.Condition, &r.Threshold, &r.EvaluationIntervalSecs, &r.ForSeconds, &r.CooldownSeconds, &r.NotificationChannelIDs, &enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
-			return nil, fmt.Errorf("failed to scan alert rule: %w", err)
-		}
-		r.Enabled = enabled == 1
-		ruleList = append(ruleList, r)
+		return nil, err
 	}
 
-	// Bulk fetch all states in one query instead of N+1
 	stateMap, err := ListAllStates(ctx)
 	if err != nil {
-		// Non-fatal: attach nil states if bulk fetch fails
 		stateMap = make(map[string]*State)
 	}
 
-	var rules []RuleWithState
+	rules := make([]RuleWithState, 0, len(ruleList))
 	for _, r := range ruleList {
-		rules = append(rules, RuleWithState{Rule: r, State: stateMap[r.ID]})
+		rules = append(rules, RuleWithState{AlertRule: r, State: stateMap[r.ID]})
 	}
 	return rules, nil
 }
 
-// ListAllStates returns all alert states as a map keyed by rule_id
+// GetRule returns one rule with its current state.
+//
+// A missing rule is an ERROR rather than (nil, nil), matching what the handler
+// has always turned into a 404. query.GetAlertRule is the layer that reports
+// absence as absence; this one is the API's opinion about it.
+func GetRule(ctx context.Context, id string) (*RuleWithState, error) {
+	rule, err := query.GetAlertRule(db.SQL, id)
+	if err != nil {
+		return nil, err
+	}
+	if rule == nil {
+		return nil, fmt.Errorf("alert rule not found")
+	}
+	state, _ := GetState(ctx, id)
+	return &RuleWithState{AlertRule: *rule, State: state}, nil
+}
+
+// DeleteRule removes a rule from MariaDB and its state row from ClickHouse.
+//
+// The two stores are why this is not a bare call to query.DeleteAlertRule. The
+// state cleanup keeps its original best-effort handling: a leftover alert_states
+// row is orphaned data that nothing reads (ListAllStates is only ever keyed by a
+// rule that exists), so failing the delete over it would refuse a request that
+// actually succeeded at the part that matters.
+func DeleteRule(ctx context.Context, id string) error {
+	if _, err := query.DeleteAlertRule(db.SQL, id); err != nil {
+		return err
+	}
+
+	_ = db.Conn.Exec(ctx, fmt.Sprintf(
+		"ALTER TABLE %s.alert_states DELETE WHERE rule_id = ?", db.Database,
+	), id)
+
+	return nil
+}
+
+// ListAllStates returns all alert states as a map keyed by rule_id.
 func ListAllStates(ctx context.Context) (map[string]*State, error) {
 	rows, err := db.Conn.Query(ctx, fmt.Sprintf(
 		"SELECT rule_id, status, value, fired_at, resolved_at, last_notified_at, updated_at FROM %s.alert_states FINAL",
@@ -313,141 +204,7 @@ func ListAllStates(ctx context.Context) (map[string]*State, error) {
 	return stateMap, nil
 }
 
-// GetRule returns an alert rule by ID with its current state
-func GetRule(ctx context.Context, id string) (*RuleWithState, error) {
-	rule, err := getRuleOnly(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	state, _ := GetState(ctx, id)
-	return &RuleWithState{Rule: *rule, State: state}, nil
-}
-
-func getRuleOnly(ctx context.Context, id string) (*Rule, error) {
-	row := db.Conn.QueryRow(ctx, fmt.Sprintf(
-		"SELECT id, name, description, type, priority, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at FROM %s.alert_rules FINAL WHERE id = ?",
-		db.Database,
-	), id)
-
-	var r Rule
-	var enabled uint8
-	if err := row.Scan(&r.ID, &r.Name, &r.Description, &r.Type, &r.Priority, &r.QueryFilters, &r.Metric, &r.Field, &r.Condition, &r.Threshold, &r.EvaluationIntervalSecs, &r.ForSeconds, &r.CooldownSeconds, &r.NotificationChannelIDs, &enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
-		return nil, fmt.Errorf("alert rule not found")
-	}
-	r.Enabled = enabled == 1
-	return &r, nil
-}
-
-// UpdateRule applies a partial update to an existing alert rule. Only fields set
-// (non-nil) in the request are changed; absent fields preserve their current
-// value. Enum-constrained fields are validated when provided; numeric fields can
-// be set to 0 and `enabled` can be set to false because pointers distinguish
-// "absent" from "zero".
-func UpdateRule(ctx context.Context, id string, req UpdateRuleRequest) (*Rule, error) {
-	existing, err := getRuleOnly(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-
-	if req.Name != nil {
-		if *req.Name == "" {
-			return nil, fmt.Errorf("name cannot be empty")
-		}
-		existing.Name = *req.Name
-	}
-	if req.Description != nil {
-		existing.Description = *req.Description
-	}
-	if req.Type != nil {
-		validTypes := map[string]bool{"threshold": true, "absence": true, "rate_change": true}
-		if !validTypes[*req.Type] {
-			return nil, fmt.Errorf("invalid type: %s (must be threshold, absence, or rate_change)", *req.Type)
-		}
-		existing.Type = *req.Type
-	}
-	if req.Priority != nil {
-		if !ValidPriorities[*req.Priority] {
-			return nil, fmt.Errorf("invalid priority: %s", *req.Priority)
-		}
-		existing.Priority = *req.Priority
-	}
-	if req.QueryFilters != nil {
-		existing.QueryFilters = *req.QueryFilters
-	}
-	if req.Metric != nil {
-		validMetrics := map[string]bool{"count": true, "sum": true, "avg": true, "min": true, "max": true}
-		if !validMetrics[*req.Metric] {
-			return nil, fmt.Errorf("invalid metric: %s (must be count, sum, avg, min, or max)", *req.Metric)
-		}
-		existing.Metric = *req.Metric
-	}
-	if req.Field != nil {
-		existing.Field = *req.Field
-	}
-	if req.Condition != nil {
-		validConditions := map[string]bool{"gt": true, "lt": true, "gte": true, "lte": true, "eq": true}
-		if !validConditions[*req.Condition] {
-			return nil, fmt.Errorf("invalid condition: %s", *req.Condition)
-		}
-		existing.Condition = *req.Condition
-	}
-	if req.Threshold != nil {
-		existing.Threshold = *req.Threshold
-	}
-	if req.EvaluationIntervalSecs != nil {
-		existing.EvaluationIntervalSecs = *req.EvaluationIntervalSecs
-	}
-	if req.ForSeconds != nil {
-		existing.ForSeconds = *req.ForSeconds
-	}
-	if req.CooldownSeconds != nil {
-		existing.CooldownSeconds = *req.CooldownSeconds
-	}
-	if req.NotificationChannelIDs != nil {
-		existing.NotificationChannelIDs = *req.NotificationChannelIDs
-	}
-	// Enabled is applied only when present — omitting it preserves the current value.
-	if req.Enabled != nil {
-		existing.Enabled = *req.Enabled
-	}
-
-	now := time.Now().UTC()
-	existing.UpdatedAt = now
-
-	enabled := uint8(0)
-	if existing.Enabled {
-		enabled = 1
-	}
-
-	err = db.Conn.Exec(ctx, fmt.Sprintf(
-		`INSERT INTO %s.alert_rules (id, name, description, type, priority, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		db.Database,
-	), existing.ID, existing.Name, existing.Description, existing.Type, existing.Priority, existing.QueryFilters, existing.Metric, existing.Field, existing.Condition, existing.Threshold, existing.EvaluationIntervalSecs, existing.ForSeconds, existing.CooldownSeconds, existing.NotificationChannelIDs, enabled, existing.CreatedAt, existing.UpdatedAt)
-	if err != nil {
-		return nil, fmt.Errorf("failed to update alert rule: %w", err)
-	}
-
-	return existing, nil
-}
-
-// DeleteRule removes an alert rule and its state
-func DeleteRule(ctx context.Context, id string) error {
-	err := db.Conn.Exec(ctx, fmt.Sprintf(
-		"ALTER TABLE %s.alert_rules DELETE WHERE id = ?", db.Database,
-	), id)
-	if err != nil {
-		return fmt.Errorf("failed to delete alert rule: %w", err)
-	}
-
-	// Clean up state
-	_ = db.Conn.Exec(ctx, fmt.Sprintf(
-		"ALTER TABLE %s.alert_states DELETE WHERE rule_id = ?", db.Database,
-	), id)
-
-	return nil
-}
-
-// GetState returns the current state for a rule
+// GetState returns the current state for a rule.
 func GetState(ctx context.Context, ruleID string) (*State, error) {
 	row := db.Conn.QueryRow(ctx, fmt.Sprintf(
 		"SELECT rule_id, status, value, fired_at, resolved_at, last_notified_at, updated_at FROM %s.alert_states FINAL WHERE rule_id = ?",
@@ -461,7 +218,7 @@ func GetState(ctx context.Context, ruleID string) (*State, error) {
 	return &s, nil
 }
 
-// UpsertState inserts or updates alert state (ReplacingMergeTree handles dedup)
+// UpsertState inserts or updates alert state (ReplacingMergeTree handles dedup).
 func UpsertState(ctx context.Context, s *State) error {
 	return db.Conn.Exec(ctx, fmt.Sprintf(
 		"INSERT INTO %s.alert_states (rule_id, status, value, fired_at, resolved_at, last_notified_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -469,7 +226,7 @@ func UpsertState(ctx context.Context, s *State) error {
 	), s.RuleID, s.Status, s.Value, s.FiredAt, s.ResolvedAt, s.LastNotifiedAt, s.UpdatedAt)
 }
 
-// RecordHistory records an alert event in history
+// RecordHistory records an alert event in history.
 func RecordHistory(ctx context.Context, entry HistoryEntry) error {
 	entry.ID = uuid.New().String()
 	entry.CreatedAt = time.Now().UTC()
@@ -480,32 +237,39 @@ func RecordHistory(ctx context.Context, entry HistoryEntry) error {
 	), entry.ID, entry.RuleID, entry.RuleName, entry.Status, entry.Value, entry.Message, entry.CreatedAt)
 }
 
-// ListHistory returns alert history entries
+// ListHistory returns alert history entries.
 func ListHistory(ctx context.Context, ruleID string, limit, offset int) ([]HistoryEntry, error) {
+	// Clamped exactly as before, now spelled with the shared constants: an
+	// absent or negative limit defaults, an oversized one is TRIMMED to the
+	// maximum rather than reset to the default. The distinction is visible to a
+	// caller asking for 600 and is preserved on purpose.
 	if limit <= 0 {
-		limit = 50
+		limit = db.DEFAULT_LIMIT
 	}
-	if limit > 500 {
-		limit = 500
+	if limit > db.MAX_LIMIT {
+		limit = db.MAX_LIMIT
 	}
 
-	var query string
+	// Named `q`, not `query`: this package now imports the query package, and a
+	// local of that name shadows it. Harmless here and a compile error the next
+	// time somebody adds a query.* call inside this function.
+	var q string
 	var args []interface{}
 
 	if ruleID != "" {
-		query = fmt.Sprintf(
+		q = fmt.Sprintf(
 			"SELECT id, rule_id, rule_name, status, value, message, created_at FROM %s.alert_history WHERE rule_id = ? ORDER BY created_at DESC LIMIT %d OFFSET %d",
 			db.Database, limit, offset,
 		)
 		args = append(args, ruleID)
 	} else {
-		query = fmt.Sprintf(
+		q = fmt.Sprintf(
 			"SELECT id, rule_id, rule_name, status, value, message, created_at FROM %s.alert_history ORDER BY created_at DESC LIMIT %d OFFSET %d",
 			db.Database, limit, offset,
 		)
 	}
 
-	rows, err := db.Conn.Query(ctx, query, args...)
+	rows, err := db.Conn.Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list alert history: %w", err)
 	}
@@ -520,75 +284,4 @@ func ListHistory(ctx context.Context, ruleID string, limit, offset int) ([]Histo
 		entries = append(entries, e)
 	}
 	return entries, nil
-}
-
-// CreateChannel creates a new notification channel
-func CreateChannel(ctx context.Context, ch Channel) (*Channel, error) {
-	if ch.Name == "" {
-		return nil, fmt.Errorf("name is required")
-	}
-	validTypes := map[string]bool{"webhook": true, "slack": true, "email": true, "pagerduty": true}
-	if !validTypes[ch.Type] {
-		return nil, fmt.Errorf("invalid type: %s (must be webhook, slack, email, or pagerduty)", ch.Type)
-	}
-
-	ch.ID = uuid.New().String()
-	ch.CreatedAt = time.Now().UTC()
-
-	err := db.Conn.Exec(ctx, fmt.Sprintf(
-		"INSERT INTO %s.notification_channels (id, name, type, config, created_at) VALUES (?, ?, ?, ?, ?)",
-		db.Database,
-	), ch.ID, ch.Name, ch.Type, ch.Config, ch.CreatedAt)
-	if err != nil {
-		return nil, fmt.Errorf("failed to insert notification channel: %w", err)
-	}
-
-	return &ch, nil
-}
-
-// ListChannels returns all notification channels
-func ListChannels(ctx context.Context) ([]Channel, error) {
-	rows, err := db.Conn.Query(ctx, fmt.Sprintf(
-		"SELECT id, name, type, config, created_at FROM %s.notification_channels ORDER BY created_at DESC",
-		db.Database,
-	))
-	if err != nil {
-		return nil, fmt.Errorf("failed to list notification channels: %w", err)
-	}
-	defer rows.Close()
-
-	var channels []Channel
-	for rows.Next() {
-		var c Channel
-		if err := rows.Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.CreatedAt); err != nil {
-			return nil, fmt.Errorf("failed to scan notification channel: %w", err)
-		}
-		channels = append(channels, c)
-	}
-	return channels, nil
-}
-
-// GetChannel returns a notification channel by ID
-func GetChannel(ctx context.Context, id string) (*Channel, error) {
-	row := db.Conn.QueryRow(ctx, fmt.Sprintf(
-		"SELECT id, name, type, config, created_at FROM %s.notification_channels WHERE id = ?",
-		db.Database,
-	), id)
-
-	var c Channel
-	if err := row.Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.CreatedAt); err != nil {
-		return nil, fmt.Errorf("notification channel not found")
-	}
-	return &c, nil
-}
-
-// DeleteChannel removes a notification channel by ID
-func DeleteChannel(ctx context.Context, id string) error {
-	err := db.Conn.Exec(ctx, fmt.Sprintf(
-		"ALTER TABLE %s.notification_channels DELETE WHERE id = ?", db.Database,
-	), id)
-	if err != nil {
-		return fmt.Errorf("failed to delete notification channel: %w", err)
-	}
-	return nil
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
 )
@@ -99,7 +100,7 @@ func (e *Evaluator) Run(ctx context.Context) {
 }
 
 func (e *Evaluator) evaluateAll(ctx context.Context) {
-	rules, err := listEnabledRules(ctx)
+	rules, err := listEnabledRules()
 	if err != nil {
 		log.Printf("alert evaluator: failed to list rules: %v", err)
 		return
@@ -119,11 +120,11 @@ func (e *Evaluator) evaluateAll(ctx context.Context) {
 // EvaluateRuleNow evaluates a single rule and returns the current value and
 // whether it is firing (for the test endpoint). It branches on rule.Type just
 // like the live evaluator.
-func EvaluateRuleNow(ctx context.Context, rule *Rule) (value float64, isFiring bool, err error) {
+func EvaluateRuleNow(ctx context.Context, rule *structs.AlertRule) (value float64, isFiring bool, err error) {
 	return evaluateRuleState(ctx, rule)
 }
 
-func (e *Evaluator) evaluateRule(ctx context.Context, rule *Rule) {
+func (e *Evaluator) evaluateRule(ctx context.Context, rule *structs.AlertRule) {
 	value, isFiring, err := evaluateRuleState(ctx, rule)
 	if err != nil {
 		log.Printf("alert evaluator: failed to query rule %s (%s): %v", rule.ID, rule.Name, err)
@@ -204,7 +205,7 @@ func (e *Evaluator) evaluateRule(ctx context.Context, rule *Rule) {
 	_ = UpsertState(ctx, state)
 }
 
-func (e *Evaluator) onFiring(ctx context.Context, rule *Rule, state *State) {
+func (e *Evaluator) onFiring(ctx context.Context, rule *structs.AlertRule, state *State) {
 	now := time.Now().UTC()
 	state.LastNotifiedAt = &now
 
@@ -228,7 +229,7 @@ func (e *Evaluator) onFiring(ctx context.Context, rule *Rule, state *State) {
 	}
 }
 
-func (e *Evaluator) onResolved(ctx context.Context, rule *Rule, state *State) {
+func (e *Evaluator) onResolved(ctx context.Context, rule *structs.AlertRule, state *State) {
 	now := time.Now().UTC()
 	state.LastNotifiedAt = &now
 
@@ -254,7 +255,7 @@ func (e *Evaluator) onResolved(ctx context.Context, rule *Rule, state *State) {
 
 // evaluateRuleState computes a rule's current value and whether it is firing,
 // branching on rule.Type. The "value" recorded is type-dependent (see below).
-func evaluateRuleState(ctx context.Context, rule *Rule) (value float64, isFiring bool, err error) {
+func evaluateRuleState(ctx context.Context, rule *structs.AlertRule) (value float64, isFiring bool, err error) {
 	now := time.Now().UTC()
 	interval := time.Duration(rule.EvaluationIntervalSecs) * time.Second
 
@@ -300,7 +301,7 @@ func evaluateRuleState(ctx context.Context, rule *Rule) (value float64, isFiring
 }
 
 // parseRuleFilters decodes a rule's query_filters JSON array.
-func parseRuleFilters(rule *Rule) ([]structs.QueryFilter, error) {
+func parseRuleFilters(rule *structs.AlertRule) ([]structs.QueryFilter, error) {
 	var filters []structs.QueryFilter
 	if rule.QueryFilters != "" && rule.QueryFilters != "[]" {
 		if err := json.Unmarshal([]byte(rule.QueryFilters), &filters); err != nil {
@@ -318,7 +319,7 @@ func parseRuleFilters(rule *Rule) ([]structs.QueryFilter, error) {
 // difference, which no assertion about a returned float64 could show.
 //
 // aggExpr is a trusted, code-built expression; the rule's filters are bound.
-func buildAggQuery(ctx context.Context, rule *Rule, aggExpr string, from, to time.Time) (string, []interface{}, error) {
+func buildAggQuery(ctx context.Context, rule *structs.AlertRule, aggExpr string, from, to time.Time) (string, []interface{}, error) {
 	filters, err := parseRuleFilters(rule)
 	if err != nil {
 		return "", nil, err
@@ -368,7 +369,7 @@ func buildAggQuery(ctx context.Context, rule *Rule, aggExpr string, from, to tim
 // mandatory: the timer has no request to derive one from, the HTTP test endpoint
 // does, and the aggregate this returns is handed straight back to that endpoint's
 // caller.
-func queryAggForRange(ctx context.Context, rule *Rule, aggExpr string, from, to time.Time) (float64, error) {
+func queryAggForRange(ctx context.Context, rule *structs.AlertRule, aggExpr string, from, to time.Time) (float64, error) {
 	sql, args, err := buildAggQuery(ctx, rule, aggExpr, from, to)
 	if err != nil {
 		return 0, err
@@ -382,7 +383,7 @@ func queryAggForRange(ctx context.Context, rule *Rule, aggExpr string, from, to 
 }
 
 // queryValueForRange runs the rule's configured metric aggregation over [from,to].
-func queryValueForRange(ctx context.Context, rule *Rule, from, to time.Time) (float64, error) {
+func queryValueForRange(ctx context.Context, rule *structs.AlertRule, from, to time.Time) (float64, error) {
 	agg := structs.AggregationType(rule.Metric)
 	if agg == "" {
 		agg = structs.AggCount
@@ -396,7 +397,7 @@ func queryValueForRange(ctx context.Context, rule *Rule, from, to time.Time) (fl
 
 // queryCountForRange runs a COUNT over [from,to] regardless of the rule's metric
 // (used by absence alerts, which only care whether any matching event arrived).
-func queryCountForRange(ctx context.Context, rule *Rule, from, to time.Time) (float64, error) {
+func queryCountForRange(ctx context.Context, rule *structs.AlertRule, from, to time.Time) (float64, error) {
 	return queryAggForRange(ctx, rule, "toFloat64(count())", from, to)
 }
 
@@ -505,25 +506,20 @@ func CheckCondition(value float64, condition string, threshold float64) bool {
 	}
 }
 
-func listEnabledRules(ctx context.Context) ([]Rule, error) {
-	rows, err := db.Conn.Query(ctx, fmt.Sprintf(
-		"SELECT id, name, description, type, priority, query_filters, metric, field, condition, threshold, evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at FROM %s.alert_rules FINAL WHERE enabled = 1",
-		db.Database,
-	))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var rules []Rule
-	for rows.Next() {
-		var r Rule
-		var enabled uint8
-		if err := rows.Scan(&r.ID, &r.Name, &r.Description, &r.Type, &r.Priority, &r.QueryFilters, &r.Metric, &r.Field, &r.Condition, &r.Threshold, &r.EvaluationIntervalSecs, &r.ForSeconds, &r.CooldownSeconds, &r.NotificationChannelIDs, &enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
-			return nil, err
-		}
-		r.Enabled = enabled == 1
-		rules = append(rules, r)
-	}
-	return rules, nil
+// listEnabledRules reads the rules the evaluator should run.
+//
+// It is a MariaDB read now (migration 119), so it no longer takes a context: the
+// query layer's signature is db.Queryable-first and carries none, matching every
+// other relational read in the repo. The wrapper is kept rather than inlined at
+// the one call site because it is the seam a future project-scoped evaluator
+// changes — see the KNOWN GAP header above.
+//
+// The `FINAL` that used to be on this statement is gone with the engine that
+// needed it. It was there because a ReplacingMergeTree can hold several versions
+// of one rule until a background merge collapses them, so a read without it
+// could return a rule as enabled after it had been disabled — a disabled rule
+// that kept firing until ClickHouse got around to merging. There is one row per
+// rule now.
+func listEnabledRules() ([]structs.AlertRule, error) {
+	return query.ListEnabledAlertRules(db.SQL)
 }

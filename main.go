@@ -14,18 +14,15 @@ import (
 	"github.com/aidenappl/monitor-core/alerts"
 	"github.com/aidenappl/monitor-core/apikeys"
 	"github.com/aidenappl/monitor-core/bootstrap"
-	"github.com/aidenappl/monitor-core/dashboards"
+	"github.com/aidenappl/monitor-core/cutover"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/issues"
-	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/migrations"
 	"github.com/aidenappl/monitor-core/registry"
 	"github.com/aidenappl/monitor-core/routes"
 	"github.com/aidenappl/monitor-core/services"
 	"github.com/aidenappl/monitor-core/sso"
-	"github.com/aidenappl/monitor-core/views"
-	"github.com/gorilla/mux"
 	"github.com/rs/cors"
 )
 
@@ -46,6 +43,24 @@ func main() {
 	// Load configuration (picks up any values injected by Keyring above).
 	env.Load()
 
+	// Settle which plane this process is before anything reads the answer. An
+	// unrecognised MON_ROLE stops the boot rather than degrading to the default —
+	// see env.RequireValidRole for why a silent fallback here would quietly stand
+	// up a second control plane on a machine meant to be a zone.
+	if err := env.RequireValidRole(); err != nil {
+		log.Fatalf("FATAL: %v", err)
+	}
+
+	// Announce the role once, at the very top of the boot log, for the same
+	// reason migrations.RunMigrations names the database it migrated: an operator
+	// holding nothing but a container's logs must be able to answer "which plane
+	// does this process think it is?". Printed BEFORE the first fatal below, so a
+	// process that dies during startup still says what it was trying to be — and
+	// printed unconditionally, including for `both`, so running as `both` is a
+	// state someone can see rather than the absence of a signal.
+	log.Printf("monitor-core role: %s (control plane: %t, data plane: %t)",
+		env.MonRole, env.MonRole.RunsControlPlane(), env.MonRole.RunsDataPlane())
+
 	if env.IngestKey == "" {
 		log.Fatal("FATAL: MONITOR_API_KEY must be set — refusing to start without ingest authentication")
 	}
@@ -58,47 +73,67 @@ func main() {
 	}
 
 	// Handle shutdown signals
+	// Non-nil when the Phase 2 configuration cutover has not been run. Set below,
+	// read by the evaluator gate and reported by /health and /ready.
+	var configCutoverPending error
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Connect to ClickHouse
-	if err := db.Connect(ctx, env.ClickHouseAddr, env.ClickHouseDatabase, env.ClickHouseUsername, env.ClickHousePassword, env.ClickHouseMaxMemoryUsage); err != nil {
-		log.Fatalf("❌ failed to connect to ClickHouse: %v", err)
-	}
-	defer db.Close()
-
-	// Apply the ClickHouse schema migrations (events + api_keys) at startup.
-	// Ingestion and queries depend on the events table existing, so this is
-	// fail-fast — a fresh deploy no longer needs a manual `dev migrate` step.
-	// The runner rewrites the DDL to env.ClickHouseDatabase, so it migrates the
-	// same database the serving path reads and writes.
-	if err := migrations.RunMigrations(ctx); err != nil {
-		log.Fatalf("❌ failed to run ClickHouse migrations: %v", err)
-	}
-
-	// Then prove it. Every failure mode of the above — a half-applied file, a
-	// grant that covers CREATE but not SELECT, a rewrite that lands somewhere
-	// unexpected — otherwise produces a process that boots green, accepts events
-	// and loses all of them, because nothing on the serving path reads the
-	// schema until the first write. One cheap read against the table ingestion
-	// depends on turns that into a crash-loop, which is at least visible.
+	// ---- ClickHouse: DATA PLANE ONLY -----------------------------------------
 	//
-	// Retried, unlike the assertion it makes: db.Connect and db.InitSQL both
-	// retry, and a probe that crash-loops the container on one dropped
-	// connection would be a worse failure than the one it guards against. Three
-	// quick attempts separate "the schema is wrong" — which never recovers and
-	// should stop the boot — from "the connection blipped", which does.
-	probeQuery := fmt.Sprintf("SELECT count() FROM %s.events WHERE 1 = 0", db.Database)
-	var probeErr error
-	for attempt := 1; attempt <= 3; attempt++ {
-		if probeErr = db.Conn.Exec(ctx, probeQuery); probeErr == nil {
-			break
+	// An app process holds NO ClickHouse connection. db.Conn stays nil, and that
+	// is the enforcement rather than a side effect: db.Conn is an interface, so a
+	// nil one panics on the first method call instead of returning a zero value,
+	// and there is no arrangement of this code in which a control plane quietly
+	// reads or writes the event store. Nothing in an app process should reach it
+	// — buildRouter registers no route that touches it, and none of the
+	// goroutines below start — so the panic is a backstop for a mistake, not a
+	// path anything is expected to take. router_test.go pins both halves.
+	//
+	// Do not "harden" this by returning an error from the nil case. Degrading to
+	// an error is how a plane ends up serving empty results that look like an
+	// empty database; the panic is the loud failure that is wanted here.
+	if env.MonRole.RunsDataPlane() {
+		// Connect to ClickHouse
+		if err := db.Connect(ctx, env.ClickHouseAddr, env.ClickHouseDatabase, env.ClickHouseUsername, env.ClickHousePassword, env.ClickHouseMaxMemoryUsage); err != nil {
+			log.Fatalf("❌ failed to connect to ClickHouse: %v", err)
 		}
-		log.Printf("attempt %d/3: %s.events not readable yet: %v", attempt, db.Database, probeErr)
-		time.Sleep(time.Duration(attempt) * time.Second)
-	}
-	if probeErr != nil {
-		log.Fatalf("❌ ClickHouse table %s.events is not readable after migrations — refusing to start and silently drop events: %v", db.Database, probeErr)
+		defer db.Close()
+
+		// Apply the ClickHouse schema migrations (events + api_keys) at startup.
+		// Ingestion and queries depend on the events table existing, so this is
+		// fail-fast — a fresh deploy no longer needs a manual `dev migrate` step.
+		// The runner rewrites the DDL to env.ClickHouseDatabase, so it migrates the
+		// same database the serving path reads and writes.
+		if err := migrations.RunMigrations(ctx); err != nil {
+			log.Fatalf("❌ failed to run ClickHouse migrations: %v", err)
+		}
+
+		// Then prove it. Every failure mode of the above — a half-applied file, a
+		// grant that covers CREATE but not SELECT, a rewrite that lands somewhere
+		// unexpected — otherwise produces a process that boots green, accepts events
+		// and loses all of them, because nothing on the serving path reads the
+		// schema until the first write. One cheap read against the table ingestion
+		// depends on turns that into a crash-loop, which is at least visible.
+		//
+		// Retried, unlike the assertion it makes: db.Connect and db.InitSQL both
+		// retry, and a probe that crash-loops the container on one dropped
+		// connection would be a worse failure than the one it guards against. Three
+		// quick attempts separate "the schema is wrong" — which never recovers and
+		// should stop the boot — from "the connection blipped", which does.
+		probeQuery := fmt.Sprintf("SELECT count() FROM %s.events WHERE 1 = 0", db.Database)
+		var probeErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			if probeErr = db.Conn.Exec(ctx, probeQuery); probeErr == nil {
+				break
+			}
+			log.Printf("attempt %d/3: %s.events not readable yet: %v", attempt, db.Database, probeErr)
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+		if probeErr != nil {
+			log.Fatalf("❌ ClickHouse table %s.events is not readable after migrations — refusing to start and silently drop events: %v", db.Database, probeErr)
+		}
 	}
 
 	// Connect to MariaDB (relational auth data layer: users, identities,
@@ -119,6 +154,14 @@ func main() {
 	// subcommand rather than a boot step because it is a one-time cutover, not
 	// part of normal startup. Safe to re-run — see issues.BackfillFromClickHouse.
 	if len(os.Args) > 1 && os.Args[1] == "backfill-issues" {
+		// It reads the legacy ClickHouse table, so it needs the connection the
+		// block above only opens on the data plane. Refused with the reason rather
+		// than run into a nil-Conn panic, because the operator invoking this by
+		// hand deserves to be told which knob is wrong.
+		if !env.MonRole.RunsDataPlane() {
+			log.Fatalf("❌ backfill-issues reads ClickHouse, which %s=%s does not connect to — re-run it with %s=%s or %s=%s",
+				env.ROLE_ENV_VAR, env.MonRole, env.ROLE_ENV_VAR, env.RoleZone, env.ROLE_ENV_VAR, env.RoleBoth)
+		}
 		copied, err := issues.BackfillFromClickHouse(ctx)
 		if err != nil {
 			log.Fatalf("❌ backfill failed after %d issue(s): %v", copied, err)
@@ -127,25 +170,94 @@ func main() {
 		return
 	}
 
-	// Seed the first admin user on a fresh database (no-op once any user exists).
-	if err := bootstrap.EnsureAdminUser(db.SQL); err != nil {
-		log.Fatalf("❌ failed to bootstrap admin user: %v", err)
+	// `monitor-core backfill-config` copies the six configuration tables that
+	// moved to MariaDB in migrations 119-124 — alert_rules,
+	// notification_channels, notification_policies, service_groups, dashboards
+	// and saved_views — out of the legacy ClickHouse tables, then exits without
+	// serving. Same shape as backfill-issues above and for the same reasons:
+	// after both migration runners so the destination exists, and a subcommand
+	// rather than a boot step because it is a cutover.
+	//
+	// ORDER IS LOAD-BEARING ON THE CUTOVER DEPLOY. The new binary reads these
+	// tables from MariaDB, so this must run BEFORE it serves. Started first, the
+	// new binary finds an empty alert_rules and the evaluator quietly has nothing
+	// to evaluate — no error, no alert, just silence — and alerts.Init seeds four
+	// default notification policies that this then appends four more behind,
+	// leaving a routing list with duplicates in it. Neither failure raises
+	// anything. AGENTS.md §8 carries the full sequence and the recovery.
+	//
+	// Safe to re-run: a row whose id is already in MariaDB is skipped, never
+	// overwritten. See cutover.BackfillConfig.
+	if len(os.Args) > 1 && os.Args[1] == "backfill-config" {
+		// Reads the legacy ClickHouse tables, so it needs the connection only the
+		// data plane opens — refused with the reason rather than run into a
+		// nil-Conn panic, exactly as backfill-issues is.
+		if !env.MonRole.RunsDataPlane() {
+			log.Fatalf("❌ backfill-config reads ClickHouse, which %s=%s does not connect to — re-run it with %s=%s or %s=%s",
+				env.ROLE_ENV_VAR, env.MonRole, env.ROLE_ENV_VAR, env.RoleZone, env.ROLE_ENV_VAR, env.RoleBoth)
+		}
+		// `backfill-config --dry-run` reads, validates and reports without writing
+		// a row or stamping the marker. Worth running first every time: it is the
+		// only way to see which rows would be REFUSED — a duplicate name against
+		// the new UNIQUE keys, an empty enum — before the real run stops halfway
+		// through a hand-run cutover on a deploy that has alerting switched off.
+		cutover.DryRun = len(os.Args) > 2 && os.Args[2] == "--dry-run"
+		if cutover.DryRun {
+			log.Printf("🔍 DRY RUN — reading and validating only, nothing will be written")
+		}
+
+		reports, err := cutover.BackfillConfig(ctx)
+		for _, report := range reports {
+			log.Printf("   %-32s copied %d, skipped %d", report.Table, report.Copied, report.Skipped)
+		}
+		if err != nil {
+			log.Fatalf("❌ config backfill failed: %v", err)
+		}
+		if cutover.DryRun {
+			log.Printf("✅ dry run clean — re-run without --dry-run to apply")
+		} else {
+			log.Printf("✅ configuration backfill complete")
+		}
+		return
 	}
 
-	// Seed the single zone and its default project (no-op once both rows exist).
-	// Fail-fast rather than degraded: the default project is what api_keys bind
-	// to and what the env master key stamps events with, so a Monitor without it
-	// would ingest happily with a null tenant on every row — the state that is
-	// hardest to notice and impossible to reattribute afterwards.
-	if err := bootstrap.EnsureZoneAndProject(db.SQL); err != nil {
-		log.Fatalf("❌ failed to bootstrap the tenancy registry: %v", err)
+	// ---- Identity and configuration: CONTROL PLANE ONLY ----------------------
+	//
+	// Seeding is an act of ownership. A zone that ran these would mint its own
+	// admin account and its own zone row — the second copy of exactly the two
+	// things there is meant to be one of — and would then diverge from the
+	// control plane's registry silently, because nothing compares them. A zone
+	// gets its identity and its tenancy rows from the control plane; the
+	// mechanism for that (a config pull) is deliberately not built yet, so today
+	// a zone-only process expects those rows to be present already.
+	if env.MonRole.RunsControlPlane() {
+		// Seed the first admin user on a fresh database (no-op once any user exists).
+		if err := bootstrap.EnsureAdminUser(db.SQL); err != nil {
+			log.Fatalf("❌ failed to bootstrap admin user: %v", err)
+		}
+
+		// Seed the single zone and its default project (no-op once both rows exist).
+		// Fail-fast rather than degraded: the default project is what api_keys bind
+		// to and what the env master key stamps events with, so a Monitor without it
+		// would ingest happily with a null tenant on every row — the state that is
+		// hardest to notice and impossible to reattribute afterwards.
+		if err := bootstrap.EnsureZoneAndProject(db.SQL); err != nil {
+			log.Fatalf("❌ failed to bootstrap the tenancy registry: %v", err)
+		}
+
+		// Wire the SSO revocation checkpoint into SessionMiddleware. Until this runs
+		// the hook is nil and the checkpoint is skipped.
+		//
+		// Skipped on a zone because a zone serves no SSO surface at all — no
+		// provider CRUD, no callback, no back-channel logout. The checkpoint is an
+		// outbound introspection against a provider row this plane does not own.
+		sso.Install()
 	}
 
-	// Wire the SSO revocation checkpoint into SessionMiddleware. Until this runs
-	// the hook is nil and the checkpoint is skipped.
-	sso.Install()
-
-	// Initialize API key management (loads the key cache from MariaDB)
+	// Initialize API key management (loads the key cache from MariaDB).
+	//
+	// EVERY role. A zone authenticates ingest against this cache, and the control
+	// plane serves the management surface from it, so neither can go without.
 	if err := apikeys.Init(ctx); err != nil {
 		log.Printf("WARNING: failed to initialize api keys: %v", err)
 	}
@@ -163,215 +275,126 @@ func main() {
 		log.Printf("WARNING: failed to initialize the tenancy registry cache: %v", err)
 	}
 
-	// Initialize dashboards
-	if err := dashboards.Init(ctx); err != nil {
-		log.Printf("WARNING: failed to initialize dashboards: %v", err)
-	}
-
-	// Initialize saved views
-	if err := views.Init(ctx); err != nil {
-		log.Printf("WARNING: failed to initialize views: %v", err)
-	}
-
-	// Initialize alerts
-	if err := alerts.Init(ctx); err != nil {
-		log.Printf("WARNING: failed to initialize alerts: %v", err)
-	}
-
-	// Initialize issues
-	if err := issues.Init(ctx); err != nil {
-		log.Printf("WARNING: failed to initialize issues: %v", err)
-	}
-
-	// Create SSE hub
-	hub := services.NewHub(env.MaxSSESubscribers)
-	routes.EventHub = hub
-
-	// Create event queue
-	queue := services.NewQueue(env.QueueSize)
-	routes.Queue = queue
-
-	// Create and start batcher
-	writer := &db.Writer{}
-	batcher := services.NewBatcher(queue, writer, env.BatchSize, env.FlushInterval)
-	routes.Batcher = batcher
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("PANIC in batcher: %v", r)
-			}
-		}()
-		batcher.Run(ctx)
-	}()
-
-	// Create alert notification hub for SSE streaming
-	alertHub := alerts.NewAlertHub(env.MaxSSESubscribers)
-	routes.AlertNotifHub = alertHub
-
-	// Start alert evaluator
-	evaluator := alerts.NewEvaluator(alertHub)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("PANIC in alert evaluator: %v", r)
-			}
-		}()
-		evaluator.Run(ctx)
-	}()
-
-	// Setup router
-	r := mux.NewRouter()
-	r.Use(middleware.RequestIDMiddleware)
-	r.Use(middleware.LoggingMiddleware)
-	r.Use(middleware.MuxHeaderMiddleware)
-	// Double-submit CSRF for cookie-authenticated browsers. Safe methods, Bearer
-	// clients, and X-Api-Key clients (ingestion) are exempt, so this does not
-	// affect the go-monitor ingest path or API-key query callers.
-	r.Use(middleware.CSRFMiddleware)
-
-	// Liveness vs readiness. /health always answers 200 — the container
-	// HEALTHCHECK points at it, and restarting the process does not repair a
-	// dead ClickHouse. /ready answers 503 naming the store that is down, so a
-	// load balancer can route around a replica that would only drop what it
-	// accepts. Do not "fix" /health to fail on dependencies; that is /ready.
-	r.HandleFunc("/health", routes.HealthHandler).Methods(http.MethodGet)
-	r.HandleFunc("/ready", routes.ReadyHandler).Methods(http.MethodGet)
-
-	// Native session auth (Monitor-owned JWT). External IdPs are config rows,
-	// mounted below via RegisterSSORoutes.
-	//   /auth/login, /auth/register — public, CSRF-exempt (no session yet).
-	//   /auth/refresh — public, CSRF-exempt (authenticates via the refresh cookie).
-	//   /auth/logout, /auth/self* — behind SessionMiddleware.
-	r.HandleFunc("/auth/login", routes.HandleLogin).Methods(http.MethodPost)
-	if env.AllowRegistration {
-		r.HandleFunc("/auth/register", routes.HandleRegister).Methods(http.MethodPost)
-	}
-	r.HandleFunc("/auth/refresh", routes.HandleRefresh).Methods(http.MethodPost)
-	r.HandleFunc("/auth/logout", middleware.Protected(routes.HandleLogout)).Methods(http.MethodPost)
-
-	// Current-user profile + linked sign-in methods (all Protected).
-	r.HandleFunc("/auth/self", middleware.Protected(routes.HandleGetSelf)).Methods(http.MethodGet)
-	r.HandleFunc("/auth/self", middleware.Protected(routes.HandleUpdateSelf)).Methods(http.MethodPut)
-	r.HandleFunc("/auth/self/identities", middleware.Protected(routes.HandleListIdentities)).Methods(http.MethodGet)
-	r.HandleFunc("/auth/self/identities/{slug}", middleware.Protected(routes.HandleLinkIdentity)).Methods(http.MethodPost)
-	r.HandleFunc("/auth/self/identities/{slug}", middleware.Protected(routes.HandleUnlinkIdentity)).Methods(http.MethodDelete)
-
-	// Pluggable SSO subsystem (Phase 3A): /auth/sso/config, /auth/sso/{slug}/login,
-	// /auth/sso/{slug}/callback, and the /admin/sso-providers CRUD.
-	routes.RegisterSSORoutes(r)
-
-	// Event ingestion — authenticated by X-Api-Key (used by go-monitor)
-	r.HandleFunc("/v1/events", middleware.IngestAuthMiddleware(routes.IngestEventsHandler)).Methods(http.MethodPost)
-
-	// GitHub webhook — deliberately on the ROOT router, not the v1 subrouter, so
-	// QueryAuthMiddleware does not run on it: GitHub cannot present an API key or
-	// a session. Its authentication is the HMAC-SHA256 signature over the body
-	// (github.VerifySignature), and it is CSRF-exempt for the same reason.
-	r.HandleFunc("/webhooks/github", routes.HandleGitHubWebhook).Methods(http.MethodPost)
-
-	// V1 API routes — protected by API key or a Monitor session
-	v1 := r.PathPrefix("/v1").Subrouter()
-	v1.Use(middleware.QueryAuthMiddleware)
-
-	// Tenancy registry reads. These are what the project switcher in monitor-web
-	// populates from, and they are READS ONLY — the registry is seeded by
-	// bootstrap.EnsureZoneAndProject and managed out of band in this phase.
+	// ---- Event machinery: DATA PLANE ONLY ------------------------------------
 	//
-	// Clients must not send the ?project selector to either: both run through
-	// QueryAuthMiddleware, so a stale selection would refuse the exact request
-	// needed to discover a valid one.
-	v1.HandleFunc("/zones", routes.HandleListZones).Methods(http.MethodGet)
-	v1.HandleFunc("/zones/{zone}/projects", routes.HandleListProjects).Methods(http.MethodGet)
+	// The three Init calls below create ClickHouse tables and would panic on a
+	// nil db.Conn; the hubs, queue, batcher and evaluator are the ingest and
+	// alerting pipeline, which a control plane has no business running. Their
+	// globals (routes.EventHub, routes.Queue, routes.Batcher,
+	// routes.AlertNotifHub) stay nil in an app process — buildRouter registers no
+	// route that reads them, and HealthHandler is written to tolerate a nil Queue
+	// for exactly this reason.
+	//
+	// issues.Init is here rather than beside the MariaDB work it actually writes
+	// to: it starts the error-tracking worker pool, and the only thing that ever
+	// feeds that pool is ingestion. Workers with no producer are not harmful,
+	// just dishonest about what the process does.
+	var queue *services.Queue
+	if env.MonRole.RunsDataPlane() {
+		// Refuse to serve with the alerting configuration still stranded in
+		// ClickHouse. Migrations 119-124 create the six MariaDB tables EMPTY, and
+		// every read below now goes to them, so a process that starts before
+		// `backfill-config` has run finds no rules and no policies and reports
+		// nothing at all about it: listEnabledRules returns an empty slice with a
+		// nil error, and the evaluator's loop simply has no work.
+		//
+		// FIRST IN THIS BLOCK, before alerts.Init, and that ordering is the point.
+		// alerts.Init seeds four default notification policies into an empty
+		// table; the backfill would then append the four ClickHouse originals
+		// behind them, leaving eight policies of which four match every alert by
+		// priority and route it nowhere. Refusing here means that state is never
+		// created, rather than created and then explained in a runbook.
+		//
+		// See cutover.RequireConfigBackfill for why this is a crash-loop rather
+		// than a warning, and why it can only fire once — it is gated on a marker
+		// the backfill stamps, so deleting your last alert rule after the cutover
+		// can never bring it back.
+		//
+		// DEGRADED, NOT FATAL — and the difference matters more than it looks.
+		// A log.Fatalf here crash-loops the container, and CI deploys this image
+		// automatically on every push to main, so the DEFAULT path would take
+		// ingestion down until an operator noticed and ran the cutover by hand.
+		// That trades a rare silent failure for a common loud outage, in the one
+		// system whose job is to still be recording when everything else breaks.
+		//
+		// So: refuse to EVALUATE (the thing that would be silently wrong), keep
+		// ingesting (the thing that must never stop), and make the state
+		// unmissable — a startup banner, /health, and a 503 on /ready. This is
+		// exactly the liveness/readiness split those two endpoints exist for:
+		// Docker keeps the container up because the process is fine, while a load
+		// balancer and an operator both see that it is not fully functional.
+		if err := cutover.RequireConfigBackfill(ctx); err != nil {
+			configCutoverPending = err
+			log.Printf("⚠️  ALERTING IS DISABLED: %v", err)
+			log.Printf("⚠️  Ingest, queries and issues are unaffected. Run `monitor-core backfill-config`, then restart this process.")
+			routes.AlertingDisabledReason = err.Error()
+		}
 
-	// Service → source-repository mapping. Monitor watches services across more
-	// than one GitHub org, and several service versions share one repo, so this
-	// is explicit configuration rather than anything derived from the name.
-	v1.HandleFunc("/service-repos", routes.HandleListServiceRepos).Methods(http.MethodGet)
-	v1.HandleFunc("/service-repos/{service}", routes.HandleGetServiceRepo).Methods(http.MethodGet)
-	v1.HandleFunc("/service-repos/{service}", routes.HandleUpsertServiceRepo).Methods(http.MethodPut)
-	v1.HandleFunc("/service-repos/{service}", routes.HandleDeleteServiceRepo).Methods(http.MethodDelete)
+		// dashboards.Init and views.Init are GONE, not omitted: migrations 123
+		// and 124 create those tables, so there is nothing left for a boot-time
+		// CREATE TABLE to do. Both packages are now empty and say so.
+		//
+		// alerts.Init survives because two of its eight tables did not move —
+		// alert_states and alert_history are still ClickHouse, still created
+		// here, and alert_history's 90-day TTL is the reason (migration 119). It
+		// also seeds the default notification policies into MariaDB, which stays
+		// on this plane rather than moving to bootstrap/ so that the set of
+		// processes creating those four rows is unchanged.
+		if err := alerts.Init(ctx); err != nil {
+			log.Printf("WARNING: failed to initialize alerts: %v", err)
+		}
 
-	v1.HandleFunc("/events", routes.QueryEventsHandler).Methods(http.MethodGet)
-	v1.HandleFunc("/events/stream", routes.StreamEventsHandler).Methods(http.MethodGet)
-	v1.HandleFunc("/labels/{label}/values", routes.GetLabelValuesHandler).Methods(http.MethodGet)
-	v1.HandleFunc("/data/keys", routes.GetDataKeysHandler).Methods(http.MethodGet)
-	v1.HandleFunc("/data/values", routes.GetDataValuesHandler).Methods(http.MethodGet)
+		// Initialize issues
+		if err := issues.Init(ctx); err != nil {
+			log.Printf("WARNING: failed to initialize issues: %v", err)
+		}
 
-	// Analytics routes (Grafana-compatible)
-	v1.HandleFunc("/analytics", routes.AnalyticsHandler).Methods(http.MethodPost)
-	v1.HandleFunc("/analytics", routes.AnalyticsQueryHandler).Methods(http.MethodGet)
-	v1.HandleFunc("/timeseries", routes.TimeSeriesHandler).Methods(http.MethodPost)
-	v1.HandleFunc("/timeseries", routes.TimeSeriesQueryHandler).Methods(http.MethodGet)
-	v1.HandleFunc("/topn", routes.TopNHandler).Methods(http.MethodPost)
-	v1.HandleFunc("/gauge", routes.GaugeHandler).Methods(http.MethodPost)
-	v1.HandleFunc("/compare", routes.CompareHandler).Methods(http.MethodPost)
+		// Create SSE hub
+		hub := services.NewHub(env.MaxSSESubscribers)
+		routes.EventHub = hub
 
-	// API key management — protected by the session/API-key middleware (admin UI)
-	v1.HandleFunc("/api-keys", routes.HandleListAPIKeys).Methods(http.MethodGet)
-	v1.HandleFunc("/api-keys", routes.HandleCreateAPIKey).Methods(http.MethodPost)
-	v1.HandleFunc("/api-keys/{id}", routes.HandleDeleteAPIKey).Methods(http.MethodDelete)
+		// Create event queue
+		queue = services.NewQueue(env.QueueSize)
+		routes.Queue = queue
 
-	// Dashboard persistence
-	v1.HandleFunc("/dashboards", routes.HandleListDashboards).Methods(http.MethodGet)
-	v1.HandleFunc("/dashboards", routes.HandleCreateDashboard).Methods(http.MethodPost)
-	v1.HandleFunc("/dashboards/{id}", routes.HandleGetDashboard).Methods(http.MethodGet)
-	v1.HandleFunc("/dashboards/{id}", routes.HandleUpdateDashboard).Methods(http.MethodPut)
-	v1.HandleFunc("/dashboards/{id}", routes.HandleDeleteDashboard).Methods(http.MethodDelete)
+		// Create and start batcher
+		writer := &db.Writer{}
+		batcher := services.NewBatcher(queue, writer, env.BatchSize, env.FlushInterval)
+		routes.Batcher = batcher
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("PANIC in batcher: %v", r)
+				}
+			}()
+			batcher.Run(ctx)
+		}()
 
-	// Saved views
-	v1.HandleFunc("/views", routes.HandleListViews).Methods(http.MethodGet)
-	v1.HandleFunc("/views", routes.HandleCreateView).Methods(http.MethodPost)
-	v1.HandleFunc("/views/{id}", routes.HandleDeleteView).Methods(http.MethodDelete)
+		// Create alert notification hub for SSE streaming
+		alertHub := alerts.NewAlertHub(env.MaxSSESubscribers)
+		routes.AlertNotifHub = alertHub
 
-	// Alert rules
-	v1.HandleFunc("/alert-rules", routes.HandleListAlertRules).Methods(http.MethodGet)
-	v1.HandleFunc("/alert-rules", routes.HandleCreateAlertRule).Methods(http.MethodPost)
-	v1.HandleFunc("/alert-rules/{id}", routes.HandleGetAlertRule).Methods(http.MethodGet)
-	v1.HandleFunc("/alert-rules/{id}", routes.HandleUpdateAlertRule).Methods(http.MethodPut)
-	v1.HandleFunc("/alert-rules/{id}", routes.HandleDeleteAlertRule).Methods(http.MethodDelete)
-	v1.HandleFunc("/alert-rules/{id}/test", routes.HandleTestAlertRule).Methods(http.MethodPost)
+		// Start alert evaluator — unless the configuration cutover is outstanding,
+		// in which case its rule table is empty and every evaluation would decide
+		// "nothing is wrong" from an empty slice, with no error and no log line.
+		// Not starting it at all is the honest state: alerting is off, and the
+		// banner above plus /health and /ready all say so.
+		if configCutoverPending == nil {
+			evaluator := alerts.NewEvaluator(alertHub)
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("PANIC in alert evaluator: %v", r)
+					}
+				}()
+				evaluator.Run(ctx)
+			}()
+		}
+	}
 
-	// Alert history
-	v1.HandleFunc("/alert-history", routes.HandleListAlertHistory).Methods(http.MethodGet)
-
-	// Notification channels
-	v1.HandleFunc("/notification-channels", routes.HandleListNotificationChannels).Methods(http.MethodGet)
-	v1.HandleFunc("/notification-channels", routes.HandleCreateNotificationChannel).Methods(http.MethodPost)
-	v1.HandleFunc("/notification-channels/{id}", routes.HandleDeleteNotificationChannel).Methods(http.MethodDelete)
-	v1.HandleFunc("/notification-channels/{id}/test", routes.HandleTestNotificationChannel).Methods(http.MethodPost)
-
-	// Service groups
-	v1.HandleFunc("/service-groups", routes.HandleListServiceGroups).Methods(http.MethodGet)
-	v1.HandleFunc("/service-groups", routes.HandleCreateServiceGroup).Methods(http.MethodPost)
-	v1.HandleFunc("/service-groups/{id}", routes.HandleUpdateServiceGroup).Methods(http.MethodPut)
-	v1.HandleFunc("/service-groups/{id}", routes.HandleDeleteServiceGroup).Methods(http.MethodDelete)
-
-	// Notification policies (routing rules)
-	v1.HandleFunc("/notification-policies", routes.HandleListPolicies).Methods(http.MethodGet)
-	v1.HandleFunc("/notification-policies", routes.HandleCreatePolicy).Methods(http.MethodPost)
-	v1.HandleFunc("/notification-policies/reorder", routes.HandleReorderPolicies).Methods(http.MethodPut)
-	v1.HandleFunc("/notification-policies/{id}", routes.HandleGetPolicy).Methods(http.MethodGet)
-	v1.HandleFunc("/notification-policies/{id}", routes.HandleUpdatePolicy).Methods(http.MethodPut)
-	v1.HandleFunc("/notification-policies/{id}", routes.HandleDeletePolicy).Methods(http.MethodDelete)
-
-	// Alert notification stream (SSE for web/desktop notifications)
-	v1.HandleFunc("/alerts/stream", routes.HandleStreamAlerts).Methods(http.MethodGet)
-
-	// Issue tracking
-	v1.HandleFunc("/issues", routes.HandleListIssues).Methods(http.MethodGet)
-	v1.HandleFunc("/issues/{id}", routes.HandleGetIssue).Methods(http.MethodGet)
-	v1.HandleFunc("/issues/{id}", routes.HandleUpdateIssue).Methods(http.MethodPut)
-	v1.HandleFunc("/issues/{id}/events", routes.HandleGetIssueEvents).Methods(http.MethodGet)
-	// Timeline, comments and links. The comment path is how agents leave notes as
-	// they work; every write here records its actor.
-	v1.HandleFunc("/issues/{id}/timeline", routes.HandleGetIssueTimeline).Methods(http.MethodGet)
-	v1.HandleFunc("/issues/{id}/history", routes.HandleGetIssueHistory).Methods(http.MethodGet)
-	v1.HandleFunc("/issues/{id}/comments", routes.HandleAddIssueComment).Methods(http.MethodPost)
-	v1.HandleFunc("/issues/{id}/comments/{commentID}", routes.HandleEditIssueComment).Methods(http.MethodPatch)
-	v1.HandleFunc("/issues/{id}/comments/{commentID}", routes.HandleDeleteIssueComment).Methods(http.MethodDelete)
-	v1.HandleFunc("/issues/{id}/links", routes.HandleListIssueLinks).Methods(http.MethodGet)
-	v1.HandleFunc("/issues/{id}/links", routes.HandleCreateIssueLink).Methods(http.MethodPost)
-	v1.HandleFunc("/issues/{id}/links/{linkID}", routes.HandleDeleteIssueLink).Methods(http.MethodDelete)
+	// Setup router. The role decides which routes exist at all — see
+	// buildRouter in router.go.
+	r := buildRouter(env.MonRole)
 
 	// CORS Middleware
 	corsMiddleware := cors.New(cors.Options{
@@ -389,7 +412,7 @@ func main() {
 	})
 
 	// Launch Server
-	fmt.Printf("✅ monitor-core running on port %s\n", env.Port)
+	fmt.Printf("✅ monitor-core running on port %s (role: %s)\n", env.Port, env.MonRole)
 	fmt.Println()
 
 	server := &http.Server{
@@ -419,7 +442,13 @@ func main() {
 	}
 
 	cancel()
-	queue.Close()
+	// Nil in an app process, which creates no queue. The sleep that follows is
+	// the batcher's window to drain what the close released, and there is no
+	// batcher either — but it costs two seconds on a shutdown path and removing
+	// it for one role would be a second thing to keep in step for no gain.
+	if queue != nil {
+		queue.Close()
+	}
 	time.Sleep(2 * time.Second)
 
 	log.Println("shutdown complete")

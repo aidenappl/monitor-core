@@ -2,6 +2,9 @@ package routes
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -121,5 +124,54 @@ func TestCachedPingDependencies_ConcurrentCallersAreSafe(t *testing.T) {
 
 	if checking {
 		t.Error("probe latch left set after all callers returned; a later refresh would never run")
+	}
+}
+
+// TestReadyReportsDisabledAlerting pins the Phase 2 degraded state.
+//
+// The configuration cutover guard deliberately does NOT crash-loop: CI deploys
+// this image automatically, so a fatal guard would take INGESTION down on the
+// default path — trading a rare silent failure for a common loud outage in the
+// one system whose job is to still be recording when everything else breaks.
+//
+// Degrading is only defensible if the degraded state is visible, so that
+// visibility is asserted rather than assumed: /ready must fail and must name
+// alerting, while /health keeps returning 200 so Docker does not restart a
+// process that is running correctly.
+func TestReadyReportsDisabledAlerting(t *testing.T) {
+	resetDependencyProbe()
+	previous := AlertingDisabledReason
+	AlertingDisabledReason = "the configuration cutover has not been run"
+	t.Cleanup(func() {
+		AlertingDisabledReason = previous
+		resetDependencyProbe()
+	})
+
+	rec := httptest.NewRecorder()
+	ReadyHandler(rec, httptest.NewRequest(http.MethodGet, "/ready", nil))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("/ready = %d, want 503 — a process that cannot alert must not read as ready", rec.Code)
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode /ready body: %v", err)
+	}
+	if body["alerting_ok"] != false {
+		t.Errorf("alerting_ok = %v, want false", body["alerting_ok"])
+	}
+	if body["alerting_disabled_reason"] == nil {
+		t.Error("alerting_disabled_reason absent — the operator is told it is not ready but not why")
+	}
+	failing, _ := body["failing"].([]interface{})
+	found := false
+	for _, f := range failing {
+		if f == "alerting" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("failing = %v, want it to name \"alerting\"", failing)
 	}
 }

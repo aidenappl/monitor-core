@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/issues"
 	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/services"
@@ -20,13 +21,29 @@ import (
 // MaxRequestBodySize limits request body to 10MB
 const MaxRequestBodySize = 10 * 1024 * 1024
 
-// Queue is the global event queue (set from main.go)
+// Queue is the global event queue (set from main.go).
+//
+// NIL IN A CONTROL-PLANE-ONLY PROCESS (MON_ROLE=app), which runs no ingest
+// machinery at all. Nothing that reads it is registered there — the ingest route
+// is gated in buildRouter — except HealthHandler, which must answer in every
+// role and therefore checks.
 var Queue *services.Queue
 
 // Batcher is the global event batcher (set from main.go). Only /health reads
 // it, and only for last_flush_at, so a nil Batcher reports null rather than
 // panicking a liveness probe.
 var Batcher *services.Batcher
+
+// AlertingDisabledReason is non-empty when the alert evaluator was deliberately
+// not started — today, only because the Phase 2 configuration cutover has not
+// run and the rule table is therefore empty.
+//
+// Reported on /health and /ready because a disabled evaluator is otherwise
+// indistinguishable from a working one that has nothing to fire on: both are a
+// quiet process and an empty alert history. Degrading rather than crash-looping
+// is only defensible if the degraded state is visible, and this is the endpoint
+// an operator already polls.
+var AlertingDisabledReason string
 
 // HealthHandler is the LIVENESS probe. It reports queue stats plus the state of
 // the two stores, and it ALWAYS returns 200 with status "ok".
@@ -43,8 +60,23 @@ var Batcher *services.Batcher
 // (status, enqueued, dropped, pending) are unchanged — monitor-web's transport
 // and the container healthcheck both read that exact shape — and `dropped` now
 // finally counts batches the writer gave up on, not just queue overflow.
+//
+// `role` is reported for the same reason main() logs it at boot, and here
+// because a log line scrolls away while this endpoint can be asked. The risk the
+// role split carries is not that `both` is wrong — it is that `both` becomes an
+// unexamined default nobody remembers choosing, and a value that can be curled
+// is the cheapest defence against that.
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
-	enqueued, dropped, pending := Queue.Stats()
+	// Queue is nil in an app process. Reporting zeroes there is honest: it runs
+	// no queue, so nothing has been enqueued, dropped or is pending. Calling
+	// Stats() on the nil pointer would panic and take out the endpoint the
+	// container HEALTHCHECK polls, turning a role that is working perfectly into
+	// a restart loop.
+	var enqueued, dropped int64
+	var pending int
+	if Queue != nil {
+		enqueued, dropped, pending = Queue.Stats()
+	}
 	clickhouseOK, mariadbOK := cachedPingDependencies(r.Context())
 
 	// interface{} so "never flushed" serialises as null rather than the zero
@@ -66,6 +98,8 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 		"clickhouse_ok": clickhouseOK,
 		"mariadb_ok":    mariadbOK,
 		"last_flush_at": lastFlushAt,
+		"role":          string(env.MonRole),
+		"alerting_ok":   AlertingDisabledReason == "",
 	})
 }
 

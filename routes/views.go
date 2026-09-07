@@ -4,31 +4,29 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
-	"github.com/aidenappl/monitor-core/views"
 	"github.com/gorilla/mux"
 )
+
+// Saved views moved from ClickHouse to MariaDB in migration 124, so these
+// handlers now call the query layer directly against db.SQL. The `views` package
+// they used to go through held nothing but the forwarding.
 
 func HandleListViews(w http.ResponseWriter, r *http.Request) {
 	page := r.URL.Query().Get("page")
 
-	list, err := views.List(r.Context(), page)
+	list, err := query.ListSavedViews(db.SQL, page)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to list views", err)
 		return
-	}
-	if list == nil {
-		list = []views.View{}
 	}
 	responder.New(w, list)
 }
 
 func HandleCreateView(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Name        string `json:"name"`
-		QueryParams string `json:"query_params"`
-		Page        string `json:"page"`
-	}
+	var body query.CreateSavedViewRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -38,7 +36,7 @@ func HandleCreateView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	view, err := views.Create(r.Context(), body.Name, body.QueryParams, body.Page)
+	view, err := query.CreateSavedView(db.SQL, body)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to create view", err)
 		return
@@ -54,7 +52,7 @@ func HandleDeleteView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := views.Delete(r.Context(), id); err != nil {
+	if _, err := query.DeleteSavedView(db.SQL, id); err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to delete view", err)
 		return
 	}
