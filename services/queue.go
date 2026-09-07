@@ -35,6 +35,22 @@ func (q *Queue) Enqueue(event *structs.Event) bool {
 	}
 }
 
+// RecordDropped adds n events that were accepted by the queue but lost further
+// down the pipeline to the SAME counter the overflow path above feeds.
+//
+// The counter lives here rather than on the Batcher because this is what
+// `/health` already reports, and an event destroyed by a write that never
+// succeeded is lost exactly as surely as one the queue refused — reporting only
+// the second made a zone whose ClickHouse was completely dead answer
+// `{"status":"ok","dropped":0}` while shredding every event. The Batcher
+// already holds a *Queue, so this needed no new plumbing.
+func (q *Queue) RecordDropped(n int64) {
+	if n <= 0 {
+		return
+	}
+	q.dropped.Add(n)
+}
+
 // Events returns the channel for consuming events
 func (q *Queue) Events() <-chan *structs.Event {
 	return q.events

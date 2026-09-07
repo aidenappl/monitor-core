@@ -9,8 +9,10 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aidenappl/monitor-core/issues"
+	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/services"
 	"github.com/aidenappl/monitor-core/structs"
 )
@@ -21,16 +23,49 @@ const MaxRequestBodySize = 10 * 1024 * 1024
 // Queue is the global event queue (set from main.go)
 var Queue *services.Queue
 
-// HealthHandler returns queue stats
+// Batcher is the global event batcher (set from main.go). Only /health reads
+// it, and only for last_flush_at, so a nil Batcher reports null rather than
+// panicking a liveness probe.
+var Batcher *services.Batcher
+
+// HealthHandler is the LIVENESS probe. It reports queue stats plus the state of
+// the two stores, and it ALWAYS returns 200 with status "ok".
+//
+// That is deliberate, not an oversight. The container HEALTHCHECK points here:
+// failing it during a ClickHouse outage would have Docker kill and restart a
+// process that is running perfectly and cannot fix ClickHouse by rebooting —
+// turning a partial outage into a restart loop that also loses the in-memory
+// queue. Readiness, which DOES fail on a dead dependency, is `GET /ready`.
+//
+// The dependency booleans and last_flush_at are reported here anyway because
+// this is the endpoint operators and monitor-web already poll; they are
+// diagnostics, not a verdict on the status code. The original four keys
+// (status, enqueued, dropped, pending) are unchanged — monitor-web's transport
+// and the container healthcheck both read that exact shape — and `dropped` now
+// finally counts batches the writer gave up on, not just queue overflow.
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	enqueued, dropped, pending := Queue.Stats()
+	clickhouseOK, mariadbOK := cachedPingDependencies(r.Context())
+
+	// interface{} so "never flushed" serialises as null rather than the zero
+	// time, which would read as a flush in year 1.
+	var lastFlushAt interface{}
+	if Batcher != nil {
+		if t := Batcher.LastFlushAt(); !t.IsZero() {
+			lastFlushAt = t.UTC().Format(time.RFC3339)
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":   "ok",
-		"enqueued": enqueued,
-		"dropped":  dropped,
-		"pending":  pending,
+		"status":        "ok",
+		"enqueued":      enqueued,
+		"dropped":       dropped,
+		"pending":       pending,
+		"clickhouse_ok": clickhouseOK,
+		"mariadb_ok":    mariadbOK,
+		"last_flush_at": lastFlushAt,
 	})
 }
 
@@ -57,14 +92,35 @@ func IngestEventsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The tenant is resolved ONCE per request, not once per event: every line in
+	// an NDJSON body arrived under a single credential and therefore belongs to
+	// a single project.
+	//
+	// No fallback is applied when the lookup misses, deliberately.
+	// IngestAuthMiddleware is the only route to this handler and it resolves a
+	// project for every credential it accepts — the env master key included,
+	// which is precisely why that branch stamps env.DefaultProjectSlug rather
+	// than nothing. A second default here would be a second answer to "whose
+	// data is this", and the two would drift the first time one of them changed.
+	project, _ := middleware.GetProject(r.Context())
+
 	// Whole body parsed cleanly — now enqueue. Count only events the queue
 	// actually accepted; dropped events are reflected in /health's `dropped`.
 	accepted := 0
 	for _, event := range events {
-		// Stamp the issue id BEFORE enqueueing, so it lands on the stored row.
-		// Always assigned, never merged: an issue_id supplied by a client is
-		// overwritten (with "" for non-error levels), so no caller can file its
-		// events under another issue.
+		// Stamp the project and the issue id BEFORE enqueueing, so both land on
+		// the stored row. Both are always assigned, never merged: a project or
+		// an issue_id supplied by a client is overwritten (issue_id with "" for
+		// non-error levels), so no caller can file its events under another
+		// project or another issue.
+		//
+		// THESE TWO LINES ARE ORDERED, not merely adjacent. The issue id is a
+		// UUIDv5 over a fingerprint that now includes the project, so the
+		// project must already be on the event when IssueIDForEvent reads it.
+		// Swapping them still compiles and still produces a well-formed id — the
+		// wrong one, pointing at whichever project the client happened to claim,
+		// or at the default when it claimed none.
+		event.Project = project
 		event.IssueID = issues.IssueIDForEvent(event)
 
 		if Queue.Enqueue(event) {

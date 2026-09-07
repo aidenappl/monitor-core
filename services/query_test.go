@@ -21,7 +21,15 @@ func TestApplyDataFilterRejectsInjection(t *testing.T) {
 		{"drop table", "a'; DROP TABLE events;--", true},
 		{"leading digit", "1field", true},
 		{"empty", "", true},
-		{"dot not allowed", "http.status", true},
+		// Dots are now accepted. This case previously asserted the opposite,
+		// because services/ and alerts/ carried divergent copies of the regex and
+		// only the alerts copy allowed dots — so a nested key like "user.id"
+		// worked in an alert rule and failed in a query. Both now share
+		// structs.SafeIdentifierRegex, and the permissive side won.
+		{"nested data key allowed", "http.status", false},
+		// Loosening to allow dots must not loosen anything else: the characters
+		// that would actually break out of the string literal stay rejected.
+		{"backslash", `a\b`, true},
 	}
 
 	for _, tt := range tests {

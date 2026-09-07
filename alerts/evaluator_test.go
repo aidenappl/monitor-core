@@ -1,8 +1,14 @@
 package alerts
 
 import (
+	"context"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/aidenappl/monitor-core/env"
+	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
 )
 
@@ -134,5 +140,122 @@ func TestBuildFilterCondition(t *testing.T) {
 				t.Errorf("buildFilterCondition(field=%q) err = %v, wantErr %v", tt.field, err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// withDefaultProject pins env.DefaultProjectSlug for the duration of a test.
+// env.Load() never runs under `go test`, so the var is empty unless a test sets
+// it, and scope.ProjectPredicate's empty-string transition arm keys off it.
+func withDefaultProject(t *testing.T, slug string) {
+	t.Helper()
+	previous := env.DefaultProjectSlug
+	env.DefaultProjectSlug = slug
+	t.Cleanup(func() { env.DefaultProjectSlug = previous })
+}
+
+// TestAggQueryScopesWhenContextCarriesAProject covers the HTTP half of alert
+// evaluation: POST /v1/alert-rules/{id}/test reaches queryAggForRange through
+// EvaluateRuleNow with the request's own context, which QueryAuthMiddleware has
+// already stamped with a project.
+//
+// Unscoped, that endpoint was an oracle rather than a gap. A rule carries a
+// caller-chosen aggregation, field and filter set, so an admin key bound to one
+// project could POST a rule and read back a count or a max over EVERY project's
+// events — one number per request, no row ever crossing the boundary to notice.
+func TestAggQueryScopesWhenContextCarriesAProject(t *testing.T) {
+	withDefaultProject(t, "default")
+
+	ctx := scope.WithProject(context.Background(), "atlas")
+	sql, args, err := buildAggQuery(ctx, &Rule{}, "toFloat64(count())", time.Unix(0, 0), time.Unix(60, 0))
+	if err != nil {
+		t.Fatalf("buildAggQuery: %v", err)
+	}
+
+	if !strings.Contains(sql, "project = ?") {
+		t.Errorf("statement carries no project predicate — the test endpoint reads every tenant:\n\t%s", sql)
+	}
+	// A non-default project matches EXACTLY. Picking up the empty-string arm here
+	// would hand it every pre-006 row, which belongs to the default project.
+	if strings.Contains(sql, "project = ''") {
+		t.Errorf("non-default project matched the empty stamp:\n\t%s", sql)
+	}
+	// Order is the whole reason the predicate is appended before the filter loop:
+	// these are positional placeholders, so from, to, project is the only vector
+	// that lines up with the text.
+	want := []interface{}{time.Unix(0, 0), time.Unix(60, 0), "atlas"}
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("args = %v, want %v", args, want)
+	}
+}
+
+// TestAggQueryStaysZoneWideForTheTimer pins the OTHER half, which is a decision
+// rather than an oversight: Evaluator.Run has a background context, no
+// credential and no project, and a rule's threshold is deliberately a count of
+// the whole zone. If this ever starts failing because the predicate went
+// unconditional, alert_rules needs a project column in the same change — see the
+// KNOWN GAP header.
+func TestAggQueryStaysZoneWideForTheTimer(t *testing.T) {
+	withDefaultProject(t, "default")
+
+	sql, args, err := buildAggQuery(context.Background(), &Rule{}, "toFloat64(count())", time.Unix(0, 0), time.Unix(60, 0))
+	if err != nil {
+		t.Fatalf("buildAggQuery: %v", err)
+	}
+
+	if strings.Contains(sql, "project") {
+		t.Errorf("timer path acquired a project predicate with no project to scope to:\n\t%s", sql)
+	}
+	if len(args) != 2 {
+		t.Errorf("args = %v, want just the time range", args)
+	}
+}
+
+// TestAggQueryBindsFiltersAfterTheProject is the argument-ordering guard. The
+// predicate and the rule's filters both bind positionally into one statement, so
+// a future edit that appends the project after the filter loop produces valid
+// SQL with every binding slid one place along — no error, wrong rows, and a
+// project slug fed into a filter comparison.
+func TestAggQueryBindsFiltersAfterTheProject(t *testing.T) {
+	withDefaultProject(t, "default")
+
+	rule := &Rule{QueryFilters: `[{"field":"service","operator":"eq","value":"atlas-api"}]`}
+	ctx := scope.WithProject(context.Background(), "atlas")
+
+	sql, args, err := buildAggQuery(ctx, rule, "toFloat64(count())", time.Unix(0, 0), time.Unix(60, 0))
+	if err != nil {
+		t.Fatalf("buildAggQuery: %v", err)
+	}
+
+	projectAt := strings.Index(sql, "project = ?")
+	serviceAt := strings.Index(sql, "service")
+	if projectAt < 0 || serviceAt < 0 {
+		t.Fatalf("expected both a project predicate and the rule's filter:\n\t%s", sql)
+	}
+	if projectAt > serviceAt {
+		t.Errorf("project predicate appears after the rule's filter; the bound args no longer line up:\n\t%s", sql)
+	}
+
+	want := []interface{}{time.Unix(0, 0), time.Unix(60, 0), "atlas", "atlas-api"}
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("args = %v, want %v", args, want)
+	}
+}
+
+// TestAggQueryMatchesUnstampedRowsOnlyForTheDefaultProject checks that alert
+// evaluation reads the transition window the same way every other read does.
+// Pre-006 rows carry an empty project and are visible to the default project
+// alone; a second implementation of that rule here would drift from
+// scope.ProjectPredicate the day the arm is removed.
+func TestAggQueryMatchesUnstampedRowsOnlyForTheDefaultProject(t *testing.T) {
+	withDefaultProject(t, "default")
+
+	ctx := scope.WithProject(context.Background(), "default")
+	sql, _, err := buildAggQuery(ctx, &Rule{}, "toFloat64(count())", time.Unix(0, 0), time.Unix(60, 0))
+	if err != nil {
+		t.Fatalf("buildAggQuery: %v", err)
+	}
+
+	if !strings.Contains(sql, "(project = ? OR project = '')") {
+		t.Errorf("default project did not pick up the empty-string transition arm:\n\t%s", sql)
 	}
 }

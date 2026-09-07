@@ -1,0 +1,35 @@
+-- Adds the tenant column to the events table. Shaped after 004: one additive
+-- ALTER TABLE ... ADD COLUMN IF NOT EXISTS, idempotent, and therefore harmless
+-- when the runner in migrations/embed.go replays this file on every boot.
+--
+-- The column is a plain LowCardinality(String) and is deliberately NOT part of
+-- the sorting key. ORDER BY, PARTITION BY and TTL are untouched here, for two
+-- reasons that both point the same way. First, changing a sorting key means
+-- rebuilding the table, and this runner has no applied-tracking table -- every
+-- statement it issues must be safe to re-execute forever, which a rebuild is
+-- not. Second, there is nothing to win: the whole table is roughly 209 granules,
+-- so a scan reads essentially all of it regardless and key pruning has no room
+-- to operate. A key change would buy a rewrite and no measurable read.
+--
+-- No skip index either, and this is the one place the file departs from 004. The
+-- bloom filter 004 attached to issue_id pays for itself because issue_id is
+-- high-cardinality: a lookup for one issue matches a few blocks and skips the
+-- rest. This column is the opposite case. A handful of distinct project values
+-- spread across every part means every block contains every project, so a bloom
+-- filter over it matches everything and skips nothing -- pure write-time and
+-- disk cost for no read benefit.
+--
+-- No MATERIALIZE COLUMN. That statement is a mutation, not DDL, and the header
+-- of migrations/embed.go is explicit that every file here runs again on EVERY
+-- restart. Emitting it would queue a fresh asynchronous table-wide rewrite each
+-- time the service booted, forever. The one-off fill for pre-existing rows lives
+-- in migrations/manual/backfill_events_project.sql and is run by hand.
+--
+-- Which leaves the fact the transition rule downstream of this depends on:
+-- adding a column is metadata-only. ClickHouse does not rewrite existing parts,
+-- so every row written before this migration reads back as the EMPTY STRING --
+-- not NULL, the column is not Nullable. Empty therefore has a precise meaning on
+-- the read path, "written before projects existed", and read paths must treat it
+-- as the default project until the manual backfill has been run and the last
+-- unbackfilled rows have aged out under the 30-day TTL.
+ALTER TABLE monitor.events ADD COLUMN IF NOT EXISTS project LowCardinality(String) AFTER service;

@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/query"
+	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
 	"github.com/google/uuid"
 )
@@ -37,6 +39,18 @@ var (
 
 // issueNamespace seeds the deterministic issue UUIDs derived from fingerprints.
 // Fixed forever: changing it re-keys every issue and orphans all history.
+//
+// It did NOT change when project entered the fingerprint, and that was not an
+// oversight. The two are independent axes, and only one of them needed to move.
+// The fingerprint string is what identifies a failure; the namespace is the
+// constant that guarantees a given fingerprint always resolves to the same id.
+// Re-keying through the fingerprint means new events land on new ids while every
+// stored legacy fingerprint still resolves to the legacy row it always did —
+// which is exactly what makes the pre-project issues findable and
+// hand-resolvable. Moving the namespace as well would break that second property
+// too, for no additional benefit: it would make even the old rows unreachable by
+// derivation, so a stored fingerprint could no longer be checked against its own
+// id. One re-key, one axis.
 var issueNamespace = uuid.MustParse("6f1d8f6a-2a3e-5c47-9a4b-6d1c0f2e7b31")
 
 // issueIDFor derives an issue's primary key from its fingerprint.
@@ -100,6 +114,11 @@ func Init(ctx context.Context) error {
 // TrackError enqueues an error event for issue tracking. It is non-blocking: if
 // the worker queue is full (or not yet initialized), the event is dropped and a
 // warning logged rather than blocking the ingestion path or spawning a goroutine.
+//
+// The event must already carry its server-stamped Project: the issue it folds
+// into is derived from it, and the queue hands the caller's pointer straight to
+// processError, so anything assigned after this call is a race the fingerprint
+// may or may not see.
 func TrackError(event *structs.Event) {
 	if trackQueue == nil {
 		return
@@ -146,7 +165,14 @@ const regressionFreshness = time.Minute
 func processError(ctx context.Context, event *structs.Event) {
 	path := extractPath(event)
 	message := extractMessage(event, path)
-	fingerprint := generateFingerprint(event.Service, event.Name, message, path)
+
+	// Resolve the project ONCE and use that same value for both the hash and the
+	// stored column, so monitor.issues.project can never disagree with the
+	// project baked into the row's own fingerprint. Two derivations of the same
+	// thing is how uq_issues_project_fingerprint ends up describing a row that
+	// does not exist.
+	project := fingerprintProject(event.Project)
+	fingerprint := generateFingerprint(project, event.Service, event.Name, message, path)
 
 	// DATETIME(3) stores milliseconds, so truncate before writing. Otherwise the
 	// value read back never equals the one sent, and the regression dedupe key
@@ -159,6 +185,7 @@ func processError(ctx context.Context, event *structs.Event) {
 	issue, err := query.UpsertIssueOccurrence(db.SQL, query.UpsertIssueOccurrenceRequest{
 		ID:          issueIDFor(fingerprint),
 		Fingerprint: fingerprint,
+		Project:     project,
 		Service:     event.Service,
 		Name:        event.Name,
 		Message:     message,
@@ -217,13 +244,39 @@ func recordRegression(issue *structs.Issue) {
 // since no caller is responsible for them.
 const regressionActorLabel = "ingest"
 
-// List returns a page of issues plus the total matching the filters.
+// The three wrappers below take a context and resolve the tenant OUT of it with
+// scope.GetProject, rather than taking a project argument the way the query
+// functions they call do.
+//
+// That difference is deliberate and worth one note covering all three. Down in
+// query/, an explicit argument is the right shape: those functions are the last
+// thing before the SQL, they are called from several layers, and making the
+// project impossible to omit there is what the compiler is for. Up here the
+// context is already the parameter — every caller is a handler holding a
+// *http.Request, and the project is on it because QueryAuthMiddleware put it
+// there. Asking them to unpack it and pass it back down would be a second place
+// to get it from, and a second place to get it wrong.
+//
+// All three refuse rather than widen when the context carries no project. Two of
+// them have no callers today, and that is exactly why they are scoped: an
+// unscoped exported reader sitting in this package is a leak waiting for its
+// first caller, and the first caller will not read this comment before writing
+// the line.
+
+// List returns a page of issues plus the total matching the filters, within the
+// project on ctx.
 //
 // Filtering, sorting, paginating and counting now happen in one relational query
 // each, rather than against a ClickHouse ReplacingMergeTree with FINAL — where
 // count(DISTINCT id) had to work around rows the engine had not yet merged.
 func List(ctx context.Context, status, service string, limit, offset int) ([]Issue, int, error) {
+	project, ok := scope.GetProject(ctx)
+	if !ok {
+		return nil, 0, scope.ErrNoProject
+	}
+
 	req := query.ListIssuesRequest{
+		Project:    project,
 		Sort:       query.IssueSortLastSeen,
 		Descending: true,
 		Limit:      limit,
@@ -252,9 +305,19 @@ func List(ctx context.Context, status, service string, limit, offset int) ([]Iss
 	return list, total, nil
 }
 
-// Get returns an issue by id.
+// Get returns an issue by id, within the project on ctx.
+//
+// An issue belonging to another project reports "issue not found" — the same
+// error as an id that does not exist anywhere. Its caller,
+// routes.HandleGetIssueEvents, turns that into a 404, which is what keeps a
+// foreign id from being distinguishable from a bogus one.
 func Get(ctx context.Context, id string) (*Issue, error) {
-	issue, err := query.GetIssue(db.SQL, id)
+	project, ok := scope.GetProject(ctx)
+	if !ok {
+		return nil, scope.ErrNoProject
+	}
+
+	issue, err := query.GetIssue(db.SQL, project, id)
 	if err != nil {
 		return nil, err
 	}
@@ -271,12 +334,17 @@ func Get(ctx context.Context, id string) (*Issue, error) {
 // query.UpdateIssue with the actor from middleware.GetActor instead. Kept while
 // the routes are cut over.
 func UpdateStatus(ctx context.Context, id, status string) error {
+	project, ok := scope.GetProject(ctx)
+	if !ok {
+		return scope.ErrNoProject
+	}
+
 	s := structs.IssueStatus(status)
 	if !s.IsValid() {
 		return fmt.Errorf("invalid status: %s (must be unresolved, in_progress, resolved, or ignored)", status)
 	}
 
-	updated, err := query.UpdateIssue(db.SQL, id, query.UpdateIssueRequest{Status: &s})
+	updated, err := query.UpdateIssue(db.SQL, project, id, query.UpdateIssueRequest{Status: &s})
 	if err != nil {
 		return err
 	}
@@ -361,10 +429,17 @@ func extractMessage(event *structs.Event, path string) string {
 // whether an event belongs to an issue must compare THIS against the issue's
 // fingerprint — matching on service+name alone lumps together every distinct
 // failure that happens to share an event name.
+//
+// It reads event.Project, which is server-stamped: on the ingest path by
+// routes.IngestEventsHandler, and on a read path by whatever scanned the row out
+// of monitor.events. An event whose Project is not populated does NOT fall
+// through to some project-agnostic fingerprint — it is fingerprinted as the
+// default project (see fingerprintProject), because that is what an empty
+// project means everywhere else in this codebase.
 func FingerprintForEvent(event *structs.Event) string {
 	path := extractPath(event)
 	message := extractMessage(event, path)
-	return generateFingerprint(event.Service, event.Name, message, path)
+	return generateFingerprint(event.Project, event.Service, event.Name, message, path)
 }
 
 // IssueIDForEvent returns the id of the issue an event belongs to, or "" if the
@@ -374,6 +449,13 @@ func FingerprintForEvent(event *structs.Event) string {
 // row. That is deliberate and cheap — fingerprinting is a pure sha256 over a few
 // regex substitutions, with no I/O. The worker pool exists for the database
 // round-trip in processError, not for this.
+//
+// ORDERING: event.Project must already be stamped when this is called, because
+// the id is now derived from it. Calling this first and assigning the project
+// afterwards compiles, returns a plausible UUID, and files the event under a
+// DIFFERENT project's issue than the one the row itself claims — a mismatch with
+// no error and no log line, visible only as an issue whose event list is empty.
+// routes.IngestEventsHandler assigns in the right order and says why.
 func IssueIDForEvent(event *structs.Event) string {
 	if event == nil || !isErrorLevel(event.Level) {
 		return ""
@@ -388,11 +470,64 @@ func isErrorLevel(level string) bool {
 	return level == "error" || level == "fatal"
 }
 
-func generateFingerprint(service, name, message, path string) string {
+// generateFingerprint derives the grouping key for one error event.
+//
+// PROJECT IS IN THE STRING, not merely in a database key, and that distinction
+// is the entire point rather than a stylistic choice.
+//
+// The issue's primary key is uuid.NewSHA1(issueNamespace, fingerprint) — DERIVED
+// from this string, not independent of it. So two projects whose service, name,
+// path and normalized message matched would produce an identical fingerprint,
+// therefore an identical id, therefore a PRIMARY KEY collision. Adding
+// UNIQUE KEY (project, fingerprint) to monitor.issues while leaving project out
+// of here would have protected nothing at all: MariaDB's
+// INSERT ... ON DUPLICATE KEY UPDATE fires on the FIRST unique index the row
+// violates, and that is the primary key, so project B's occurrence would be
+// folded into project A's row — its counter incremented, its message
+// overwritten, its resolved status reopened — before the composite key was ever
+// consulted. Two tenants, one issue, one shared triage state, and no error
+// anywhere to say so. The composite key in migration 118 documents the intent;
+// this line is the mechanism.
+//
+// ENV IS DELIBERATELY NOT A COMPONENT. Production and staging failures of the
+// same shape already merge into one issue today, and that is what Sentry does on
+// purpose too: an error is one bug regardless of which deployment it fired in,
+// and the per-event `env` column is still there to split the occurrences when
+// somebody wants them split. Adding it would also be a SECOND full re-key of
+// every issue, and unlike project it has no anchor to re-key onto — project has
+// env.DefaultProjectSlug, whereas env is whatever string an SDK happened to
+// send, including nothing at all. Recorded here so it reads as a decision rather
+// than as an omission for someone to rediscover as a bug.
+func generateFingerprint(project, service, name, message, path string) string {
 	normalized := normalizeMessage(message)
-	raw := service + "|" + name + "|" + path + "|" + normalized
+	raw := fingerprintProject(project) + "|" + service + "|" + name + "|" + path + "|" + normalized
 	h := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(h[:])
+}
+
+// fingerprintProject resolves the project component, mapping the empty string
+// onto the default project slug.
+//
+// Ingest never hands this an empty one: IngestAuthMiddleware resolves a project
+// for every credential it accepts, the env master key included, and
+// routes.IngestEventsHandler stamps it onto the event before either fingerprint
+// call runs. The empty case comes from the READ side. An events row written
+// before migrations/006_events_project.sql reads back as "" — adding a
+// ClickHouse column is metadata-only, so existing parts are never rewritten —
+// and routes/issues.go's legacy fallback scan re-derives a fingerprint from
+// exactly those rows to decide whether they belong to an issue.
+//
+// Mapping "" onto the default is the same rule scope.ProjectPredicate already
+// applies to that read: empty means "written before projects existed", not "no
+// project". Doing it HERE, inside the single derivation both the write and read
+// paths share, is what stops them from disagreeing — a normalization applied in
+// one caller is one the other caller silently forgets, and the symptom would be
+// an issue whose own events no longer match it.
+func fingerprintProject(project string) string {
+	if project == "" {
+		return env.DefaultProjectSlug
+	}
+	return project
 }
 
 func normalizeMessage(message string) string {

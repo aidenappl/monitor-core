@@ -31,6 +31,21 @@ type Event struct {
 	// It exists so an issue's events can be looked up by an indexed equality
 	// match instead of rescanning candidates and recomputing fingerprints in Go.
 	IssueID string `json:"issue_id,omitempty"`
+
+	// Project is the tenant slug this event files under, stamped server-side at
+	// ingest from the api_keys row behind the presented key (or, for the env
+	// master key — which has no such row — from env.DefaultProjectSlug). Like
+	// IssueID it is DERIVED, never trusted from the client: the ingest path
+	// overwrites whatever arrives here, so a caller cannot file its events under
+	// another project.
+	//
+	// That overwrite IS the tenancy boundary; there is nothing else enforcing
+	// it. A project a caller may name is a project a caller may impersonate, and
+	// the damage is silent rather than loud: the forged rows are valid events
+	// that every per-project view — quotas, dashboards, alert rules, retention —
+	// then counts as the victim's own traffic, with nothing in the row left to
+	// tell them apart afterwards.
+	Project string `json:"project,omitempty"`
 }
 
 // Validate checks that all required fields are present and IDs are valid UUIDs

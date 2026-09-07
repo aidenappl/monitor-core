@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/env"
 )
 
 // BackfillFromClickHouse copies the legacy ClickHouse issues table into MariaDB.
@@ -39,9 +40,17 @@ func BackfillFromClickHouse(ctx context.Context) (int, error) {
 	// Status is carried across as-is: 'unresolved', 'resolved' and 'ignored' are
 	// all still valid in the new four-value enum, so no mapping is required.
 	// 'in_progress' simply never appears in legacy data.
+	//
+	// project is bound to env.DefaultProjectSlug for every row, because the
+	// ClickHouse issues table predates tenancy entirely and has no column to
+	// carry one. That is the same value migration 118 backfills onto the rows
+	// already in MariaDB, so the two agree by construction. It does NOT make
+	// these issues live again: their ids and fingerprints were derived before
+	// project entered the fingerprint, so new occurrences of the same failure
+	// mint a new row and these keep only their history.
 	const upsert = `INSERT INTO monitor.issues
-		(id, fingerprint, service, name, message, path, status, occurrence_count, first_seen, last_seen, resolved_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, fingerprint, project, service, name, message, path, status, occurrence_count, first_seen, last_seen, resolved_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON DUPLICATE KEY UPDATE
 		occurrence_count = GREATEST(occurrence_count, VALUES(occurrence_count)),
 		first_seen       = LEAST(COALESCE(first_seen, VALUES(first_seen)), COALESCE(VALUES(first_seen), first_seen)),
@@ -71,7 +80,7 @@ func BackfillFromClickHouse(ctx context.Context) (int, error) {
 		}
 
 		if _, err := db.SQL.Exec(upsert,
-			id, fingerprint, service, name, messageArg, pathArg, status,
+			id, fingerprint, env.DefaultProjectSlug, service, name, messageArg, pathArg, status,
 			occurrenceCount,
 			firstSeen.UTC().Truncate(time.Millisecond),
 			lastSeen.UTC().Truncate(time.Millisecond),

@@ -3,6 +3,7 @@ package services
 import (
 	"sync"
 
+	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
 	"github.com/google/uuid"
 )
@@ -89,6 +90,21 @@ func matchesFilters(event *structs.Event, filters map[string]string) bool {
 			if event.Service != value {
 				return false
 			}
+		case "project":
+			// The tenancy boundary for the live tail. Unlike every other key
+			// here this one is NOT a client filter — routes/stream.go sets it
+			// from the authenticated credential and there is no query parameter
+			// that can reach it — so a missing case would not merely widen a
+			// subscriber's own filter, it would hand them every project's
+			// events in real time.
+			//
+			// Membership is delegated to scope.Matches rather than compared
+			// here, so the live tail and the stored query cannot answer the
+			// same question differently — including during the empty-string
+			// transition window, which scope.ProjectPredicate documents.
+			if !scope.Matches(value, event.Project) {
+				return false
+			}
 		case "env":
 			if event.Env != value {
 				return false
@@ -101,6 +117,17 @@ func matchesFilters(event *structs.Event, filters map[string]string) bool {
 			if event.Name != value {
 				return false
 			}
+		default:
+			// Fail closed on any key this switch does not know about. Without
+			// this the loop would simply skip the unrecognised key and fall
+			// through to `return true`, so a subscriber who filtered on a key
+			// we forgot to handle here would silently receive EVERY event
+			// instead of none. The only symptom is "more data than I asked
+			// for" — no error, no log line, and nothing a happy-path test
+			// would notice. Today the stream route's allowlist keeps this
+			// unreachable, but the two lists live in different files and the
+			// safe side of that drift is matching nothing.
+			return false
 		}
 	}
 	return true

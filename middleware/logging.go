@@ -107,7 +107,9 @@ func (rw *loggingResponseWriter) Unwrap() http.ResponseWriter {
 
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" {
+		// Probe endpoints are polled every few seconds by Docker and the load
+		// balancer; logging them buries real traffic.
+		if r.URL.Path == "/health" || r.URL.Path == "/ready" {
 			next.ServeHTTP(w, r)
 			return
 		}

@@ -3,29 +3,65 @@ package alerts
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"regexp"
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
 )
 
-// safeIdentifierRegex validates field names to prevent SQL injection
-var safeIdentifierRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_.]*$`)
-
-// validFilterColumns are columns that can be used in filter conditions
-var validFilterColumns = map[string]bool{
-	"service":    true,
-	"env":        true,
-	"job_id":     true,
-	"request_id": true,
-	"trace_id":   true,
-	"user_id":    true,
-	"name":       true,
-	"level":      true,
-}
+// KNOWN GAP — TIMER-DRIVEN alert evaluation is ZONE-WIDE. Recorded 2026-09-06,
+// alongside the change that made every event READ project-scoped; narrowed the
+// same day, when the HTTP half of it turned out to be a live leak rather than a
+// gap.
+//
+// TWO CALLERS, TWO ANSWERS. evaluateRuleState is reached from exactly two
+// places, and they differ in the only thing that matters here — whether a
+// request is on the other end of it:
+//
+//   - Evaluator.Run, on a 15-second timer, with a background context. There is
+//     no request, no credential and therefore no project to scope against, and
+//     nothing is returned to a caller: the value becomes a firing decision and a
+//     notification. This is the gap, and it stays.
+//   - EvaluateRuleNow, from routes.HandleTestAlertRule (POST
+//     /v1/alert-rules/{id}/test), which passes r.Context() — an ordinary /v1
+//     request context that HAS been through QueryAuthMiddleware and DOES carry a
+//     project. Its aggregate is returned to the caller as JSON.
+//
+// The second was NOT a gap, it was an oracle. A rule carries a caller-chosen
+// aggregation, field and filter set, so an admin key bound to project A could
+// POST a rule and read back max(data.amount), count() or a contains-filtered
+// count over EVERY project's events — one number at a time, but a number of
+// someone else's data on demand, with no row ever crossing the boundary to
+// notice. The reasoning that used to sit here ("no rule can be made to read a
+// project its author cannot already read, because rule authorship is itself an
+// admin-scoped action") was true when admin meant global and became false the
+// moment middleware/query_auth.go decided that admin is a scope over VERBS and
+// never over tenants. It is restated here because that inversion is the exact
+// shape of the next mistake: a pre-tenancy safety argument that nobody
+// re-derived after tenancy landed.
+//
+// So queryAggForRange now applies scope.ProjectPredicate WHENEVER the context
+// carries a project, and only falls through to zone-wide on the sentinel that
+// means "no request was involved". The timer keeps the documented behaviour; the
+// endpoint stops answering questions about other tenants.
+//
+// CONSEQUENCE, ON PURPOSE: a rule's test result and the value that fires it can
+// now disagree once a second project exists — the test reports the caller's
+// project, the timer counts the zone. They agree today, because every credential
+// resolves to env.DefaultProjectSlug (migration 117 bound all existing keys to
+// it). A test that under-reports is a confusing false negative; a test that
+// reports another tenant's traffic is a disclosure, and only one of those is
+// worth keeping.
+//
+// "project" also remains in structs.FilterColumns so a TIMER rule can opt in
+// with a query_filters entry of {"field":"project","value":"..."}. Close the
+// remaining half by giving alert_rules a project column, resolving it in
+// listEnabledRules, and passing it into queryAggForRange as the same predicate —
+// at which point the ctx-conditional below collapses into an unconditional one.
 
 // Evaluator periodically evaluates alert rules
 type Evaluator struct {
@@ -274,24 +310,68 @@ func parseRuleFilters(rule *Rule) ([]structs.QueryFilter, error) {
 	return filters, nil
 }
 
-// queryAggForRange runs an arbitrary aggregation expression over [from,to],
-// applying the rule's query_filters. aggExpr is a trusted, code-built expression.
-func queryAggForRange(ctx context.Context, rule *Rule, aggExpr string, from, to time.Time) (float64, error) {
+// buildAggQuery assembles the statement queryAggForRange runs, and is split out
+// of it for the same reason routes.subscriptionFilters is split out of its
+// handler: the thing worth asserting on is the text, and it is unreachable
+// through a function whose next act is to hit ClickHouse. A test can call this
+// twice — once with a project on the context, once without — and read the
+// difference, which no assertion about a returned float64 could show.
+//
+// aggExpr is a trusted, code-built expression; the rule's filters are bound.
+func buildAggQuery(ctx context.Context, rule *Rule, aggExpr string, from, to time.Time) (string, []interface{}, error) {
 	filters, err := parseRuleFilters(rule)
 	if err != nil {
-		return 0, err
+		return "", nil, err
 	}
 
 	sql := fmt.Sprintf("SELECT %s AS value FROM %s.events WHERE timestamp >= ? AND timestamp <= ?", aggExpr, db.Database)
 	args := []interface{}{from, to}
 
+	// Attached BEFORE the rule's own filters, not after: these are positional
+	// `?` placeholders, so the args have to be appended in the order their
+	// placeholders appear in the text. Splicing this in below the loop would
+	// slide every filter's binding one position along — valid SQL, no error,
+	// wrong rows.
+	predicate, scopeArgs, err := scope.ProjectPredicate(ctx)
+	switch {
+	case err == nil:
+		sql += " AND " + predicate
+		args = append(args, scopeArgs...)
+	case errors.Is(err, scope.ErrNoProject):
+		// The timer path. Deliberately zone-wide — the documented half of the
+		// gap above — and reached only when no request context exists.
+	default:
+		// ErrNoProject is the only error ProjectPredicate returns today. Any
+		// other one means the scoping rule changed under this call, and the safe
+		// reading of "I could not work out whose data this is" is to refuse
+		// rather than to fall back to every tenant's.
+		return "", nil, err
+	}
+
 	for _, f := range filters {
 		cond, condArgs, err := buildFilterCondition(f)
 		if err != nil {
-			return 0, err
+			return "", nil, err
 		}
 		sql += " AND " + cond
 		args = append(args, condArgs...)
+	}
+
+	return sql, args, nil
+}
+
+// queryAggForRange runs an arbitrary aggregation expression over [from,to],
+// applying the rule's query_filters.
+//
+// The tenancy predicate is attached when — and only when — the context carries a
+// project. See the KNOWN GAP header for why that is conditional rather than
+// mandatory: the timer has no request to derive one from, the HTTP test endpoint
+// does, and the aggregate this returns is handed straight back to that endpoint's
+// caller.
+func queryAggForRange(ctx context.Context, rule *Rule, aggExpr string, from, to time.Time) (float64, error) {
+	sql, args, err := buildAggQuery(ctx, rule, aggExpr, from, to)
+	if err != nil {
+		return 0, err
 	}
 
 	var value float64
@@ -359,7 +439,7 @@ func numericFieldExpr(field string) (string, error) {
 	}
 	if len(field) > 5 && field[:5] == "data." {
 		key := field[5:]
-		if !safeIdentifierRegex.MatchString(key) {
+		if !structs.SafeIdentifierRegex.MatchString(key) {
 			return "", fmt.Errorf("invalid data field name: %s", key)
 		}
 		return fmt.Sprintf("toFloat64OrNull(JSONExtractRaw(data, '%s'))", key), nil
@@ -372,7 +452,7 @@ func buildFilterCondition(f structs.QueryFilter) (string, []interface{}, error) 
 
 	if len(f.Field) > 5 && f.Field[:5] == "data." {
 		key := f.Field[5:]
-		if !safeIdentifierRegex.MatchString(key) {
+		if !structs.SafeIdentifierRegex.MatchString(key) {
 			return "", nil, fmt.Errorf("invalid data field name: %s", key)
 		}
 		switch f.Operator {
@@ -381,7 +461,7 @@ func buildFilterCondition(f structs.QueryFilter) (string, []interface{}, error) 
 		default:
 			fieldExpr = fmt.Sprintf("JSONExtractString(data, '%s')", key)
 		}
-	} else if validFilterColumns[f.Field] {
+	} else if structs.FilterColumns[f.Field] {
 		fieldExpr = f.Field
 	} else {
 		return "", nil, fmt.Errorf("invalid filter field: %s", f.Field)

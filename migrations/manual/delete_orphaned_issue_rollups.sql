@@ -1,0 +1,129 @@
+-- delete_orphaned_issue_rollups.sql — MANUAL, ONE-OFF. NOT A MIGRATION.
+--
+-- Deletes rows from the no-TTL occurrence rollup whose issue no longer exists in
+-- monitor.issues.
+--
+--
+-- WHY THESE ROWS EXIST. db/migrations/118_issues_project.sql put the project into
+-- the issue fingerprint, and the issue's primary key is derived from that
+-- fingerprint (issues.issueIDFor). Every issue that predates 118 therefore keeps
+-- an id nothing will ever mint again: new occurrences of the same failure land on
+-- a new row, and the old one is frozen. There was deliberately no re-keying
+-- migration — the owner deals with the pre-118 issues by hand. There were 43 of
+-- them on 2026-09-06 (12 unresolved, 3 ignored, 28 resolved); re-count before
+-- planning the work rather than trusting that number.
+--
+-- monitor.issue_occurrences_daily is keyed on (issue_id, day) and carries NO TTL
+-- (migrations/005), unlike monitor.events which expires after 30 days. So the
+-- rollup rows under those old ids are permanent. While the issues still exist
+-- they are simply that issue's history and must be left alone. Once the issues
+-- are gone, they are unreachable: nothing can join to them, nothing displays
+-- them, and nothing will ever expire them.
+--
+--
+-- WHEN TO RUN IT. After the pre-118 issues have been dealt with AND their rows
+-- DELETED from monitor.issues.
+--
+-- Note the difference between "resolved" and "deleted". Setting status =
+-- 'resolved' leaves the row present, so this script matches nothing and changes
+-- nothing — deliberately. It keys on ABSENCE from monitor.issues, which makes it
+-- self-limiting: it cannot destroy the history of an issue somebody can still
+-- open. If it reports zero rows to delete, the issues have not been deleted yet,
+-- and that is the correct outcome rather than a failure.
+--
+--
+-- WHY IT IS NOT IN migrations/. The boot runner (migrations/embed.go) has no
+-- applied-tracking table: it re-executes every top-level migrations/*.sql file
+-- on EVERY boot and requires each statement to be idempotent DDL. ALTER TABLE ...
+-- DELETE is an asynchronous mutation, not DDL. Sitting one directory up it would
+-- queue a fresh table-wide mutation on every restart of the service, forever.
+-- This subdirectory is excluded from the `*.sql` embed pattern precisely so that
+-- cannot happen by accident, and files here are NOT rewritten from the literal
+-- `monitor.` prefix — adjust it yourself if CLICKHOUSE_DATABASE differs.
+--
+--
+-- !! THE TRAP IN THIS FILE. READ IT BEFORE RUNNING ANYTHING BELOW. !!
+--
+-- The live issue ids live in MariaDB and the rollup lives in ClickHouse, so the
+-- predicate crosses stores through the mysql() table function. If that subquery
+-- returns an EMPTY SET, then `issue_id NOT IN (empty)` is true for every row and
+-- the statement deletes THE ENTIRE ROLLUP — which has no TTL, is not
+-- reconstructible from monitor.events once the 30-day window has passed, and is
+-- the only surviving record of how often anything fired before that. An empty
+-- set is not hypothetical: a wrong database argument, a user without SELECT on
+-- monitor.issues, or a connection that resolves to the wrong host can all
+-- produce one. Step 0 exists to prove it is non-empty. Do not skip it.
+--
+-- The arguments are mysql('host:port', 'database', 'table', 'user', 'password').
+-- The database is the MariaDB schema named `monitor` — which is a DIFFERENT store
+-- from the ClickHouse database of the same name that this file otherwise talks
+-- to. Substitute a real host, user and password below.
+--
+--
+-- BACK IT UP FIRST. ALTER TABLE ... DELETE is an asynchronous mutation and is not
+-- reversible. Copy the table before running anything, and drop the copy only once
+-- you are satisfied:
+--
+--   CREATE TABLE monitor.issue_occurrences_daily_backup_118 AS monitor.issue_occurrences_daily
+--   INSERT INTO monitor.issue_occurrences_daily_backup_118 SELECT * FROM monitor.issue_occurrences_daily
+
+-- Step 0a — PROVE THE SUBQUERY IS ALIVE. This must return a plausible issue count
+-- (non-zero). If it returns 0, or errors, STOP: the DELETE below would take the
+-- whole rollup with it.
+--
+--   SELECT count() AS live_issues
+--   FROM mysql('MARIADB_HOST:3306', 'monitor', 'issues', 'MARIADB_USER', 'MARIADB_PASSWORD')
+
+-- Step 0b — BLAST RADIUS. Exactly what step 1 will remove, and how much history
+-- goes with it. Run this before and expect the same numbers after.
+--
+--   SELECT
+--       uniqExact(issue_id)     AS orphan_issues,
+--       count()                 AS orphan_day_rows,
+--       countMerge(occurrences) AS orphan_occurrences,
+--       min(day)                AS oldest_day,
+--       max(day)                AS newest_day
+--   FROM monitor.issue_occurrences_daily
+--   WHERE issue_id NOT IN (
+--       SELECT id FROM mysql('MARIADB_HOST:3306', 'monitor', 'issues', 'MARIADB_USER', 'MARIADB_PASSWORD')
+--   )
+--
+-- And the same broken out per issue, which is the list to eyeball against the
+-- ids that were resolved by hand. Anything here that you do not recognise is a
+-- reason to stop rather than to proceed.
+--
+--   SELECT issue_id, countMerge(occurrences) AS occurrences,
+--          min(day) AS oldest_day, max(day) AS newest_day
+--   FROM monitor.issue_occurrences_daily
+--   WHERE issue_id NOT IN (
+--       SELECT id FROM mysql('MARIADB_HOST:3306', 'monitor', 'issues', 'MARIADB_USER', 'MARIADB_PASSWORD')
+--   )
+--   GROUP BY issue_id
+--   ORDER BY occurrences DESC
+
+-- Step 1 — the sweep.
+--
+-- Substitute the same connection arguments verified in step 0a. Nothing here is
+-- scoped by date on purpose: age is not what makes a row an orphan, absence of
+-- its issue is, and a date bound would leave a second class of unreachable rows
+-- behind for someone to rediscover later.
+ALTER TABLE monitor.issue_occurrences_daily
+DELETE WHERE issue_id NOT IN (
+    SELECT id FROM mysql('MARIADB_HOST:3306', 'monitor', 'issues', 'MARIADB_USER', 'MARIADB_PASSWORD')
+);
+
+-- Step 2 — watch it. Mutations are ASYNCHRONOUS: the statement above returns as
+-- soon as it is accepted, not when it has been applied, and a failure surfaces
+-- in latest_fail_reason rather than at the client that submitted it.
+--
+--   SELECT mutation_id, command, parts_to_do, is_done, latest_fail_reason
+--   FROM system.mutations
+--   WHERE database = 'monitor' AND table = 'issue_occurrences_daily' AND is_done = 0
+--   ORDER BY create_time DESC
+--
+-- A mutation still running can be cancelled:
+--
+--   KILL MUTATION WHERE database = 'monitor' AND table = 'issue_occurrences_daily' AND mutation_id = '...'
+
+-- Step 3 — after. Re-run step 0b. It should report zero orphan rows once the
+-- mutation is done.

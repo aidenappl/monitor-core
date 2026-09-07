@@ -17,6 +17,7 @@ import (
 	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
+	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
 	"github.com/gorilla/mux"
 )
@@ -103,6 +104,29 @@ func issueQueryParams(r *http.Request) (query.ListIssuesRequest, error) {
 
 // parseTimeParam accepts RFC3339 or a unix timestamp, matching the rest of the
 // query API.
+// requireProject resolves the tenant for an issue request, writing the refusal
+// and reporting false when the request carries none.
+//
+// It is a 500, not a 401 or a 403. A missing project here cannot be caused by
+// anything the caller did: every /v1 route sits behind QueryAuthMiddleware, and
+// that middleware injects a project on all three of its accepted branches. So
+// reaching this line means a route was registered outside it — a wiring mistake
+// in main.go, which is a server fault and should read as one in the logs rather
+// than being blamed on the credential.
+//
+// This mirrors scope.ProjectPredicate's refusal for the ClickHouse reads. The
+// issue tables are in MariaDB and never touch that predicate, so without an
+// equivalent here they would be the one surface where "no project" quietly meant
+// "every project".
+func requireProject(w http.ResponseWriter, r *http.Request) (string, bool) {
+	project, ok := scope.GetProject(r.Context())
+	if !ok {
+		responder.Error(w, http.StatusInternalServerError, "no project resolved for this request")
+		return "", false
+	}
+	return project, true
+}
+
 func parseTimeParam(v string) (time.Time, error) {
 	if t, err := time.Parse(time.RFC3339, v); err == nil {
 		return t.UTC(), nil
@@ -124,6 +148,16 @@ func HandleListIssues(w http.ResponseWriter, r *http.Request) {
 		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	// Stamped AFTER the caller's parameters are parsed, so it overwrites rather
+	// than competes with anything a query string could have set — the same
+	// ordering, and the same reason, as routes/stream.go applying the project
+	// after the subscriber's own filters.
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+	req.Project = project
 
 	total, err := query.CountIssues(db.SQL, req)
 	if err != nil {
@@ -233,7 +267,12 @@ func HandleGetIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	issue, err := query.GetIssue(db.SQL, id)
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	issue, err := query.GetIssue(db.SQL, project, id)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to fetch issue", err)
 		return
@@ -327,7 +366,12 @@ func HandleUpdateIssue(w http.ResponseWriter, r *http.Request) {
 		return ok && string(v) == "null"
 	}
 
-	before, err := query.GetIssue(db.SQL, id)
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	before, err := query.GetIssue(db.SQL, project, id)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to fetch issue", err)
 		return
@@ -373,7 +417,7 @@ func HandleUpdateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := query.UpdateIssue(db.SQL, id, req)
+	updated, err := query.UpdateIssue(db.SQL, project, id, req)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusBadRequest, "failed to update issue", err)
 		return
@@ -538,17 +582,30 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 	// fingerprint below. Filtering on the pre-filter alone previously returned
 	// other tenants' failures as though they were this issue's occurrences.
 	//
+	// The project is the fourth fingerprint input and is deliberately NOT in this
+	// pre-filter, because selectIssueEvents already applies it — that constructor
+	// is the one place the tenancy predicate is attached, and restating it here
+	// would create a second copy to keep in step. A row surviving that predicate
+	// still has to match on fingerprint, which is where the project is checked
+	// exactly rather than by policy.
+	//
 	// The scan is restricted to issue_id = '' so it can only ever return rows the
 	// fast path could not have: without that, a stamped event would be returned
 	// twice once both paths run.
 	var query string
 	var args []interface{}
 	if issue.Path != nil && *issue.Path != "" {
-		query = "SELECT timestamp, service, env, job_id, request_id, trace_id, user_id, name, level, data FROM " + db.Database + ".events WHERE issue_id = '' AND service = ? AND name = ? AND level IN ('error', 'fatal') AND (JSONExtractString(data, 'path') = ? OR JSONExtractString(data, 'uri') = ?) ORDER BY timestamp DESC LIMIT ?"
-		args = []interface{}{issue.Service, issue.Name, *issue.Path, *issue.Path, candidateScanLimit(limit)}
+		query, args, err = selectIssueEvents(r.Context(),
+			"issue_id = '' AND service = ? AND name = ? AND level IN ('error', 'fatal') AND (JSONExtractString(data, 'path') = ? OR JSONExtractString(data, 'uri') = ?) ORDER BY timestamp DESC LIMIT ?",
+			issue.Service, issue.Name, *issue.Path, *issue.Path, candidateScanLimit(limit))
 	} else {
-		query = "SELECT timestamp, service, env, job_id, request_id, trace_id, user_id, name, level, data FROM " + db.Database + ".events WHERE issue_id = '' AND service = ? AND name = ? AND level IN ('error', 'fatal') ORDER BY timestamp DESC LIMIT ?"
-		args = []interface{}{issue.Service, issue.Name, candidateScanLimit(limit)}
+		query, args, err = selectIssueEvents(r.Context(),
+			"issue_id = '' AND service = ? AND name = ? AND level IN ('error', 'fatal') ORDER BY timestamp DESC LIMIT ?",
+			issue.Service, issue.Name, candidateScanLimit(limit))
+	}
+	if err != nil {
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to build event query", err)
+		return
 	}
 	rows, err := db.Conn.Query(r.Context(), query, args...)
 	if err != nil {
@@ -564,7 +621,7 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		var e structs.Event
 		var dataStr string
-		if err := rows.Scan(&e.Timestamp, &e.Service, &e.Env, &e.JobID, &e.RequestID, &e.TraceID, &e.UserID, &e.Name, &e.Level, &dataStr); err != nil {
+		if err := rows.Scan(&e.Timestamp, &e.Service, &e.Project, &e.Env, &e.JobID, &e.RequestID, &e.TraceID, &e.UserID, &e.Name, &e.Level, &dataStr); err != nil {
 			responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to scan event", err)
 			return
 		}
@@ -598,13 +655,54 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 	responder.New(w, events)
 }
 
+// issueEventColumns is the projection both reads below share, in the order
+// scanEventRow expects.
+const issueEventColumns = "timestamp, service, project, env, job_id, request_id, trace_id, user_id, name, level, data"
+
+// selectIssueEvents is the ONLY way this file builds SQL against monitor.events,
+// and the single place the tenancy predicate is applied to it.
+//
+// These reads are the ones most likely to leak, because they are hand-written
+// strings that go nowhere near services/query.go's allowlists or squirrel
+// builders — nothing structural was stopping them from selecting every project's
+// errors, and a reviewer scanning the builders would never see them. Funnelling
+// both through one constructor makes the predicate impossible to omit: there is
+// no other expression in this file that names the table.
+//
+// The caller supplies everything after the project predicate — its own WHERE
+// conditions plus any ORDER BY / LIMIT tail — and its args are appended after
+// the project's, which is the order the positional `?` placeholders appear in.
+func selectIssueEvents(ctx context.Context, where string, args ...interface{}) (string, []interface{}, error) {
+	predicate, scopeArgs, err := scope.ProjectPredicate(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+
+	query := fmt.Sprintf("SELECT %s FROM %s.events WHERE %s AND %s", issueEventColumns, db.Database, predicate, where)
+	return query, append(scopeArgs, args...), nil
+}
+
 // queryEventsByIssueID returns an issue's events by indexed equality on the
 // stamped issue_id. This is the path that replaces scan-and-recompute: exact
 // membership, no candidate window, and no fingerprinting in Go.
+//
+// The issue_id match alone is NOT a tenancy boundary, and it did not become one
+// when 118_issues_project.sql put the project into the fingerprint. That made
+// every NEWLY minted id project-specific; ids minted before it were computed
+// from service + name + path alone, and events stamped with one of those are
+// still inside the 30-day retention window — so a legacy id can legitimately
+// span several projects' rows. Which is why this still goes through
+// selectIssueEvents rather than trusting the id to be narrow enough on its own,
+// and why it keeps doing so after those rows age out: an id travels into
+// monitor-web URLs, alert payloads and comments, so it is a value a caller can
+// hold without being entitled to what it selects.
 func queryEventsByIssueID(ctx context.Context, issueID string, limit int) ([]*structs.Event, error) {
-	const q = "SELECT timestamp, service, env, job_id, request_id, trace_id, user_id, name, level, data FROM %s.events WHERE issue_id = ? ORDER BY timestamp DESC LIMIT ?"
+	query, args, err := selectIssueEvents(ctx, "issue_id = ? ORDER BY timestamp DESC LIMIT ?", issueID, limit)
+	if err != nil {
+		return nil, err
+	}
 
-	rows, err := db.Conn.Query(ctx, fmt.Sprintf(q, db.Database), issueID, limit)
+	rows, err := db.Conn.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -614,7 +712,7 @@ func queryEventsByIssueID(ctx context.Context, issueID string, limit int) ([]*st
 	for rows.Next() {
 		var e structs.Event
 		var dataStr string
-		if err := rows.Scan(&e.Timestamp, &e.Service, &e.Env, &e.JobID, &e.RequestID, &e.TraceID, &e.UserID, &e.Name, &e.Level, &dataStr); err != nil {
+		if err := rows.Scan(&e.Timestamp, &e.Service, &e.Project, &e.Env, &e.JobID, &e.RequestID, &e.TraceID, &e.UserID, &e.Name, &e.Level, &dataStr); err != nil {
 			return nil, err
 		}
 		if dataStr != "" && dataStr != "{}" {

@@ -27,22 +27,24 @@ func TestValidateWithIdentity(t *testing.T) {
 	)
 
 	seedCache(t, map[string]cachedKey{
-		hashKey(adminRaw):   {ID: "k-admin", Name: "monitor-mcp", Scope: ScopeAdmin},
-		hashKey(ingestRaw):  {ID: "k-ingest", Name: "go-monitor", Scope: ScopeIngest},
-		hashKey(unnamedRaw): {ID: "k-unnamed", Name: "", Scope: ScopeAdmin},
+		hashKey(adminRaw):   {ID: "k-admin", Name: "monitor-mcp", Scope: ScopeAdmin, ProjectID: 1, ProjectSlug: "default"},
+		hashKey(ingestRaw):  {ID: "k-ingest", Name: "go-monitor", Scope: ScopeIngest, ProjectID: 2, ProjectSlug: "payments"},
+		hashKey(unnamedRaw): {ID: "k-unnamed", Name: "", Scope: ScopeAdmin, ProjectID: 1, ProjectSlug: "default"},
 	})
 
 	tests := []struct {
-		name      string
-		raw       string
-		wantOK    bool
-		wantID    string
-		wantName  string
-		wantScope Scope
+		name        string
+		raw         string
+		wantOK      bool
+		wantID      string
+		wantName    string
+		wantScope   Scope
+		wantProject int64
+		wantSlug    string
 	}{
-		{name: "admin key resolves with name", raw: adminRaw, wantOK: true, wantID: "k-admin", wantName: "monitor-mcp", wantScope: ScopeAdmin},
-		{name: "ingest key resolves with its scope", raw: ingestRaw, wantOK: true, wantID: "k-ingest", wantName: "go-monitor", wantScope: ScopeIngest},
-		{name: "unnamed key still resolves", raw: unnamedRaw, wantOK: true, wantID: "k-unnamed", wantName: "", wantScope: ScopeAdmin},
+		{name: "admin key resolves with name", raw: adminRaw, wantOK: true, wantID: "k-admin", wantName: "monitor-mcp", wantScope: ScopeAdmin, wantProject: 1, wantSlug: "default"},
+		{name: "ingest key resolves with its scope", raw: ingestRaw, wantOK: true, wantID: "k-ingest", wantName: "go-monitor", wantScope: ScopeIngest, wantProject: 2, wantSlug: "payments"},
+		{name: "unnamed key still resolves", raw: unnamedRaw, wantOK: true, wantID: "k-unnamed", wantName: "", wantScope: ScopeAdmin, wantProject: 1, wantSlug: "default"},
 		{name: "unknown key does not resolve", raw: "nope", wantOK: false},
 		{name: "empty key does not resolve", raw: "", wantOK: false},
 	}
@@ -64,6 +66,16 @@ func TestValidateWithIdentity(t *testing.T) {
 			}
 			if identity.Scope != tt.wantScope {
 				t.Errorf("Scope = %q, want %q", identity.Scope, tt.wantScope)
+			}
+			// The tenant binding is asserted per-key, not once, because the bug
+			// this guards against is a field silently dropped on the way out of
+			// the cache — which reads as "everything works" everywhere except
+			// the project column of every event the key ever writes.
+			if identity.ProjectID != tt.wantProject {
+				t.Errorf("ProjectID = %d, want %d", identity.ProjectID, tt.wantProject)
+			}
+			if identity.ProjectSlug != tt.wantSlug {
+				t.Errorf("ProjectSlug = %q, want %q", identity.ProjectSlug, tt.wantSlug)
 			}
 		})
 	}

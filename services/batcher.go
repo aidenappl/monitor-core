@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/aidenappl/monitor-core/structs"
@@ -20,6 +21,11 @@ type Batcher struct {
 	batchSize     int
 	flushInterval time.Duration
 	batch         []*structs.Event
+
+	// lastFlush is the UnixNano of the most recent SUCCESSFUL WriteBatch, 0 if
+	// there has never been one. Read from the /health handler's goroutine, so
+	// atomic rather than a plain time.Time.
+	lastFlush atomic.Int64
 }
 
 // NewBatcher creates a new batcher
@@ -66,6 +72,19 @@ func (b *Batcher) Run(ctx context.Context) {
 	}
 }
 
+// LastFlushAt reports when a batch last reached the writer successfully. The
+// zero Time means never — which, unlike the drop counter, distinguishes "just
+// booted, nothing to write yet" from "has been failing since boot": a process
+// whose very first flush fails drops events without the counter ever having had
+// a healthy value to move away from.
+func (b *Batcher) LastFlushAt() time.Time {
+	ns := b.lastFlush.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
 const (
 	maxFlushRetries    = 5
 	flushRetryBaseWait = 2 * time.Second
@@ -84,6 +103,7 @@ func (b *Batcher) flush(ctx context.Context) {
 
 		if err == nil {
 			log.Printf("flushed %d events in %v", len(b.batch), duration)
+			b.lastFlush.Store(time.Now().UnixNano())
 			b.batch = b.batch[:0]
 			return
 		}
@@ -95,6 +115,10 @@ func (b *Batcher) flush(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			log.Printf("context cancelled, dropping batch of %d events after %d failed attempt(s)", len(b.batch), attempt)
+			// Abandoning the batch destroys these events. Record them before
+			// truncating, or /health keeps reporting dropped=0 through an
+			// outage that is losing everything.
+			b.queue.RecordDropped(int64(len(b.batch)))
 			b.batch = b.batch[:0]
 			return
 		case <-time.After(wait):
@@ -102,5 +126,6 @@ func (b *Batcher) flush(ctx context.Context) {
 	}
 
 	log.Printf("permanently dropping batch of %d events after %d failed attempts: %v", len(b.batch), maxFlushRetries, err)
+	b.queue.RecordDropped(int64(len(b.batch)))
 	b.batch = b.batch[:0]
 }

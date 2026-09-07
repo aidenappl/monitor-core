@@ -10,9 +10,26 @@ import (
 	"github.com/aidenappl/monitor-core/structs"
 )
 
+// apiKeyColumns is table-qualified because every read joins projects to resolve
+// the slug. Unqualified `id` would be ambiguous the moment the join is present,
+// and MariaDB reports that as a query error rather than picking one — a failure
+// that would take down authentication wholesale, since refreshCache runs this.
 var apiKeyColumns = []string{
-	"id", "name", "key_hash", "key_prefix", "scope", "created_at", "last_used_at",
+	"api_keys.id", "api_keys.name", "api_keys.key_hash", "api_keys.key_prefix",
+	"api_keys.scope", "api_keys.project_id", "projects.slug",
+	"api_keys.created_at", "api_keys.last_used_at",
 }
+
+// apiKeysWithProject is the FROM clause every read shares.
+//
+// INNER JOIN, not LEFT. project_id is NOT NULL with a foreign key to projects
+// (migration 117), so the join cannot drop a row — and if a future schema change
+// ever broke that, an inner join makes the key vanish from the cache and stop
+// authenticating, whereas a left join would keep it working with an empty
+// project slug and stamp every one of its events with a blank tenant. Failing
+// closed on a binding that should be impossible is worth more than a resilience
+// that quietly mis-files data.
+const apiKeysWithProject = "api_keys JOIN projects ON projects.id = api_keys.project_id"
 
 type apiKeyScanner interface {
 	Scan(dest ...interface{}) error
@@ -21,7 +38,8 @@ type apiKeyScanner interface {
 func scanAPIKey(row apiKeyScanner) (*structs.APIKey, error) {
 	var k structs.APIKey
 	var scope string
-	if err := row.Scan(&k.ID, &k.Name, &k.KeyHash, &k.KeyPrefix, &scope, &k.CreatedAt, &k.LastUsedAt); err != nil {
+	if err := row.Scan(&k.ID, &k.Name, &k.KeyHash, &k.KeyPrefix, &scope,
+		&k.ProjectID, &k.ProjectSlug, &k.CreatedAt, &k.LastUsedAt); err != nil {
 		return nil, err
 	}
 	k.Scope = structs.Scope(scope)
@@ -29,11 +47,48 @@ func scanAPIKey(row apiKeyScanner) (*structs.APIKey, error) {
 }
 
 // ListAPIKeys returns every stored API key (including key_hash, which callers
-// must not serialize) ordered newest-first.
-func ListAPIKeys(engine db.Queryable) ([]structs.APIKey, error) {
-	query, args, err := sq.Select(apiKeyColumns...).
-		From("api_keys").
-		OrderBy("created_at DESC").
+// must not serialize) ordered newest-first, each with its project resolved.
+//
+// The project is joined here rather than fetched by the caller because this is
+// what apikeys.refreshCache reads every 30 seconds to rebuild the entire auth
+// cache. Resolving the slug per key afterwards would turn one query into one
+// plus one per key, on a timer, forever.
+// ListAllAPIKeys returns every key across every project.
+//
+// This exists for exactly ONE caller: the apikeys cache refresh. Validation must
+// resolve a presented key whatever project it belongs to — the cache is the
+// authentication path, not a view — so scoping it would make keys outside the
+// refresher's notion of "current project" silently stop authenticating, and the
+// refresher has no request and therefore no project at all.
+//
+// Every other reader wants ListAPIKeys. If you are adding a second caller here,
+// that is the signal you want the scoped one.
+func ListAllAPIKeys(engine db.Queryable) ([]structs.APIKey, error) {
+	return listAPIKeys(engine, nil)
+}
+
+// ListAPIKeys returns the keys belonging to one project.
+//
+// Scoped rather than global because the page that renders it carries a project
+// selector: showing every project's keys under a control that says "atlas" is
+// the same class of lie as showing every project's events would be. A caller
+// wanting the whole inventory switches project, exactly as it would to see
+// another project's issues.
+func ListAPIKeys(engine db.Queryable, projectSlug string) ([]structs.APIKey, error) {
+	return listAPIKeys(engine, &projectSlug)
+}
+
+// listAPIKeys is the one builder both readers share. A nil projectSlug means
+// every project — expressible only here, never from outside the package, so the
+// unscoped read cannot be reached by passing an empty string by accident.
+func listAPIKeys(engine db.Queryable, projectSlug *string) ([]structs.APIKey, error) {
+	q := sq.Select(apiKeyColumns...).From(apiKeysWithProject)
+	if projectSlug != nil {
+		q = q.Where(sq.Eq{"projects.slug": *projectSlug})
+	}
+
+	query, args, err := q.
+		OrderBy("api_keys.created_at DESC").
 		ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("build query: %w", err)
@@ -59,8 +114,8 @@ func ListAPIKeys(engine db.Queryable) ([]structs.APIKey, error) {
 // GetAPIKeyByID resolves a single key. Returns (nil, nil) when not found.
 func GetAPIKeyByID(engine db.Queryable, id string) (*structs.APIKey, error) {
 	query, args, err := sq.Select(apiKeyColumns...).
-		From("api_keys").
-		Where(sq.Eq{"id": id}).
+		From(apiKeysWithProject).
+		Where(sq.Eq{"api_keys.id": id}).
 		ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("build query: %w", err)
@@ -76,21 +131,34 @@ func GetAPIKeyByID(engine db.Queryable, id string) (*structs.APIKey, error) {
 	return k, nil
 }
 
+// CreateAPIKeyRequest is a fully-resolved row. ProjectID is an id, not a slug:
+// resolving the slug is the caller's job (apikeys.Create), so this layer never
+// has to guess which zone a bare slug belonged to.
 type CreateAPIKeyRequest struct {
 	ID        string
 	Name      string
 	KeyHash   string
 	KeyPrefix string
 	Scope     structs.Scope
+	ProjectID int64
 	CreatedAt time.Time
 }
 
 // CreateAPIKey inserts a new key row. The raw key/prefix/hash are generated by
 // the caller (apikeys package).
+//
+// ProjectID is required and is not defaulted here. A zero would fail
+// fk_api_keys_project anyway, but it would fail as errno 1452 naming a
+// constraint rather than as a sentence naming the missing field, and this is the
+// layer that knows which field it was.
 func CreateAPIKey(engine db.Queryable, req CreateAPIKeyRequest) error {
+	if req.ProjectID <= 0 {
+		return fmt.Errorf("project_id is required")
+	}
+
 	query, args, err := sq.Insert("api_keys").
-		Columns("id", "name", "key_hash", "key_prefix", "scope", "created_at").
-		Values(req.ID, req.Name, req.KeyHash, req.KeyPrefix, string(req.Scope), req.CreatedAt).
+		Columns("id", "name", "key_hash", "key_prefix", "scope", "project_id", "created_at").
+		Values(req.ID, req.Name, req.KeyHash, req.KeyPrefix, string(req.Scope), req.ProjectID, req.CreatedAt).
 		ToSql()
 	if err != nil {
 		return fmt.Errorf("build query: %w", err)

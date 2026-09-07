@@ -8,6 +8,7 @@ import (
 
 	sq "github.com/Masterminds/squirrel"
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
 )
 
@@ -58,15 +59,32 @@ func eventsTable() string {
 	return fmt.Sprintf("%s.events", db.Database)
 }
 
-var validColumns = map[string]bool{
-	"service":    true,
-	"env":        true,
-	"job_id":     true,
-	"request_id": true,
-	"trace_id":   true,
-	"user_id":    true,
-	"name":       true,
-	"level":      true,
+// selectEvents is the ONLY constructor in this package for a query against
+// monitor.events, and it is the single place the tenancy predicate is applied.
+//
+// The predicate is attached at construction rather than added by each caller
+// because the failure mode of the alternative is invisible. A builder that
+// forgets a .Where(project) still compiles, still runs, still returns rows, and
+// the rows it returns are another project's. There is nothing to notice unless
+// you already know to look. Attached here, "unscoped" is not a mistake that can
+// be made — it is a query that cannot be built, because there is no other way to
+// name the table.
+//
+// The error is propagated rather than swallowed for the same reason: a context
+// with no project means the route was registered outside QueryAuthMiddleware,
+// and the only safe response to "I do not know whose data this is" is to refuse
+// to answer. See scope.ProjectPredicate, which also documents the empty-string
+// transition arm that keeps pre-migration rows visible to the default project.
+func selectEvents(ctx context.Context, columns ...string) (sq.SelectBuilder, error) {
+	predicate, args, err := scope.ProjectPredicate(ctx)
+	if err != nil {
+		return sq.SelectBuilder{}, err
+	}
+
+	return sq.Select(columns...).
+		From(eventsTable()).
+		Where(predicate, args...).
+		PlaceholderFormat(sq.Question), nil
 }
 
 func applyFilters(builder sq.SelectBuilder, params QueryParams) (sq.SelectBuilder, error) {
@@ -93,7 +111,7 @@ func applyFilters(builder sq.SelectBuilder, params QueryParams) (sq.SelectBuilde
 }
 
 func applyColumnFilter(builder sq.SelectBuilder, f Filter) (sq.SelectBuilder, error) {
-	if !validColumns[f.Field] {
+	if !structs.QueryableColumns[f.Field] {
 		return builder, fmt.Errorf("invalid filter column: %s", f.Field)
 	}
 
@@ -128,9 +146,11 @@ func applyColumnFilter(builder sq.SelectBuilder, f Filter) (sq.SelectBuilder, er
 func applyDataFilter(builder sq.SelectBuilder, f Filter) (sq.SelectBuilder, error) {
 	// f.Field is the JSON key (the "data." prefix is stripped during parsing) and
 	// is interpolated directly into the SQL text as a string literal, so it MUST be
-	// validated against safeIdentifierRegex (same guard as analytics.go) to prevent
-	// SQL injection. Reject invalid keys rather than silently dropping the filter.
-	if !safeIdentifierRegex.MatchString(f.Field) {
+	// validated against structs.SafeIdentifierRegex to prevent SQL injection. That
+	// regex is shared with analytics and alerts precisely so this guard cannot
+	// drift from theirs. Reject invalid keys rather than silently dropping the
+	// filter.
+	if !structs.SafeIdentifierRegex.MatchString(f.Field) {
 		return builder, fmt.Errorf("invalid data field name: %s", f.Field)
 	}
 
@@ -170,10 +190,11 @@ func QueryEvents(ctx context.Context, params QueryParams) (*QueryResult, error) 
 	}
 
 	// Count query
-	countBuilder := sq.Select("count()").
-		From(eventsTable()).
-		PlaceholderFormat(sq.Question)
-	countBuilder, err := applyFilters(countBuilder, params)
+	countBuilder, err := selectEvents(ctx, "count()")
+	if err != nil {
+		return nil, err
+	}
+	countBuilder, err = applyFilters(countBuilder, params)
 	if err != nil {
 		return nil, err
 	}
@@ -189,12 +210,14 @@ func QueryEvents(ctx context.Context, params QueryParams) (*QueryResult, error) 
 	}
 
 	// Data query
-	queryBuilder := sq.Select("timestamp", "service", "env", "job_id", "request_id", "trace_id", "user_id", "name", "level", "data").
-		From(eventsTable()).
+	queryBuilder, err := selectEvents(ctx, "timestamp", "service", "project", "env", "job_id", "request_id", "trace_id", "user_id", "name", "level", "data")
+	if err != nil {
+		return nil, err
+	}
+	queryBuilder = queryBuilder.
 		OrderBy("timestamp DESC").
 		Limit(uint64(params.Limit)).
-		Offset(uint64(params.Offset)).
-		PlaceholderFormat(sq.Question)
+		Offset(uint64(params.Offset))
 	queryBuilder, err = applyFilters(queryBuilder, params)
 	if err != nil {
 		return nil, err
@@ -215,7 +238,7 @@ func QueryEvents(ctx context.Context, params QueryParams) (*QueryResult, error) 
 	for rows.Next() {
 		var e structs.Event
 		var dataStr string
-		if err := rows.Scan(&e.Timestamp, &e.Service, &e.Env, &e.JobID, &e.RequestID, &e.TraceID, &e.UserID, &e.Name, &e.Level, &dataStr); err != nil {
+		if err := rows.Scan(&e.Timestamp, &e.Service, &e.Project, &e.Env, &e.JobID, &e.RequestID, &e.TraceID, &e.UserID, &e.Name, &e.Level, &dataStr); err != nil {
 			return nil, fmt.Errorf("scan failed: %w", err)
 		}
 		if dataStr != "" && dataStr != "{}" {
@@ -234,27 +257,24 @@ func QueryEvents(ctx context.Context, params QueryParams) (*QueryResult, error) 
 	}, nil
 }
 
-var validLabels = map[string]string{
-	"service": "service",
-	"env":     "env",
-	"user_id": "user_id",
-	"name":    "name",
-	"level":   "level",
-}
-
 func GetLabelValues(ctx context.Context, label string, params QueryParams) (*LabelValuesResult, error) {
-	column, ok := validLabels[label]
+	column, ok := structs.LabelColumns[label]
 	if !ok {
 		return nil, fmt.Errorf("invalid label: %s", label)
 	}
 
-	builder := sq.Select(fmt.Sprintf("DISTINCT %s", column)).
-		From(eventsTable()).
-		OrderBy(column).
-		Limit(1000).
-		PlaceholderFormat(sq.Question)
+	builder, err := selectEvents(ctx, fmt.Sprintf("DISTINCT %s", column))
+	if err != nil {
+		return nil, err
+	}
+	builder = builder.OrderBy(column).Limit(1000)
 
-	// Apply filters except the one we're getting values for
+	// Apply filters except the one we're getting values for.
+	//
+	// This skips only the CALLER's filter on the requested column. The tenancy
+	// predicate is not a filter — it was attached by selectEvents above and is
+	// untouched by this loop — so asking for the values of `project` still
+	// returns the caller's own project rather than every project's.
 	for _, f := range params.Filters {
 		if !f.IsData && f.Field == column {
 			continue
@@ -307,12 +327,12 @@ func GetLabelValues(ctx context.Context, label string, params QueryParams) (*Lab
 }
 
 func GetDataKeys(ctx context.Context, params QueryParams) (*DataKeysResult, error) {
-	builder := sq.Select("DISTINCT arrayJoin(JSONExtractKeys(data)) AS key").
-		From(eventsTable()).
-		OrderBy("key").
-		Limit(1000).
-		PlaceholderFormat(sq.Question)
-	builder, err := applyFilters(builder, params)
+	builder, err := selectEvents(ctx, "DISTINCT arrayJoin(JSONExtractKeys(data)) AS key")
+	if err != nil {
+		return nil, err
+	}
+	builder = builder.OrderBy("key").Limit(1000)
+	builder, err = applyFilters(builder, params)
 	if err != nil {
 		return nil, err
 	}
@@ -349,13 +369,25 @@ func GetDataValues(ctx context.Context, key string, params QueryParams) (*LabelV
 		return nil, fmt.Errorf("key is required")
 	}
 
-	builder := sq.Select("DISTINCT JSONExtractString(data, ?) AS value").
-		From(eventsTable()).
-		Where("JSONExtractString(data, ?) != ''").
+	// The key is bound through squirrel — Column for the SELECT expression, an
+	// argument on the WHERE — rather than by hand-prepending both to the arg
+	// slice as this did before. That prepend was correct only while the tenancy
+	// predicate did not exist: squirrel emits args in CLAUSE order (columns,
+	// from, where, ...), not in call order, so the project argument attached by
+	// selectEvents now lands between the SELECT's placeholder and this WHERE's.
+	// A hand-built slice would have silently mismatched every placeholder from
+	// the second one on — bound values sliding one position along, which is not
+	// an error, just wrong rows.
+	builder, err := selectEvents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	builder = builder.
+		Column("DISTINCT JSONExtractString(data, ?) AS value", key).
+		Where("JSONExtractString(data, ?) != ''", key).
 		OrderBy("value").
-		Limit(1000).
-		PlaceholderFormat(sq.Question)
-	builder, err := applyFilters(builder, params)
+		Limit(1000)
+	builder, err = applyFilters(builder, params)
 	if err != nil {
 		return nil, err
 	}
@@ -364,9 +396,6 @@ func GetDataValues(ctx context.Context, key string, params QueryParams) (*LabelV
 	if err != nil {
 		return nil, fmt.Errorf("failed to build query: %w", err)
 	}
-
-	// Prepend the key arguments for JSONExtractString (SELECT and WHERE)
-	queryArgs = append([]interface{}{key, key}, queryArgs...)
 
 	rows, err := db.Conn.Query(ctx, querySQL, queryArgs...)
 	if err != nil {

@@ -57,8 +57,16 @@ func (p IssuePriority) IsValid() bool {
 // handlers return today. It is superseded by this struct when processError and
 // the read paths are cut over to MariaDB.
 type Issue struct {
-	ID              string         `json:"id"`
-	Fingerprint     string         `json:"fingerprint"`
+	ID          string `json:"id"`
+	Fingerprint string `json:"fingerprint"`
+
+	// Project is the tenant this issue belongs to. It is not an independent
+	// attribute of the row — the project is a component of Fingerprint, and ID is
+	// derived from Fingerprint, so the three are one fact stored three ways.
+	// Nothing may edit it: moving an issue between projects would mean changing
+	// its identity, which is a different row, not an update.
+	Project string `json:"project"`
+
 	Service         string         `json:"service"`
 	Name            string         `json:"name"`
 	Message         *string        `json:"message"`

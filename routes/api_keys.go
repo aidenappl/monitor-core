@@ -2,6 +2,7 @@ package routes
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/aidenappl/monitor-core/apikeys"
@@ -22,9 +23,14 @@ func HandleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 func HandleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	// ProjectSlug names the tenant the new key will file events under. Omitting
+	// it falls back to env.DefaultProjectSlug inside apikeys.Create — the same
+	// project every pre-existing key was backfilled to — so the existing admin UI
+	// and monitor-mcp, neither of which sends one yet, keep working unchanged.
 	var body struct {
-		Name  string `json:"name"`
-		Scope string `json:"scope"`
+		Name        string `json:"name"`
+		Scope       string `json:"scope"`
+		ProjectSlug string `json:"project_slug"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
@@ -40,9 +46,20 @@ func HandleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		scope = apikeys.ScopeAdmin
 	}
 
-	result, err := apikeys.Create(r.Context(), body.Name, scope)
+	result, err := apikeys.Create(r.Context(), body.Name, scope, body.ProjectSlug)
 	if err != nil {
-		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to create api key", err)
+		// Both of these are the caller's to fix, so they must not read as 500s.
+		// Naming a key twice within one project became possible to get wrong in
+		// migration 117, which added UNIQUE(project_id, name) where nothing had
+		// constrained name before.
+		switch {
+		case errors.Is(err, apikeys.ErrDuplicateKeyName):
+			responder.Error(w, http.StatusConflict, err.Error())
+		case errors.Is(err, apikeys.ErrUnknownProject):
+			responder.Error(w, http.StatusBadRequest, err.Error())
+		default:
+			responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to create api key", err)
+		}
 		return
 	}
 

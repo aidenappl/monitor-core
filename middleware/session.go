@@ -2,10 +2,12 @@ package middleware
 
 import (
 	"context"
+	"crypto/subtle"
 	"net/http"
 	"strings"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/jwt"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
@@ -29,6 +31,25 @@ const ActorContextKey contextKey = "mon-actor"
 // env-based master key (env.IngestKey). It has no database row and therefore no
 // name of its own, so audit rows attribute it to this fixed identifier.
 const EnvMasterKeyLabel = "env-master-key"
+
+// matchesEnvMasterKey reports whether a presented X-Api-Key is the env-based
+// master key. Both auth middlewares route through here so the two comparisons
+// cannot drift apart, and so the constant-time property holds on both: `==` on
+// strings returns at the first differing byte, which leaks the shared prefix to
+// anyone who can time the response and is exactly the compare
+// subtle.ConstantTimeCompare exists to replace (csrf.go uses it for the same
+// reason).
+//
+// The two emptiness guards are load-bearing, not defensive noise. With
+// MONITOR_API_KEY unset, ConstantTimeCompare("", "") returns 1 — so without
+// them every request arriving with no X-Api-Key header would authenticate as
+// the master key.
+func matchesEnvMasterKey(presented string) bool {
+	if env.IngestKey == "" || presented == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(env.IngestKey)) == 1
+}
 
 // WithActor returns a context carrying the resolved actor.
 func WithActor(ctx context.Context, actor *structs.Actor) context.Context {

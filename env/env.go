@@ -25,6 +25,13 @@ var (
 	IngestKey          string
 	BatchSize          int
 
+	// ClickHouseMaxMemoryUsage is the per-query memory ceiling in BYTES, passed
+	// to ClickHouse as the max_memory_usage setting. Exposed as config because
+	// the right number is a property of the host, not of this code — see the
+	// comment on the Settings map in db/clickhouse.go for why the default is
+	// what it is.
+	ClickHouseMaxMemoryUsage int
+
 	// MariaDB (relational auth data layer — users, identities, tokens, api_keys)
 	MonDBDSN      string
 	FlushInterval time.Duration
@@ -64,6 +71,46 @@ var (
 	AdminPassword     string
 	AllowRegistration bool
 
+	// Tenancy registry seed (see bootstrap.EnsureZoneAndProject). Both name the
+	// single zone and single project a fresh install is seeded with. Slugs are
+	// immutable, so changing either after the rows exist renames NOTHING — the
+	// next boot seeds an additional zone or project beside the old one.
+	//
+	// NEITHER IS BOOT-ONLY, and DefaultProjectSlug least of all. An earlier
+	// version of this comment claimed both were read only by the seeder; that was
+	// true when it was written and stopped being true when reads became
+	// project-scoped. Changing MON_DEFAULT_PROJECT on a running install is a live
+	// behaviour change with a data-visibility blast radius, because it is read:
+	//   * per request, by IngestAuthMiddleware and QueryAuthMiddleware — it is the
+	//     project the env master key writes AND reads, and the one a dashboard
+	//     session reads;
+	//   * per query, by scope.ProjectPredicate — and ONLY the reader whose project
+	//     equals it also matches the pre-006 rows that carry an empty project, so
+	//     pointing it somewhere else makes every unbackfilled event invisible;
+	//   * per event, by scope.Matches on the SSE path, under the same rule;
+	//   * per error, by issues.fingerprintProject, which folds an empty project
+	//     onto it — so it is a component of the issue fingerprint, and moving it
+	//     re-keys every issue derived from an unstamped row.
+	// The api_keys rows are NOT re-pointed by changing it: they hold a project id
+	// (migration 117), so a credential keeps reading the project it was bound to
+	// while the master key and every session move to the new one. ZoneSlug is
+	// narrower but still not boot-only — apikeys.resolveProject reads it on
+	// POST /v1/api-keys to decide which zone a new key's project is looked up in.
+	//
+	// ZoneSlug defaults to "trailblaze" because that is what the existing data
+	// actually is: all 15 services currently reporting to this instance are
+	// Trailblaze services, so any other default would be a fiction the first
+	// operator has to correct.
+	//
+	// DefaultProjectSlug defaults to "default" because every api_keys row binds
+	// to it, and because the env master key — which has no api_keys row and
+	// therefore no binding of its own — stamps its events with it too. That
+	// follows the Mimir "anonymous" and Loki "fake" precedent: the tenant
+	// dimension is never left null, because a null tenant is a row that every
+	// later filter silently drops.
+	ZoneSlug           string
+	DefaultProjectSlug string
+
 	// GitHub integration for issue links. Both are OPTIONAL — with neither set,
 	// links are still stored and rendered, they just carry no live state and no
 	// webhook updates. GitHub must never be required for issue triage to work.
@@ -85,6 +132,11 @@ func Load() {
 	ClickHouseUsername = getEnv("CLICKHOUSE_USERNAME", "default")
 	ClickHousePassword = getEnv("CLICKHOUSE_PASSWORD", "")
 	IngestKey = getEnv("MONITOR_API_KEY", "")
+
+	// 2 GiB. Sized against the deployed host (worker-6, ~8 GB shared with other
+	// containers), not against ClickHouse's own 10 GiB default — which is larger
+	// than the whole machine and therefore no limit at all here.
+	ClickHouseMaxMemoryUsage = getEnvInt("CLICKHOUSE_MAX_MEMORY_USAGE", 2147483648)
 
 	// MariaDB DSN — sourced from Keyring (MON_DB_DSN) in production, injected
 	// into the environment before Load() runs. The fallback targets the local
@@ -113,6 +165,12 @@ func Load() {
 	AdminEmail = getEnv("MON_ADMIN_EMAIL", "")
 	AdminPassword = getEnv("MON_ADMIN_PASSWORD", "")
 	AllowRegistration = getEnv("MON_ALLOW_REGISTRATION", "false") == "true"
+
+	// Tenancy registry seed. Both are read once, by bootstrap.EnsureZoneAndProject,
+	// and both are validated as slugs there — a typo fails the boot rather than
+	// minting a permanently misnamed row, since slugs are immutable.
+	ZoneSlug = getEnv("MON_ZONE_SLUG", "trailblaze")
+	DefaultProjectSlug = getEnv("MON_DEFAULT_PROJECT", "default")
 
 	// Sourced from Keyring in production. No dev fallback and no panic: absent
 	// means the GitHub features are simply inactive.

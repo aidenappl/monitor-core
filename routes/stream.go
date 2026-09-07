@@ -7,11 +7,50 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/services"
 )
 
 // EventHub is the global SSE hub (set from main.go)
 var EventHub *services.Hub
+
+// clientStreamFilters are the filter keys a subscriber may choose for itself.
+// "project" is deliberately absent and must stay absent — see below.
+var clientStreamFilters = []string{"service", "env", "level", "name"}
+
+// subscriptionFilters builds the hub filter map for one stream request, and
+// reports false when the request carries no project.
+//
+// It is split out of the handler so it can be tested, which the handler itself
+// cannot be: StreamEventsHandler blocks until the client disconnects, and the
+// thing worth asserting on happens before that — the filter map handed to the
+// hub, which is the entire tenancy boundary for a live tail.
+//
+// The project is MANDATORY and SERVER-DERIVED. It is applied AFTER the client's
+// filters, so even if "project" were one day added to clientStreamFilters by
+// mistake, the credential's value would overwrite the query parameter rather
+// than lose to it. Two independent guards for one property, because the failure
+// they prevent leaves no trace: a stream is not a stored query, so a subscriber
+// receiving another project's live errors produces no statement to read back,
+// no audit row, and no error — just the wrong data, silently, for as long as the
+// connection is held. Refusing outright is the only safe response to "I do not
+// know whose events these should be".
+func subscriptionFilters(r *http.Request) (map[string]string, bool) {
+	filters := make(map[string]string)
+	for _, key := range clientStreamFilters {
+		if v := r.URL.Query().Get(key); v != "" {
+			filters[key] = v
+		}
+	}
+
+	project, ok := scope.GetProject(r.Context())
+	if !ok {
+		return nil, false
+	}
+	filters["project"] = project
+
+	return filters, true
+}
 
 // StreamEventsHandler handles GET /v1/events/stream (SSE)
 func StreamEventsHandler(w http.ResponseWriter, r *http.Request) {
@@ -21,12 +60,10 @@ func StreamEventsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse filters from query params
-	filters := make(map[string]string)
-	for _, key := range []string{"service", "env", "level", "name"} {
-		if v := r.URL.Query().Get(key); v != "" {
-			filters[key] = v
-		}
+	filters, ok := subscriptionFilters(r)
+	if !ok {
+		http.Error(w, "no project resolved for this request", http.StatusInternalServerError)
+		return
 	}
 
 	sub := EventHub.Subscribe(filters)

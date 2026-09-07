@@ -56,8 +56,8 @@ func TestNormalizeMessageCollapsesVariants(t *testing.T) {
 
 func TestGenerateFingerprint(t *testing.T) {
 	// Stable: same inputs → same fingerprint.
-	f1 := generateFingerprint("svc", "http_error", "boom", "/x")
-	f2 := generateFingerprint("svc", "http_error", "boom", "/x")
+	f1 := generateFingerprint("acme", "svc", "http_error", "boom", "/x")
+	f2 := generateFingerprint("acme", "svc", "http_error", "boom", "/x")
 	if f1 != f2 {
 		t.Errorf("fingerprint not stable: %q vs %q", f1, f2)
 	}
@@ -66,14 +66,14 @@ func TestGenerateFingerprint(t *testing.T) {
 	}
 
 	// UUID/number differences in the message collapse to the same fingerprint.
-	fa := generateFingerprint("svc", "http_error", "request 550e8400-e29b-41d4-a716-446655440000 took 12 ms", "/x")
-	fb := generateFingerprint("svc", "http_error", "request 6ba7b810-9dad-11d1-80b4-00c04fd430c8 took 88 ms", "/x")
+	fa := generateFingerprint("acme", "svc", "http_error", "request 550e8400-e29b-41d4-a716-446655440000 took 12 ms", "/x")
+	fb := generateFingerprint("acme", "svc", "http_error", "request 6ba7b810-9dad-11d1-80b4-00c04fd430c8 took 88 ms", "/x")
 	if fa != fb {
 		t.Errorf("expected UUID/number variants to share a fingerprint, got %q vs %q", fa, fb)
 	}
 
 	// Different service → different fingerprint.
-	if generateFingerprint("svc-a", "n", "m", "/p") == generateFingerprint("svc-b", "n", "m", "/p") {
+	if generateFingerprint("acme", "svc-a", "n", "m", "/p") == generateFingerprint("acme", "svc-b", "n", "m", "/p") {
 		t.Errorf("expected different services to produce different fingerprints")
 	}
 }

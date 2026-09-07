@@ -20,6 +20,7 @@ import (
 	"github.com/aidenappl/monitor-core/issues"
 	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/migrations"
+	"github.com/aidenappl/monitor-core/registry"
 	"github.com/aidenappl/monitor-core/routes"
 	"github.com/aidenappl/monitor-core/services"
 	"github.com/aidenappl/monitor-core/sso"
@@ -61,16 +62,43 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// Connect to ClickHouse
-	if err := db.Connect(ctx, env.ClickHouseAddr, env.ClickHouseDatabase, env.ClickHouseUsername, env.ClickHousePassword); err != nil {
+	if err := db.Connect(ctx, env.ClickHouseAddr, env.ClickHouseDatabase, env.ClickHouseUsername, env.ClickHousePassword, env.ClickHouseMaxMemoryUsage); err != nil {
 		log.Fatalf("❌ failed to connect to ClickHouse: %v", err)
 	}
 	defer db.Close()
 
 	// Apply the ClickHouse schema migrations (events + api_keys) at startup.
-	// Ingestion and queries depend on monitor.events existing, so this is
+	// Ingestion and queries depend on the events table existing, so this is
 	// fail-fast — a fresh deploy no longer needs a manual `dev migrate` step.
+	// The runner rewrites the DDL to env.ClickHouseDatabase, so it migrates the
+	// same database the serving path reads and writes.
 	if err := migrations.RunMigrations(ctx); err != nil {
 		log.Fatalf("❌ failed to run ClickHouse migrations: %v", err)
+	}
+
+	// Then prove it. Every failure mode of the above — a half-applied file, a
+	// grant that covers CREATE but not SELECT, a rewrite that lands somewhere
+	// unexpected — otherwise produces a process that boots green, accepts events
+	// and loses all of them, because nothing on the serving path reads the
+	// schema until the first write. One cheap read against the table ingestion
+	// depends on turns that into a crash-loop, which is at least visible.
+	//
+	// Retried, unlike the assertion it makes: db.Connect and db.InitSQL both
+	// retry, and a probe that crash-loops the container on one dropped
+	// connection would be a worse failure than the one it guards against. Three
+	// quick attempts separate "the schema is wrong" — which never recovers and
+	// should stop the boot — from "the connection blipped", which does.
+	probeQuery := fmt.Sprintf("SELECT count() FROM %s.events WHERE 1 = 0", db.Database)
+	var probeErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if probeErr = db.Conn.Exec(ctx, probeQuery); probeErr == nil {
+			break
+		}
+		log.Printf("attempt %d/3: %s.events not readable yet: %v", attempt, db.Database, probeErr)
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+	if probeErr != nil {
+		log.Fatalf("❌ ClickHouse table %s.events is not readable after migrations — refusing to start and silently drop events: %v", db.Database, probeErr)
 	}
 
 	// Connect to MariaDB (relational auth data layer: users, identities,
@@ -104,6 +132,15 @@ func main() {
 		log.Fatalf("❌ failed to bootstrap admin user: %v", err)
 	}
 
+	// Seed the single zone and its default project (no-op once both rows exist).
+	// Fail-fast rather than degraded: the default project is what api_keys bind
+	// to and what the env master key stamps events with, so a Monitor without it
+	// would ingest happily with a null tenant on every row — the state that is
+	// hardest to notice and impossible to reattribute afterwards.
+	if err := bootstrap.EnsureZoneAndProject(db.SQL); err != nil {
+		log.Fatalf("❌ failed to bootstrap the tenancy registry: %v", err)
+	}
+
 	// Wire the SSO revocation checkpoint into SessionMiddleware. Until this runs
 	// the hook is nil and the checkpoint is skipped.
 	sso.Install()
@@ -111,6 +148,19 @@ func main() {
 	// Initialize API key management (loads the key cache from MariaDB)
 	if err := apikeys.Init(ctx); err != nil {
 		log.Printf("WARNING: failed to initialize api keys: %v", err)
+	}
+
+	// Load the tenancy registry cache (the zone + its projects). This is what
+	// QueryAuthMiddleware validates a session's ?project selector against on
+	// every request, so it must not be a per-request MariaDB round trip.
+	//
+	// A warning rather than a fatal, like every other cache above it: the
+	// refresher keeps trying, and a failed load degrades to "no project may be
+	// explicitly selected" while the default project — which every session gets
+	// when it names none — keeps working. Failing the boot would take the whole
+	// dashboard down to protect a selector.
+	if err := registry.Init(ctx); err != nil {
+		log.Printf("WARNING: failed to initialize the tenancy registry cache: %v", err)
 	}
 
 	// Initialize dashboards
@@ -144,6 +194,7 @@ func main() {
 	// Create and start batcher
 	writer := &db.Writer{}
 	batcher := services.NewBatcher(queue, writer, env.BatchSize, env.FlushInterval)
+	routes.Batcher = batcher
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -178,7 +229,13 @@ func main() {
 	// affect the go-monitor ingest path or API-key query callers.
 	r.Use(middleware.CSRFMiddleware)
 
+	// Liveness vs readiness. /health always answers 200 — the container
+	// HEALTHCHECK points at it, and restarting the process does not repair a
+	// dead ClickHouse. /ready answers 503 naming the store that is down, so a
+	// load balancer can route around a replica that would only drop what it
+	// accepts. Do not "fix" /health to fail on dependencies; that is /ready.
 	r.HandleFunc("/health", routes.HealthHandler).Methods(http.MethodGet)
+	r.HandleFunc("/ready", routes.ReadyHandler).Methods(http.MethodGet)
 
 	// Native session auth (Monitor-owned JWT). External IdPs are config rows,
 	// mounted below via RegisterSSORoutes.
@@ -215,6 +272,16 @@ func main() {
 	// V1 API routes — protected by API key or a Monitor session
 	v1 := r.PathPrefix("/v1").Subrouter()
 	v1.Use(middleware.QueryAuthMiddleware)
+
+	// Tenancy registry reads. These are what the project switcher in monitor-web
+	// populates from, and they are READS ONLY — the registry is seeded by
+	// bootstrap.EnsureZoneAndProject and managed out of band in this phase.
+	//
+	// Clients must not send the ?project selector to either: both run through
+	// QueryAuthMiddleware, so a stale selection would refuse the exact request
+	// needed to discover a valid one.
+	v1.HandleFunc("/zones", routes.HandleListZones).Methods(http.MethodGet)
+	v1.HandleFunc("/zones/{zone}/projects", routes.HandleListProjects).Methods(http.MethodGet)
 
 	// Service → source-repository mapping. Monitor watches services across more
 	// than one GitHub org, and several service versions share one repo, so this

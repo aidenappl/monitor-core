@@ -1,5 +1,28 @@
 -- dedupe_issues_by_fingerprint.sql — MANUAL, ONE-OFF. NOT A MIGRATION.
 --
+-- ⚠️ SUPERSEDED — DO NOT RUN. It operates on the WRONG STORE.
+--
+-- This script targets `monitor.issues` as a ClickHouse ReplacingMergeTree and
+-- uses FINAL. That table stopped being the source of truth in
+-- db/migrations/111_create_issues.sql, which moved the issue row to MariaDB
+-- precisely BECAUSE ReplacingMergeTree could not enforce uniqueness — the
+-- duplicate fingerprints this script was written to clean up are the defect that
+-- motivated the move. The ClickHouse table still physically exists but is created
+-- by nothing and read only by issues/backfill.go.
+--
+-- So running this today would rewrite a dead table while the live issue rows in
+-- MariaDB are untouched, and its INSERT would re-inflate occurrence counts in a
+-- store nothing serves from. The problem it solves cannot recur: MariaDB's
+-- UNIQUE KEY on the fingerprint makes duplicate rows unrepresentable, and the
+-- upsert is a single atomic statement.
+--
+-- Kept only as the record of why the issue row moved. It is retained rather than
+-- deleted because migration 111's header cites this cleanup as evidence.
+--
+-- If you are here during the Phase 1 project rollout, the two scripts you
+-- actually want are backfill_events_project.sql and, later,
+-- delete_orphaned_issue_rollups.sql — both in this directory.
+--
 -- This lives in migrations/manual/ and NOT in migrations/ on purpose. The
 -- ClickHouse runner (migrations/embed.go) has no applied-tracking table: it
 -- re-executes every top-level migrations/*.sql on EVERY boot and requires each

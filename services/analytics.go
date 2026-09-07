@@ -3,11 +3,11 @@ package services
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
 )
 
@@ -16,21 +16,6 @@ const MaxTimeSeriesPoints = 10000
 
 // MaxQueryDuration is the maximum time range allowed for queries (90 days)
 const MaxQueryDuration = 90 * 24 * time.Hour
-
-// safeIdentifierRegex validates field names to prevent SQL injection
-var safeIdentifierRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
-
-// validGroupByColumns are columns that can be used in GROUP BY
-var validGroupByColumns = map[string]bool{
-	"service":    true,
-	"env":        true,
-	"job_id":     true,
-	"request_id": true,
-	"trace_id":   true,
-	"user_id":    true,
-	"name":       true,
-	"level":      true,
-}
 
 // buildAggregationExpr builds the SQL aggregation expression
 // All expressions are wrapped in toFloat64() for consistent Go scanning
@@ -128,12 +113,12 @@ func buildAggregationExpr(agg structs.AggregationType, field string) (string, er
 func buildFieldExpr(field string) (string, error) {
 	if strings.HasPrefix(field, "data.") {
 		key := strings.TrimPrefix(field, "data.")
-		if !safeIdentifierRegex.MatchString(key) {
+		if !structs.SafeIdentifierRegex.MatchString(key) {
 			return "", fmt.Errorf("invalid data field name: %s", key)
 		}
 		return fmt.Sprintf("JSONExtractString(data, '%s')", key), nil
 	}
-	if !validGroupByColumns[field] {
+	if !structs.GroupByColumns[field] {
 		return "", fmt.Errorf("invalid field: %s", field)
 	}
 	return field, nil
@@ -143,7 +128,7 @@ func buildFieldExpr(field string) (string, error) {
 func buildNumericFieldExpr(field string) (string, error) {
 	if strings.HasPrefix(field, "data.") {
 		key := strings.TrimPrefix(field, "data.")
-		if !safeIdentifierRegex.MatchString(key) {
+		if !structs.SafeIdentifierRegex.MatchString(key) {
 			return "", fmt.Errorf("invalid data field name: %s", key)
 		}
 		return fmt.Sprintf("toFloat64OrNull(JSONExtractRaw(data, '%s'))", key), nil
@@ -164,11 +149,11 @@ func buildGroupByExprs(groupBy []string) ([]string, []string, error) {
 		alias := fmt.Sprintf("group_%d", i)
 		if strings.HasPrefix(g, "data.") {
 			key := strings.TrimPrefix(g, "data.")
-			if !safeIdentifierRegex.MatchString(key) {
+			if !structs.SafeIdentifierRegex.MatchString(key) {
 				return nil, nil, fmt.Errorf("invalid data field name: %s", key)
 			}
 			exprs = append(exprs, fmt.Sprintf("JSONExtractString(data, '%s') AS %s", key, alias))
-		} else if validGroupByColumns[g] {
+		} else if structs.GroupByColumns[g] {
 			exprs = append(exprs, fmt.Sprintf("%s AS %s", g, alias))
 		} else {
 			return nil, nil, fmt.Errorf("invalid group by field: %s", g)
@@ -205,7 +190,7 @@ func buildSingleFilter(f structs.QueryFilter) (string, []interface{}, error) {
 
 	if strings.HasPrefix(f.Field, "data.") {
 		key := strings.TrimPrefix(f.Field, "data.")
-		if !safeIdentifierRegex.MatchString(key) {
+		if !structs.SafeIdentifierRegex.MatchString(key) {
 			return "", nil, fmt.Errorf("invalid data field name: %s", key)
 		}
 		// Check if operator suggests numeric comparison
@@ -215,7 +200,7 @@ func buildSingleFilter(f structs.QueryFilter) (string, []interface{}, error) {
 		default:
 			fieldExpr = fmt.Sprintf("JSONExtractString(data, '%s')", key)
 		}
-	} else if validColumns[f.Field] {
+	} else if structs.QueryableColumns[f.Field] {
 		fieldExpr = f.Field
 	} else {
 		return "", nil, fmt.Errorf("invalid filter field: %s", f.Field)
@@ -263,6 +248,54 @@ func buildSingleFilter(f structs.QueryFilter) (string, []interface{}, error) {
 	}
 }
 
+// buildEventWhere assembles the ENTIRE WHERE clause — leading " WHERE "
+// included — for every analytics read of monitor.events, and is the single place
+// the tenancy predicate enters this file.
+//
+// It returns the whole clause rather than a list of parts for the caller to
+// join, and every builder below appends it unconditionally, so there is no
+// remaining code path that produces a `FROM events` with no WHERE at all. That
+// matters more here than in query.go: these four builders assemble raw SQL
+// strings by concatenation, where a missing predicate is one absent `append`
+// with no compiler, no type and no test to notice it — and the result is a
+// perfectly valid query returning every project's numbers.
+//
+// Clause order is load-bearing because these are positional `?` placeholders:
+// project, then the time range, then the caller's filters, and the args come
+// back in exactly that order. Callers must not splice anything into the middle.
+//
+// Alert evaluation deliberately does NOT come through here — it has no request
+// context to scope against. See the note on structs.FilterColumns.
+func buildEventWhere(ctx context.Context, from, to time.Time, filters []structs.QueryFilter) (string, []interface{}, error) {
+	predicate, args, err := scope.ProjectPredicate(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	whereParts := []string{predicate}
+
+	if !from.IsZero() {
+		whereParts = append(whereParts, "timestamp >= ?")
+		args = append(args, from)
+	}
+	if !to.IsZero() {
+		whereParts = append(whereParts, "timestamp <= ?")
+		args = append(args, to)
+	}
+
+	if len(filters) > 0 {
+		filterClause, filterArgs, err := buildFilterClause(filters)
+		if err != nil {
+			return "", nil, err
+		}
+		if filterClause != "" {
+			whereParts = append(whereParts, filterClause)
+			args = append(args, filterArgs...)
+		}
+	}
+
+	return " WHERE " + strings.Join(whereParts, " AND "), args, nil
+}
+
 // buildIntervalExpr builds the time bucket expression
 func buildIntervalExpr(interval structs.IntervalType) (string, error) {
 	switch interval {
@@ -303,38 +336,15 @@ func QueryAnalytics(ctx context.Context, query *structs.AnalyticsQuery) (*struct
 		groupByAliases = aliases
 	}
 
-	// Build WHERE clause
-	var whereParts []string
-	var args []interface{}
-
-	// Time range
-	if !query.From.IsZero() {
-		whereParts = append(whereParts, "timestamp >= ?")
-		args = append(args, query.From)
-	}
-	if !query.To.IsZero() {
-		whereParts = append(whereParts, "timestamp <= ?")
-		args = append(args, query.To)
-	}
-
-	// Filters
-	if len(query.Filters) > 0 {
-		filterClause, filterArgs, err := buildFilterClause(query.Filters)
-		if err != nil {
-			return nil, err
-		}
-		if filterClause != "" {
-			whereParts = append(whereParts, filterClause)
-			args = append(args, filterArgs...)
-		}
+	// Build WHERE clause (project scope, time range, caller filters)
+	whereClause, args, err := buildEventWhere(ctx, query.From, query.To, query.Filters)
+	if err != nil {
+		return nil, err
 	}
 
 	// Build query
 	sql := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectParts, ", "), eventsTable())
-
-	if len(whereParts) > 0 {
-		sql += " WHERE " + strings.Join(whereParts, " AND ")
-	}
+	sql += whereClause
 
 	if len(groupByAliases) > 0 {
 		sql += " GROUP BY " + strings.Join(groupByAliases, ", ")
@@ -480,38 +490,15 @@ func QueryTimeSeries(ctx context.Context, query *structs.TimeSeriesQuery) (*stru
 		groupByParts = append(groupByParts, aliases...)
 	}
 
-	// Build WHERE clause
-	var whereParts []string
-	var args []interface{}
-
-	// Time range
-	if !query.From.IsZero() {
-		whereParts = append(whereParts, "timestamp >= ?")
-		args = append(args, query.From)
-	}
-	if !query.To.IsZero() {
-		whereParts = append(whereParts, "timestamp <= ?")
-		args = append(args, query.To)
-	}
-
-	// Filters
-	if len(query.Filters) > 0 {
-		filterClause, filterArgs, err := buildFilterClause(query.Filters)
-		if err != nil {
-			return nil, err
-		}
-		if filterClause != "" {
-			whereParts = append(whereParts, filterClause)
-			args = append(args, filterArgs...)
-		}
+	// Build WHERE clause (project scope, time range, caller filters)
+	whereClause, args, err := buildEventWhere(ctx, query.From, query.To, query.Filters)
+	if err != nil {
+		return nil, err
 	}
 
 	// Build query
 	sql := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectParts, ", "), eventsTable())
-
-	if len(whereParts) > 0 {
-		sql += " WHERE " + strings.Join(whereParts, " AND ")
-	}
+	sql += whereClause
 
 	sql += " GROUP BY " + strings.Join(groupByParts, ", ")
 	sql += " ORDER BY bucket ASC"
@@ -698,40 +685,20 @@ func QueryTopN(ctx context.Context, query *structs.TopNQuery) (*structs.TopNResu
 	var groupExpr string
 	if strings.HasPrefix(query.GroupBy, "data.") {
 		key := strings.TrimPrefix(query.GroupBy, "data.")
-		if !safeIdentifierRegex.MatchString(key) {
+		if !structs.SafeIdentifierRegex.MatchString(key) {
 			return nil, fmt.Errorf("invalid data field name: %s", key)
 		}
 		groupExpr = fmt.Sprintf("JSONExtractString(data, '%s')", key)
-	} else if validGroupByColumns[query.GroupBy] {
+	} else if structs.GroupByColumns[query.GroupBy] {
 		groupExpr = query.GroupBy
 	} else {
 		return nil, fmt.Errorf("invalid group by field: %s", query.GroupBy)
 	}
 
-	// Build WHERE clause
-	var whereParts []string
-	var args []interface{}
-
-	// Time range
-	if !query.From.IsZero() {
-		whereParts = append(whereParts, "timestamp >= ?")
-		args = append(args, query.From)
-	}
-	if !query.To.IsZero() {
-		whereParts = append(whereParts, "timestamp <= ?")
-		args = append(args, query.To)
-	}
-
-	// Filters
-	if len(query.Filters) > 0 {
-		filterClause, filterArgs, err := buildFilterClause(query.Filters)
-		if err != nil {
-			return nil, err
-		}
-		if filterClause != "" {
-			whereParts = append(whereParts, filterClause)
-			args = append(args, filterArgs...)
-		}
+	// Build WHERE clause (project scope, time range, caller filters)
+	whereClause, args, err := buildEventWhere(ctx, query.From, query.To, query.Filters)
+	if err != nil {
+		return nil, err
 	}
 
 	// Build query
@@ -739,10 +706,7 @@ func QueryTopN(ctx context.Context, query *structs.TopNQuery) (*structs.TopNResu
 		"SELECT %s AS key, %s AS value FROM %s",
 		groupExpr, aggExpr, eventsTable(),
 	)
-
-	if len(whereParts) > 0 {
-		sql += " WHERE " + strings.Join(whereParts, " AND ")
-	}
+	sql += whereClause
 
 	sql += " GROUP BY key ORDER BY value DESC"
 
@@ -794,38 +758,15 @@ func QueryGauge(ctx context.Context, query *structs.GaugeQuery) (*structs.GaugeR
 		return nil, err
 	}
 
-	// Build WHERE clause
-	var whereParts []string
-	var args []interface{}
-
-	// Time range
-	if !query.From.IsZero() {
-		whereParts = append(whereParts, "timestamp >= ?")
-		args = append(args, query.From)
-	}
-	if !query.To.IsZero() {
-		whereParts = append(whereParts, "timestamp <= ?")
-		args = append(args, query.To)
-	}
-
-	// Filters
-	if len(query.Filters) > 0 {
-		filterClause, filterArgs, err := buildFilterClause(query.Filters)
-		if err != nil {
-			return nil, err
-		}
-		if filterClause != "" {
-			whereParts = append(whereParts, filterClause)
-			args = append(args, filterArgs...)
-		}
+	// Build WHERE clause (project scope, time range, caller filters)
+	whereClause, args, err := buildEventWhere(ctx, query.From, query.To, query.Filters)
+	if err != nil {
+		return nil, err
 	}
 
 	// Build query
 	sql := fmt.Sprintf("SELECT %s AS value FROM %s", aggExpr, eventsTable())
-
-	if len(whereParts) > 0 {
-		sql += " WHERE " + strings.Join(whereParts, " AND ")
-	}
+	sql += whereClause
 
 	// Execute query
 	var value float64
@@ -839,7 +780,13 @@ func QueryGauge(ctx context.Context, query *structs.GaugeQuery) (*structs.GaugeR
 	}, nil
 }
 
-// QueryCompare executes a comparison query between two time periods
+// QueryCompare executes a comparison query between two time periods.
+//
+// It is the one read in this file that never calls buildEventWhere itself, and
+// that is not an omission: it issues no SQL of its own, running both periods
+// through QueryGauge with ctx passed straight down, so both windows are scoped
+// by the same chokepoint. Anyone auditing this file for the tenancy predicate
+// should stop here rather than reach for a fifth copy of it.
 func QueryCompare(ctx context.Context, query *structs.CompareQuery) (*structs.CompareResult, error) {
 	// Calculate previous period if not specified
 	compareFrom := query.CompareFrom

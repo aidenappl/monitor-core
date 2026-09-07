@@ -18,9 +18,11 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
   that only want counts do not pay for it.
 - `issues_test.go` — unit tests for `normalizeMessage` + `generateFingerprint`.
 - `grouping_test.go` — regression tests for the three grouping bugs fixed
-  2026-08-07: fingerprint-derived issue ids, status-code preservation in
-  `normalizeMessage`, and `FingerprintForEvent` separating tenants that share an
-  event name.
+  2026-08-07 (fingerprint-derived issue ids, status-code preservation in
+  `normalizeMessage`, `FingerprintForEvent` separating tenants that share an event
+  name), plus the project dimension: two projects with identical service, name and
+  message must derive **different issue ids**, an unstamped project resolves to the
+  default, and `issueNamespace` is pinned to its literal.
 
 ## How it works
 
@@ -32,7 +34,7 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
   event is dropped with a log line — bounded under an error storm (was previously one
   detached goroutine per error on `context.Background()`). The actual create/update
   logic lives in `processError(ctx, event)`.
-- **Fingerprint** = `sha256(service | name | path | normalizeMessage(message))`.
+- **Fingerprint** = `sha256(project | service | name | path | normalizeMessage(message))`.
   `normalizeMessage` strips UUIDs → `<UUID>`, hex → `<HEX>`, URLs → `<URL>`, numbers →
   `<N>` so structurally-identical errors collapse into one issue. **Exception: a
   3-digit number introduced as an HTTP status (`status 502`, `code 404`,
@@ -51,6 +53,25 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
   Deriving the id makes racing creators converge without coordinating — including
   across processes, which a mutex cannot do. **`issueNamespace` must never change**;
   changing it re-keys every issue and orphans all history.
+- **`project` is the first fingerprint component, and it is in the STRING — not
+  just in a database key.** This is the whole of the project-scoping fix and the
+  reason the obvious version of it does not work. `monitor.issues` has *both*
+  `id CHAR(36) PRIMARY KEY` and `UNIQUE KEY uq_issues_fingerprint (fingerprint)`,
+  and `id` is a pure function of the fingerprint — so two projects with matching
+  `service`/`name`/`path`/message would compute one fingerprint, therefore one id,
+  therefore a **primary-key** collision. `INSERT … ON DUPLICATE KEY UPDATE` fires on
+  the *first* unique index violated, which is the PK, so project B's occurrence would
+  fold into project A's row — counter incremented, message overwritten, a resolved
+  issue reopened — before `UNIQUE (project, fingerprint)` was ever consulted. That
+  composite key (migration 118) documents the intent; **this line is the mechanism.**
+  An empty project is fingerprinted as `MON_DEFAULT_PROJECT`, not as a tenant named
+  `""` — the same rule `scope.ProjectPredicate` applies to the pre-006 rows that are
+  the only source of one. See `fingerprintProject`.
+- **`env` is deliberately NOT in the fingerprint.** Production and staging errors of
+  the same shape merge into one issue, which is what Sentry does on purpose — an error
+  is one bug regardless of where it fired, and the per-event `env` column still splits
+  the occurrences on demand. Adding it would be a *second* full re-key with no default
+  value to anchor it. Recorded so it is not rediscovered as a bug.
 - **`FingerprintForEvent(event)`** is the exported way to ask which issue an event
   belongs to. Anything matching events to issues must use it — `service`+`name`
   alone is only a pre-filter, since many issues share one event name.
@@ -93,24 +114,78 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
   then appends a `regressed` timeline entry keyed on the stored `regressed_at`, so
   racing workers compute the same `dedupe_key` and collapse to one row.
 
-## API surface (wired in main.go → routes/issues.go)
+## API surface (wired in main.go → routes/issues.go + routes/issue_timeline.go)
 
-| Method | Path | Function |
+| Method | Path | Notes |
 |---|---|---|
-| GET | `/v1/issues?status=&service=&limit=&offset=` | `List` (limit default 50, max 500; returns total count) |
-| GET | `/v1/issues/{id}` | `Get` |
-| PUT | `/v1/issues/{id}` (body `{status}`) | `UpdateStatus` |
-| GET | `/v1/issues/{id}/events?limit=` | events matching the issue's fingerprint |
+| GET | `/v1/issues?status=&service=&assignee=&has_pr=&q=&from=&to=&sort=&order=&history=&limit=&offset=` | limit default 50, max 500; returns the total count |
+| GET | `/v1/issues/{id}` | verbose detail — links, assignee, repository, comment count, sparkline |
+| PUT | `/v1/issues/{id}` | status / priority / title / assignee |
+| GET | `/v1/issues/{id}/events?limit=` | the issue's own events (indexed on `issue_id`, legacy scan as fallback) |
+| GET | `/v1/issues/{id}/timeline` | the activity feed, oldest first |
+| GET | `/v1/issues/{id}/history` | per-day occurrence sparkline |
+| POST/PATCH/DELETE | `/v1/issues/{id}/comments[/{commentID}]` | add / edit / soft-delete a note |
+| GET/POST/DELETE | `/v1/issues/{id}/links[/{linkID}]` | linked PRs, issues and commits |
 
 This is the primary error-investigation surface (mirrored by
 `mcp__monitor__monitor_list_issues` / `monitor_get_issue`).
+
+**Every one of them is project-scoped, and none of them scope themselves.** The list resolves
+the caller's project through `routes.requireProject` and passes it into `query.ListIssues`;
+the other eleven resolve `{id}` through `routes.requireIssue`, which reads the issue **in the
+caller's project** and 404s otherwise. A new `/v1/issues/{id}/…` route must go through
+`requireIssue` too — fetching the issue any other way reintroduces the leak for that route
+alone, and no test in this package would notice.
 
 ## Known issues & gaps (2026-07-23)
 
 | Sev | Where | Issue |
 |---|---|---|
+| 🟢 | `history.go` | **`monitor.issue_occurrences_daily` has no `project` column** (005 keys it on `(issue_id, day)`), so it cannot be aggregated per project without joining `monitor.issues`. This is now a schema nicety rather than a boundary: since issue ids are derived from a fingerprint that includes the project, **one rollup key can no longer accumulate two tenants' occurrences**. Adding the column would need a table rebuild plus a `DROP`/`CREATE` of the materialized view, which the boot runner (idempotent DDL, replayed every boot) cannot perform. A predicate on these reads would still be wrong — every caller already holds an issue read from `monitor.issues`, so it would narrow a histogram under an issue the caller can read in full. **That argument depends entirely on the issue read path being scoped**, which it now is (`query.scopeIssues`) and was not when this row was first written: an unscoped list handed out any tenant's issue id, and these two functions turned it into that tenant's per-day event counts. Widen the issue read path and these widen with it. Full statement in the `KNOWN GAP` header of `history.go`. **Event reads under an issue *are* scoped** — see `routes.selectIssueEvents`. |
 | 🟢 | subsystem-wide | **No auto-resolve.** Regression reopen exists but nothing ages an issue out after N days of silence. |
 | 🟢 | `issues.UpdateStatus` | **Records no actor** — a legacy shim kept only for callers not yet moved. `routes/issues.go` no longer uses it; `HandleUpdateIssue` calls `query.UpdateIssue` with `middleware.GetActor`. Delete the shim once nothing calls it. |
+
+**Project-scoped as of `118_issues_project.sql`.** An issue belongs to exactly one project.
+`monitor.issues` gained a `NOT NULL` `project` column and a `UNIQUE (project, fingerprint)`,
+and — the part that actually does the work — `project` became the first component of the
+fingerprint string, so two tenants reporting the same failure derive different primary keys
+instead of sharing one row.
+
+**Writing the column is only half of it — the READ path is scoped too, by
+`query.scopeIssues`.** `ListIssues`, `CountIssues`, `GetIssue` and `UpdateIssue`'s own `WHERE`
+all carry the caller's project, and an empty project returns `query.ErrNoIssueProject` rather
+than a query without the predicate. This is a separate mechanism from `scope.ProjectPredicate`
+on purpose: `monitor.issues` is MariaDB, reached through `db.SQL`, so no ClickHouse chokepoint
+covers it and `scope/chokepoint_test.go` does not look at it either. Two things follow.
+
+- **An issue row carries event data**, so this is a leak surface and not a metadata one:
+  `message` is the error text lifted off the event by `extractMessage`, alongside the service,
+  the path, the occurrence count and the seen-window. A per-project column that only the WRITE
+  path honours means the listing still answers "what is failing, where and how often" for every
+  tenant at once.
+- **Scoping the id-addressed reads is not redundant** with the id being a UUIDv5 over a
+  project-bearing fingerprint. That makes a foreign id impossible to *derive*, not impossible
+  to *hold* — ids travel into monitor-web URLs, alert payloads, comments and GitHub links. A
+  foreign id returns 404, the same as one that never existed.
+- **`issues.List`, `issues.Get` and `issues.UpdateStatus` read the project off the `ctx`** they
+  already take, rather than adding a parameter, because their callers are handlers holding a
+  request whose context `QueryAuthMiddleware` has already stamped. All three refuse when it
+  carries none. Two of the three have no callers today and are scoped anyway — an unscoped
+  exported reader is a leak waiting for its first caller.
+
+**There was deliberately no re-keying migration.** Every pre-118 issue keeps its old id and
+project-less fingerprint, which means they **stop receiving occurrences**: the next occurrence
+of the same failure mints a fresh row counting from 1, so a failure that spans the deploy shows
+as two rows, one frozen and one live, until the frozen one is resolved by hand. Do not write a
+re-key subcommand, a remap table, or a legacy-fingerprint fallback — the owner deals with them
+manually. There were 43 rows on 2026-09-06 (12 unresolved, 3 ignored, 28 resolved); re-count
+rather than trusting that figure. The **ignored** ones are the quiet case: their replacement rows
+are new ids that default to `unresolved`, so a silenced error comes back looking like a fresh
+regression — re-ignore it rather than re-investigating. Their rows in the **no-TTL**
+`monitor.issue_occurrences_daily` become permanent
+orphans once the issues are deleted; the sweep is
+`migrations/manual/delete_orphaned_issue_rollups.sql`, run by hand, keyed on absence from
+`monitor.issues` so it is a no-op while those issues still exist.
 
 **Resolved 2026-08-25:** the full filter/sort surface and every mutation endpoint are wired.
 `GET /v1/issues` takes status, service, assignee (`none` for unassigned), `has_pr`, `q`, `from`,

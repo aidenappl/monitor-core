@@ -20,8 +20,16 @@ import (
 	"github.com/gorilla/mux"
 )
 
-// requireIssue resolves the {id} path variable to an existing issue, writing the
-// response and returning nil when it cannot.
+// requireIssue resolves the {id} path variable to an issue THE CALLER'S PROJECT
+// OWNS, writing the response and returning nil when it cannot.
+//
+// Every handler in this file — the timeline, the occurrence history, all three
+// comment verbs and all three link verbs — starts here, which makes this one
+// function the tenancy boundary for the whole of an issue's sub-resources. That
+// concentration is worth stating plainly, because the same property cuts both
+// ways: before the project was threaded through, a single unscoped GetIssue here
+// meant eight endpoints served another tenant's issue, and the occurrence
+// history among them is per-day event counts read out of ClickHouse.
 func requireIssue(w http.ResponseWriter, r *http.Request) *structs.Issue {
 	id := mux.Vars(r)["id"]
 	if id == "" {
@@ -29,7 +37,12 @@ func requireIssue(w http.ResponseWriter, r *http.Request) *structs.Issue {
 		return nil
 	}
 
-	issue, err := query.GetIssue(db.SQL, id)
+	project, ok := requireProject(w, r)
+	if !ok {
+		return nil
+	}
+
+	issue, err := query.GetIssue(db.SQL, project, id)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to fetch issue", err)
 		return nil

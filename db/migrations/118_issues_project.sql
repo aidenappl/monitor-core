@@ -1,0 +1,157 @@
+-- Gives an issue a project, so two tenants reporting the same failure stop
+-- sharing one row, one occurrence count and one triage state.
+--
+--
+-- THE PRIMARY KEY IS THE CONSTRAINT. THE COMPOSITE UNIQUE KEY IS DOCUMENTATION.
+-- READ THIS BEFORE CHANGING EITHER.
+--
+-- The tempting version of this migration is "add project, add
+-- UNIQUE (project, fingerprint), done". That version fixes nothing, and it is
+-- worth being precise about why, because the resulting table LOOKS correct.
+--
+-- monitor.issues has two unique indexes: `id CHAR(36) PRIMARY KEY` and
+-- uq_issues_fingerprint (fingerprint). And `id` is not independent of
+-- `fingerprint` — 111 says so and issues.issueIDFor is where it happens:
+-- id = uuidv5(issueNamespace, fingerprint). The primary key is a pure function
+-- of the fingerprint STRING.
+--
+-- So if the fingerprint string does not contain the project, two projects
+-- reporting the same service, name, path and normalized message compute the same
+-- fingerprint, and therefore the same id. The upsert in query/issues.query.go is
+-- an INSERT ... ON DUPLICATE KEY UPDATE, and MariaDB fires that on the FIRST
+-- unique index the incoming row violates — which is the primary key, hit before
+-- any composite key is consulted. Project B's occurrence lands on project A's
+-- row: counter incremented, message overwritten, a resolved issue reopened. No
+-- error, no warning, nothing in a log. A composite unique key cannot intervene
+-- in that, because the collision has already been resolved by the time the index
+-- would have had an opinion.
+--
+-- The fix is therefore in Go, not here: issues.generateFingerprint now takes the
+-- project as its first component, so distinct tenants produce distinct
+-- fingerprints and hence distinct primary keys. That is the mechanism.
+--
+-- uq_issues_project_fingerprint below is belt and braces. It states the
+-- invariant in the schema where a reader looking at the table can see it, and it
+-- would catch a future writer that inserted a hand-built row with a mismatched
+-- pair. It is not what makes tenancy correct, and nothing should be written that
+-- relies on it firing.
+--
+-- uq_issues_fingerprint STAYS. With the project inside the fingerprint, a
+-- fingerprint is globally unique on its own, so the single-column key remains
+-- true and is strictly the tighter of the two — the composite is implied by it.
+-- Dropping it would loosen the table in exchange for nothing, and would also
+-- remove the index that GetIssueByFingerprint reads.
+--
+--
+-- NO MIGRATION OF EXISTING ISSUES. This is an explicit decision, not an omission.
+--
+-- 43 issue rows exist at the time of writing — 12 unresolved, 3 ignored and 28
+-- resolved, counted against the live instance on 2026-09-06. Re-keying them
+-- would mean recomputing every fingerprint from a stored normalized message,
+-- minting a new id from it, rewriting the row, and then chasing the id through
+-- monitor.issue_timeline, monitor.issue_links, the events already stamped with
+-- the old issue_id in ClickHouse, and the no-TTL rollup — a remap table and a
+-- subcommand. They are being dealt with by hand instead.
+--
+-- The number is written down because it is the scope of that hand-work, and an
+-- earlier draft of this header said "nine". Re-count before relying on it; the
+-- decision does not change with the count, but the size of the manual task does.
+--
+-- The consequence, stated plainly so nobody later reads it as a bug: an existing
+-- issue keeps its old id and its old project-less fingerprint, and therefore
+-- STOPS RECEIVING OCCURRENCES. The next occurrence of that same failure mints a
+-- fresh row under the new derivation, with a count starting at 1. Two rows for
+-- one failure, one frozen and one live, until the frozen one is resolved.
+--
+-- The 3 IGNORED rows deserve their own sentence, because their failure mode is
+-- the quiet one. Ignoring an issue silences it; the replacement row minted after
+-- this deploy is a different id and defaults to 'unresolved', so a deliberately
+-- silenced error reappears in the backlog looking like a new regression. Expect
+-- that, and re-ignore rather than re-investigate.
+--
+-- Second consequence, in the other store: monitor.issue_occurrences_daily (the
+-- ClickHouse rollup, migrations/005) is keyed on (issue_id, day) and carries NO
+-- TTL, so its rows for the old ids are permanent. They are not wrong — they are
+-- the real history of those pre-118 issues — but once the issues themselves are
+-- deleted, nothing can ever read them again and nothing will ever expire them.
+-- The sweep is migrations/manual/delete_orphaned_issue_rollups.sql, run by hand
+-- AFTER those rows have been dealt with. It deliberately keys on absence from
+-- monitor.issues, so it is a no-op for as long as those rows still exist.
+--
+--
+-- ENV IS DELIBERATELY NOT PART OF THE IDENTITY. Production and staging errors of
+-- the same shape merge into one issue today and continue to, which is what
+-- Sentry does on purpose: an error is one bug regardless of where it fired.
+-- Adding env would be a SECOND full re-key with no default value to anchor it —
+-- project has MON_DEFAULT_PROJECT, env has whatever string an SDK chose to send.
+-- The reasoning is repeated on issues.generateFingerprint so it survives
+-- wherever someone starts reading.
+--
+--
+-- NO FOREIGN KEY to projects, unlike api_keys.project_id in 117, and this is a
+-- constraint of the registry rather than a preference. A project slug is unique
+-- only WITHIN its zone (uq_projects_zone_slug), so there is no unique index on
+-- slug alone for a foreign key to reference. The column is a denormalized copy
+-- of the slug, exactly as ClickHouse's events.project is — which is also why
+-- VARCHAR(30) matches projects.slug rather than being a BIGINT id: the issue row
+-- is compared against event rows that carry the slug, not against the registry.
+-- Slugs are immutable and never reused (116), which is what makes a stored copy
+-- safe.
+--
+-- No CHECK on the slug format either. The value is never minted here — it is
+-- copied from an api_keys binding that was validated by tools.ValidateSlug and
+-- by the CHECK on projects.slug when the project was created. A third encoding
+-- of the same regex would be one more place to keep in step for no new coverage.
+--
+--
+-- RE-RUNNABILITY, the rule 107 and 117 already wrote down: db.RunMigrations
+-- records a file as applied only after a clean Exec, and DDL commits implicitly,
+-- so a run that dies partway is retried IN FULL on the next boot with the
+-- successful half already durable. Every statement below is guarded or naturally
+-- idempotent, and `WHERE project IS NULL` makes the backfill a no-op on every
+-- run after the first.
+
+-- Step 1 — the column, NULLable for the length of this file only.
+--
+-- Expand-then-tighten, as 117 did: the backfill needs somewhere to write before
+-- NOT NULL can be true. It is never nullable at rest.
+--
+-- Placed AFTER fingerprint rather than after service on purpose. project is part
+-- of what identifies the row — it is a component of the fingerprint, which the
+-- primary key is derived from — not an attribute of the error, so it belongs
+-- beside the other two identity columns.
+ALTER TABLE monitor.issues
+    ADD COLUMN IF NOT EXISTS project VARCHAR(30) NULL AFTER fingerprint;
+
+-- Step 2 — backfill the existing rows.
+--
+-- 'default' is a LITERAL because SQL cannot read the environment, and it is the
+-- compiled-in default of MON_DEFAULT_PROJECT (env/env.go) — the same literal 117
+-- binds every api_keys row to. These rows came from the only project that has
+-- ever existed on this instance, so the value is honest rather than a
+-- placeholder.
+--
+-- It is also close to cosmetic. These rows are frozen: their ids and
+-- fingerprints were derived before project entered the fingerprint, so nothing
+-- will ever upsert onto them again. The column is filled because NOT NULL
+-- requires a value and because an operator resolving them by hand should be able
+-- to see which tenant they came from — not because it makes them live.
+UPDATE monitor.issues SET project = 'default' WHERE project IS NULL;
+
+-- Step 3 — tighten to NOT NULL.
+--
+-- The loud step, for the same reason 117's was: under the strict sql_mode
+-- MariaDB 11.4 defaults to, a row the backfill failed to reach aborts the ALTER
+-- rather than being coerced to ''. An issue that belongs to no tenant must stop
+-- the boot, not sit in the table looking like a row of the empty project.
+ALTER TABLE monitor.issues
+    MODIFY COLUMN project VARCHAR(30) NOT NULL;
+
+-- Step 4 — the composite key (see the header: documentation, not mechanism).
+--
+-- It doubles as the index for project-scoped listings, since project leads it —
+-- the same argument 116 makes for uq_projects_zone_slug covering zone-scoped
+-- lookups. No separate KEY (project, ...) is added here: adding one before there
+-- is a query that needs it would leave an index nothing uses and nothing flags.
+ALTER TABLE monitor.issues
+    ADD UNIQUE KEY IF NOT EXISTS uq_issues_project_fingerprint (project, fingerprint);
