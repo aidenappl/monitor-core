@@ -1372,6 +1372,31 @@ deviating.
      off until step 3 runs. Pausing the redeploy is still the tidier path, but the default
      ordering is now survivable rather than an incident.
   2. Merge. CI builds `registry.appleby.cloud/monitor-core:latest`.
+  1a. **If the new binary already booted before the cutover, CLEAR THE SEEDED POLICIES
+     FIRST.** A build older than this fix seeded four default notification policies into
+     the empty MariaDB table on boot, and the cutover then appends the real ones behind
+     them at positions 5-8. Matching is first-past-the-post by position and every default
+     carries `continue_matching = false` with `channel_ids = "[]"`, so the defaults would
+     govern every route and send it nowhere, while the real policies are never reached.
+     Nothing errors.
+
+     The tell is in the dry run: `renumbered from position 1 to 5`. A clean cutover
+     inserts at positions 1-4 with no renumbering at all.
+
+     Confirm what is there, then clear it — the real policies are still in ClickHouse, so
+     the table should hold nothing but the four seeded defaults:
+
+     ```sql
+     SELECT id, name, position, channel_ids FROM monitor.notification_policies ORDER BY position;
+     -- expect exactly: Critical (P0) — All Channels / High (P1) — PagerDuty + Email /
+     --                 Medium (P2) — Email Only / Low (P3) — Web Only, all channel_ids '[]'
+     DELETE FROM monitor.notification_policies;
+     ```
+
+     Then re-run the dry run and check it reports positions 1-4 with no renumbering.
+     `alerts.Init` no longer seeds while the cutover guard is unsatisfied, so this cannot
+     recur — but an install that booted the intermediate build needs the one-time clear.
+
   2a. **Rehearse it first: `monitor-core backfill-config --dry-run`.** Reads, validates and
      reports exactly what would be copied and what would be REFUSED, writing nothing and
      stamping no marker. Worth running every time — the refusals are the failure that

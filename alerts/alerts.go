@@ -68,8 +68,9 @@ type RuleWithState struct {
 	State *State `json:"state,omitempty"`
 }
 
-// Init creates the two ClickHouse tables that did NOT move, and seeds the default
-// notification policies on a fresh install.
+// Init creates the two ClickHouse tables that did NOT move, and — when
+// seedPolicies is true — seeds the default notification policies on a fresh
+// install.
 //
 // The seeding is a MariaDB write and sits here rather than in bootstrap/ for one
 // reason: bootstrap runs on the CONTROL plane and this runs on the DATA plane,
@@ -77,7 +78,17 @@ type RuleWithState struct {
 // change which processes create those four rows, which is precisely the kind of
 // silent behaviour change this move must not make. It is called from main.go's
 // data-plane block, after both migration runners.
-func Init(ctx context.Context) error {
+//
+// seedPolicies EXISTS BECAUSE OF A REAL INCIDENT, not as a convenience. An empty
+// notification_policies table means two different things and they need opposite
+// treatment: a genuinely fresh install (seed the defaults) versus an install
+// whose policies are still sitting in ClickHouse awaiting the cutover (seed
+// NOTHING). Seeding the second case puts four defaults at positions 1-4 and the
+// operator's real policies land at 5-8 behind them — and because matching is
+// first-past-the-post by position, the defaults then govern every route while
+// the real policies are never reached. Nothing errors; alerting is simply wrong.
+// main.go passes false whenever the cutover guard is unsatisfied.
+func Init(ctx context.Context, seedPolicies bool) error {
 	err := db.Conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS `+db.Database+`.alert_states (
 			rule_id String,
@@ -115,8 +126,10 @@ func Init(ctx context.Context) error {
 		return fmt.Errorf("failed to create alert_history table: %w", err)
 	}
 
-	if err := query.SeedDefaultNotificationPolicies(db.SQL); err != nil {
-		return fmt.Errorf("failed to seed default notification policies: %w", err)
+	if seedPolicies {
+		if err := query.SeedDefaultNotificationPolicies(db.SQL); err != nil {
+			return fmt.Errorf("failed to seed default notification policies: %w", err)
+		}
 	}
 
 	return nil

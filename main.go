@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,7 +27,49 @@ import (
 	"github.com/rs/cors"
 )
 
+// subcommands are the one-off operator actions this binary accepts instead of
+// serving. Listed in one place so the unknown-argument error can name them all,
+// rather than an operator guessing which spelling this build understands.
+var subcommands = []string{"backfill-issues", "backfill-config [--dry-run]"}
+
+// requireKnownCommand rejects an argument this build does not implement.
+//
+// Takes argv rather than reading os.Args so it is testable, which matters more
+// than it looks: the behaviour being pinned is "does NOT boot a server", and
+// that is not something a test can assert about a function that calls
+// log.Fatalf on the real process.
+func requireKnownCommand(argv []string) error {
+	if len(argv) < 2 {
+		return nil
+	}
+	for _, known := range subcommands {
+		if argv[1] == strings.Fields(known)[0] {
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown command %q — run with no arguments to serve, or one of: %s",
+		argv[1], strings.Join(subcommands, ", "))
+}
+
 func main() {
+	// VALIDATE THE ARGUMENT FIRST, before Keyring, config, or a single connection.
+	//
+	// It depends on nothing, and putting it anywhere later means a typo is
+	// reported as whatever the boot happens to trip over first — an operator who
+	// typed `backfill-confg` gets "MONITOR_API_KEY must be set", which is true,
+	// useless, and about a different problem.
+	//
+	// It also closes a real foot-gun: without this the subcommand checks further
+	// down simply fall through and the process boots a FULL SERVER. A typo, or a
+	// correct command run against an image too old to have it, would start a
+	// second evaluator and batcher inside a container that already has one,
+	// re-run both migration runners, and then die failing to bind the port —
+	// presenting as a wall of normal startup logs ending in "address in use",
+	// which says nothing about the word that was actually wrong.
+	if err := requireKnownCommand(os.Args); err != nil {
+		log.Fatalf("❌ %v", err)
+	}
+
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -340,7 +383,13 @@ func main() {
 		// also seeds the default notification policies into MariaDB, which stays
 		// on this plane rather than moving to bootstrap/ so that the set of
 		// processes creating those four rows is unchanged.
-		if err := alerts.Init(ctx); err != nil {
+		// The default-policy seed is SUPPRESSED while the cutover is outstanding.
+		// An empty notification_policies table then means "still in ClickHouse",
+		// not "fresh install", and seeding it would put four defaults ahead of the
+		// operator's real policies — which match first and would silently govern
+		// every route. The ClickHouse table creation still runs; only the seed is
+		// held back.
+		if err := alerts.Init(ctx, configCutoverPending == nil); err != nil {
 			log.Printf("WARNING: failed to initialize alerts: %v", err)
 		}
 

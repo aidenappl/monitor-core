@@ -368,3 +368,59 @@ func TestPolicyInsertColumnsMatchScanOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestSeedDefaultPoliciesIsNoOpWhenRowsExist is the second half of the defence
+// against a live incident; the first half is the seedPolicies flag main.go
+// passes to alerts.Init.
+//
+// An empty notification_policies table means two opposite things — a fresh
+// install, or an install whose policies are still in ClickHouse awaiting the
+// Phase 2 cutover. Seeding the second case puts four defaults at positions 1-4
+// and pushes the operator's real policies to 5-8 behind them. Because matching
+// is first-past-the-post by position and every default carries
+// continue_matching=false, those defaults then govern every route while the real
+// policies are never reached — and they route to channel_ids "[]", i.e. nowhere.
+// Nothing errors. Alerting is simply, silently wrong.
+//
+// This asserts the count guard: once ANY row exists, the seeder must write
+// nothing. sqlmock fails the test if an INSERT is attempted, because none is
+// expected.
+func TestSeedDefaultPoliciesIsNoOpWhenRowsExist(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM monitor.notification_policies").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(4))
+
+	if err := SeedDefaultNotificationPolicies(mockDB); err != nil {
+		t.Fatalf("SeedDefaultNotificationPolicies: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("seeder wrote with rows already present: %v", err)
+	}
+}
+
+// TestSeedDefaultPoliciesSeedsWhenEmpty is the negative control — without it the
+// test above passes just as happily against a seeder that never writes at all.
+func TestSeedDefaultPoliciesSeedsWhenEmpty(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM monitor.notification_policies").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectExec("INSERT INTO monitor.notification_policies").
+		WillReturnResult(sqlmock.NewResult(0, 4))
+
+	if err := SeedDefaultNotificationPolicies(mockDB); err != nil {
+		t.Fatalf("SeedDefaultNotificationPolicies: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("seeder did not write on an empty table: %v", err)
+	}
+}
