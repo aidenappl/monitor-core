@@ -82,6 +82,22 @@ func EnsureZoneAndProject(engine db.Queryable) error {
 }
 
 // ensureZone reads the zone and creates it when missing.
+//
+// The endpoints come from MON_PUBLIC_URL — the origin THIS process answers on.
+// A zone serves ingest and query from the same base (different paths), so both
+// columns get the same value, and a fresh zone therefore registers itself
+// correctly without the operator having to type its own URL back in.
+//
+// Seeding them is not optional: query.CreateZone requires a valid ingest_url
+// since db/migrations/125_zone_endpoints.sql added the columns, so omitting
+// them fails the boot outright. That went unnoticed because an install whose
+// zones row predates 125 returns above and never reaches CreateZone — only a
+// genuinely fresh zone runs this path, which is exactly when getting it wrong
+// is least recoverable.
+//
+// A wrong-but-valid URL here is recoverable: unlike the slug, both columns are
+// mutable through the admin registry, and probe.Zone reports `mismatched` when
+// the box answering does not claim this slug.
 func ensureZone(engine db.Queryable, slug string) (*structs.Zone, error) {
 	zone, err := query.GetZoneBySlug(engine, slug)
 	if err != nil {
@@ -91,9 +107,19 @@ func ensureZone(engine db.Queryable, slug string) (*structs.Zone, error) {
 		return zone, nil
 	}
 
+	// Named explicitly rather than letting NormalizeEndpointURL report the bare
+	// "URL is required": that message sends an operator hunting through the
+	// registry for a field they never set, when the fix is one env var.
+	endpoint := strings.TrimSpace(env.PublicBaseURL)
+	if endpoint == "" {
+		return nil, fmt.Errorf("cannot create zone %q: MON_PUBLIC_URL is empty — it is this zone's ingest and query endpoint", slug)
+	}
+
 	zone, err = query.CreateZone(engine, query.CreateZoneRequest{
 		Slug:        slug,
 		DisplayName: defaultDisplayName(slug),
+		IngestURL:   endpoint,
+		QueryURL:    endpoint,
 	})
 	if err != nil {
 		return recoverZoneRace(engine, slug, err)

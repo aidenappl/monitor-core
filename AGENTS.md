@@ -195,13 +195,21 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
 - **Both connects are role-gated** (§6 *Roles*): ClickHouse — connection, migrations and
   boot probe — happens only on the data plane, so under `MON_ROLE=app` `db.Conn` stays
   `nil` by design. MariaDB is opened and migrated in every role.
-- **Bootstrap runs after MariaDB migrations, on the control plane only** (`main.go`,
-  skipped under `MON_ROLE=zone`): `bootstrap.EnsureAdminUser`
+- **Bootstrap runs after MariaDB migrations** (`main.go`). `bootstrap.EnsureAdminUser`
   seeds the first admin from `MON_ADMIN_EMAIL`/`MON_ADMIN_PASSWORD` (no-op once any user
-  exists), then `bootstrap.EnsureZoneAndProject` seeds the single zone
-  (`MON_ZONE_SLUG`) and its default project (`MON_DEFAULT_PROJECT`) — also a no-op once
+  exists) and is **control-plane only** — skipped under `MON_ROLE=zone`, which has no
+  login surface. `bootstrap.EnsureZoneAndProject` seeds the single zone
+  (`MON_ZONE_SLUG`) and its default project (`MON_DEFAULT_PROJECT`) and runs in
+  **every role, the data plane included**: a zone owns its own registry rows, so it must
+  be able to seed them without a control plane present. Also a no-op once
   both rows exist, and it never resurrects a zone an operator retired. Both are
-  fail-fast. No SSO provider is seeded from env — providers are created through the admin
+  fail-fast.
+  - The zone's `ingest_url` and `query_url` are both seeded from **`MON_PUBLIC_URL`** —
+    the origin this process answers on, since a zone serves ingest and query from one
+    base. They are required (`query.CreateZone` rejects an empty `ingest_url` since
+    `125_zone_endpoints.sql`), so a fresh zone with no `MON_PUBLIC_URL` fails the boot
+    rather than registering an unreachable row. Both columns stay mutable through the
+    admin registry, so a wrong-but-valid URL is recoverable — unlike the slug. No SSO provider is seeded from env — providers are created through the admin
   API / `/admin/sso`, never from Go code.
 - **Unit tests** cover pure logic and the auth layer with a mocked `Queryable`
   (`jwt/jwt_test.go`, `tools/Password_test.go`, `tools/Slug_test.go`,
@@ -753,7 +761,8 @@ registration, cannot drift that way.
 |---|---|---|---|
 | ClickHouse connection + migrations + boot probe | **no** (`db.Conn` stays nil) | yes | yes |
 | MariaDB + its migrations | yes | yes | yes |
-| `bootstrap.EnsureAdminUser`, `bootstrap.EnsureZoneAndProject` | yes | **no** | yes |
+| `bootstrap.EnsureAdminUser` | yes | **no** | yes |
+| `bootstrap.EnsureZoneAndProject` | yes | yes | yes |
 | `sso.Install()` (revocation checkpoint) | yes | **no** | yes |
 | `apikeys.Init` (key cache + refresher) | yes | yes | yes |
 | `registry.Init` (zone/project cache) | yes | yes | yes |
@@ -1608,7 +1617,7 @@ deviating.
   | `MON_CRYPTO_KEY` | *(dev default)* | **exactly 32 bytes**, AES-256-GCM key for SSO secrets/tokens; **prod must override** |
   | `MON_COOKIE_DOMAIN` | `` | domain on the `mon-*` cookies |
   | `MON_COOKIE_INSECURE` | `false` | `true` = local dev (drops `Secure`, allows dev-default secrets) |
-  | `MON_PUBLIC_URL` | `https://monitor.appleby.cloud` | origin used to build each SSO `redirect_uri` (`{base}/auth/sso/{slug}/callback`) — must match the IdP registration byte-for-byte |
+  | `MON_PUBLIC_URL` | `https://monitor.appleby.cloud` | this process's own origin. Builds each SSO `redirect_uri` (`{base}/auth/sso/{slug}/callback`) — must match the IdP registration byte-for-byte — **and** seeds a fresh zone's `ingest_url`/`query_url` in `bootstrap.EnsureZoneAndProject` |
   | `MON_ADMIN_EMAIL` / `MON_ADMIN_PASSWORD` | `` | seed the first admin on a fresh DB; empty = no seed |
   | `MON_ALLOW_REGISTRATION` | `false` | gates `POST /auth/register` |
   | `MON_ZONE_SLUG` | `trailblaze` | slug of the single zone seeded at boot. The default is what the existing data actually is — all 15 services currently reporting are Trailblaze services. Slugs are immutable, so changing it after the row exists seeds a *second* zone rather than renaming the first. Also read by `apikeys.resolveProject` on `POST /v1/api-keys` |
