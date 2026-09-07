@@ -1,6 +1,11 @@
 package query
 
 import (
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -8,10 +13,22 @@ import (
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 )
 
+// zoneRows mirrors the column ORDER of zoneColumns, which is what scanZone
+// unpacks positionally. Written out in full rather than derived from that slice
+// on purpose: a column added to one and not the other is a silent mis-scan — a
+// URL landing in reachability_detail, say — not a compile error, and deriving the
+// fixture would make the two wrong together and still green.
 func zoneRows() *sqlmock.Rows {
 	now := time.Now()
-	return sqlmock.NewRows([]string{"id", "slug", "display_name", "status", "created_at", "updated_at"}).
-		AddRow(int64(1), "trailblaze", "Trailblaze", "active", now, now)
+	return sqlmock.NewRows([]string{
+		"id", "slug", "display_name", "status",
+		"ingest_url", "query_url",
+		"reachability", "reachability_detail", "reported_zone", "last_probe_at",
+		"created_at", "updated_at",
+	}).
+		AddRow(int64(1), "trailblaze", "Trailblaze", "active",
+			"https://events.example.com", "https://zone.example.com",
+			"unknown", "", "", nil, now, now)
 }
 
 func projectRows() *sqlmock.Rows {
@@ -156,5 +173,235 @@ func TestGetProjectBySlugScopesByZone(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestRetireZoneRefusesWhileProjectsAreLive pins the guard AND where it lives.
+//
+// The expectation below matches the whole predicate, NOT EXISTS included, so a
+// future edit that "simplifies" RetireZone by counting first and updating second
+// fails here. That refactor is the dangerous one: it leaves the error message
+// intact while opening a window in which a project created between the two
+// statements lands in a zone on its way to retired — a tenant whose events keep
+// arriving while the zone that would list it is hidden from every switcher.
+func TestRetireZoneRefusesWhileProjectsAreLive(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	mock.ExpectExec("UPDATE zones SET status = .+ WHERE id = .+ AND status = .+ AND NOT EXISTS \\(SELECT 1 FROM projects").
+		WithArgs("deleted", int64(1), "active", "active").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	// The count runs only to EXPLAIN a refusal that has already happened.
+	mock.ExpectQuery("FROM zones WHERE id = .").WithArgs(int64(1)).WillReturnRows(zoneRows())
+	mock.ExpectQuery("SELECT COUNT").WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(2))
+
+	zone, err := RetireZone(mockDB, 1)
+	if err == nil {
+		t.Fatal("RetireZone succeeded with live projects, want a refusal")
+	}
+	if !errors.Is(err, ErrZoneHasActiveProjects) {
+		t.Fatalf("RetireZone = %v, want ErrZoneHasActiveProjects so the handler can answer 409", err)
+	}
+	if zone != nil {
+		t.Error("RetireZone returned a zone alongside the refusal")
+	}
+	if !strings.Contains(err.Error(), "2 active") {
+		t.Errorf("RetireZone = %v, want the count in the message — it is the actionable half", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestRetireZoneSucceedsWithNoActiveProjects is the negative control for the test
+// above. Without it, a RetireZone that refused unconditionally — or one whose
+// UPDATE never matched anything — would look exactly as correct.
+func TestRetireZoneSucceedsWithNoActiveProjects(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	mock.ExpectExec("UPDATE zones SET status").
+		WithArgs("deleted", int64(1), "active", "active").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("FROM zones WHERE id = .").WithArgs(int64(1)).WillReturnRows(zoneRows())
+
+	zone, err := RetireZone(mockDB, 1)
+	if err != nil {
+		t.Fatalf("RetireZone: %v", err)
+	}
+	if zone == nil {
+		t.Fatal("RetireZone returned no zone — the caller needs the row it just changed")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestRetireProjectIsAnUpdate pins that retiring a project is a status change and
+// nothing else. sqlmock fails any statement it was not told to expect, so a
+// DELETE issued here would fail the test rather than pass it quietly.
+func TestRetireProjectIsAnUpdate(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	mock.ExpectExec("UPDATE projects SET status = .+ WHERE id = .+ AND status = .").
+		WithArgs("deleted", int64(1), "active").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("FROM projects WHERE id = .").WithArgs(int64(1)).WillReturnRows(projectRows())
+
+	project, err := RetireProject(mockDB, 1)
+	if err != nil {
+		t.Fatalf("RetireProject: %v", err)
+	}
+	if project == nil {
+		t.Fatal("RetireProject returned no project")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestRetireProjectSeparatesMissingFromAlreadyRetired. Both produce zero affected
+// rows and they need different answers: 404 sends an operator looking for a row,
+// 409 tells them the state changed under them.
+func TestRetireProjectSeparatesMissingFromAlreadyRetired(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name string
+		rows *sqlmock.Rows
+		want error
+	}{
+		{
+			name: "no such project",
+			rows: sqlmock.NewRows([]string{"id", "zone_id", "slug", "display_name", "status", "created_at", "updated_at"}),
+			want: ErrProjectNotFound,
+		},
+		{
+			name: "already retired",
+			rows: sqlmock.NewRows([]string{"id", "zone_id", "slug", "display_name", "status", "created_at", "updated_at"}).
+				AddRow(int64(1), int64(7), "payments", "Payments", "deleted", now, now),
+			want: ErrProjectAlreadyRetired,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockDB, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock.New: %v", err)
+			}
+			defer mockDB.Close()
+
+			mock.ExpectExec("UPDATE projects SET status").
+				WithArgs("deleted", int64(1), "active").
+				WillReturnResult(sqlmock.NewResult(0, 0))
+			mock.ExpectQuery("FROM projects WHERE id = .").WithArgs(int64(1)).WillReturnRows(tt.rows)
+
+			if _, err := RetireProject(mockDB, 1); !errors.Is(err, tt.want) {
+				t.Fatalf("RetireProject = %v, want %v", err, tt.want)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
+// registryDeletePattern finds any SQL that could remove a row from the two
+// registry tables — a squirrel DELETE builder aimed at either, or a hand-written
+// DELETE FROM naming one.
+var registryDeletePattern = regexp.MustCompile(`(?i)\bdelete\s+from\s+` + "`" + `?"?(zones|projects)\b|\bsq\.Delete\(\s*(zonesTable|projectsTable|"zones"|"projects")`)
+
+// TestNoDeleteReachesTheRegistryTables walks every .go file in the repository and
+// fails if any of them can delete a zone or a project.
+//
+// THIS IS A STRUCTURAL GUARD, not a unit test, and it is here because the failure
+// it prevents is invisible at runtime. Removing a row frees its slug, and the
+// UNIQUE key that makes reuse impossible is the ONLY thing standing between a
+// recycled name and a month of the previous owner's surviving events (30-day TTL)
+// plus their permanent daily rollup (no TTL) silently reattaching to the new
+// owner. Every reference involved stays valid; nothing errors and nothing logs.
+// No test of a delete path could catch that, because the damage is done by the
+// NEXT tenant, weeks later.
+//
+// Retirement is an UPDATE — see RetireZone and RetireProject — and there is no
+// legitimate reason for either verb to appear anywhere.
+func TestNoDeleteReachesTheRegistryTables(t *testing.T) {
+	var offenders []string
+
+	err := filepath.WalkDir("..", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// Hidden directories hold a full copy of this repo (.claude/worktrees) and
+		// the object store (.git); scanning them would report the same line twice
+		// and, worse, fail on somebody else's branch.
+		if d.IsDir() {
+			if strings.HasPrefix(d.Name(), ".") && d.Name() != "." && d.Name() != ".." {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// Test files are skipped so this one's own negative control does not count
+		// as an offender.
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+
+		source, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, match := range registryDeletePattern.FindAllString(string(source), -1) {
+			offenders = append(offenders, path+": "+match)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking the repository: %v", err)
+	}
+
+	if len(offenders) > 0 {
+		t.Errorf("a DELETE can reach the registry tables, which frees a slug for reuse:\n\t%s",
+			strings.Join(offenders, "\n\t"))
+	}
+}
+
+// TestRegistryDeleteDetectorActuallyDetects is the negative control for the walk
+// above. A pattern that matched nothing at all would make that test permanently,
+// silently green — which is the exact failure mode a structural guard is most
+// prone to.
+func TestRegistryDeleteDetectorActuallyDetects(t *testing.T) {
+	samples := []string{
+		`q := sq.Delete(zonesTable).Where(sq.Eq{"id": id})`,
+		`sq.Delete("projects")`,
+		"engine.Exec(\"DELETE FROM zones WHERE id = ?\", id)",
+		"engine.Exec(\"delete from projects where zone_id = ?\", id)",
+	}
+	for _, sample := range samples {
+		if !registryDeletePattern.MatchString(sample) {
+			t.Errorf("registryDeletePattern missed %q — the repository walk proves nothing", sample)
+		}
+	}
+
+	// And the other direction: the guard must not flag the retirement path, or the
+	// pressure to weaken it starts immediately.
+	for _, sample := range []string{
+		`sq.Update(zonesTable).Set("status", "deleted")`,
+		`// There is deliberately no DeleteZone anywhere`,
+		`sq.Delete(issuesTable)`,
+	} {
+		if registryDeletePattern.MatchString(sample) {
+			t.Errorf("registryDeletePattern flagged %q, which is not a registry delete", sample)
+		}
 	}
 }

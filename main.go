@@ -264,28 +264,49 @@ func main() {
 		return
 	}
 
-	// ---- Identity and configuration: CONTROL PLANE ONLY ----------------------
+	// ---- Tenancy rows: EVERY ROLE, because they mean different things ---------
 	//
-	// Seeding is an act of ownership. A zone that ran these would mint its own
-	// admin account and its own zone row — the second copy of exactly the two
-	// things there is meant to be one of — and would then diverge from the
-	// control plane's registry silently, because nothing compares them. A zone
-	// gets its identity and its tenancy rows from the control plane; the
-	// mechanism for that (a config pull) is deliberately not built yet, so today
-	// a zone-only process expects those rows to be present already.
+	// An earlier version of this gated the registry seed behind the control
+	// plane, on the reasoning that "a zone minting its own zone row is a second
+	// copy of something there should be one of". That conflated two different
+	// tables that happen to share a name.
+	//
+	// The CONTROL PLANE's registry answers "which zones exist" — it is what the
+	// switcher lists and what a fan-out would route over. There is exactly one of
+	// those, and a zone must never write to it.
+	//
+	// A ZONE's OWN registry answers a local question: "which project does this
+	// api_keys row belong to". apikeys.Create resolves a key's project against
+	// the zone's own MariaDB (see resolveProject), and scope.ProjectPredicate
+	// refuses to build a WHERE clause without one. A zone with no rows here can
+	// migrate, boot and report healthy — and then cannot mint a single ingest
+	// key, because the project it would bind to does not exist locally.
+	//
+	// So a zone seeds ITSELF: the row named by its own MON_ZONE_SLUG, and that
+	// zone's default project. That is not divergence, it is the local resolution
+	// data without which the zone cannot do its one job. It is idempotent, and it
+	// can only ever create the zone this process already believes it is.
+	//
+	// Seed the zone and its default project (no-op once both rows exist).
+	// Fail-fast rather than degraded: the default project is what api_keys bind
+	// to and what the env master key stamps events with, so a Monitor without it
+	// would ingest happily with a null tenant on every row — the state that is
+	// hardest to notice and impossible to reattribute afterwards.
+	if err := bootstrap.EnsureZoneAndProject(db.SQL); err != nil {
+		log.Fatalf("❌ failed to bootstrap the tenancy registry: %v", err)
+	}
+
+	// ---- Identity: CONTROL PLANE ONLY ----------------------------------------
+	//
+	// This one genuinely is an act of ownership. A zone that seeded an admin user
+	// would stand up a second identity store — its own accounts, its own
+	// passwords, its own sessions — none of which the control plane knows about
+	// and none of which anything reconciles. Sessions are the control plane's
+	// alone; a zone authenticates api_keys and nothing else.
 	if env.MonRole.RunsControlPlane() {
 		// Seed the first admin user on a fresh database (no-op once any user exists).
 		if err := bootstrap.EnsureAdminUser(db.SQL); err != nil {
 			log.Fatalf("❌ failed to bootstrap admin user: %v", err)
-		}
-
-		// Seed the single zone and its default project (no-op once both rows exist).
-		// Fail-fast rather than degraded: the default project is what api_keys bind
-		// to and what the env master key stamps events with, so a Monitor without it
-		// would ingest happily with a null tenant on every row — the state that is
-		// hardest to notice and impossible to reattribute afterwards.
-		if err := bootstrap.EnsureZoneAndProject(db.SQL); err != nil {
-			log.Fatalf("❌ failed to bootstrap the tenancy registry: %v", err)
 		}
 
 		// Wire the SSO revocation checkpoint into SessionMiddleware. Until this runs

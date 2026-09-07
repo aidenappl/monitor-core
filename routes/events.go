@@ -99,7 +99,29 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 		"mariadb_ok":    mariadbOK,
 		"last_flush_at": lastFlushAt,
 		"role":          string(env.MonRole),
-		"alerting_ok":   AlertingDisabledReason == "",
+		// `zone` is THIS PROCESS'S IDENTITY, and it is here so that a caller can
+		// tell "a monitor-core answered" apart from "the monitor-core I meant
+		// answered". Every zone runs this same binary and every one of them
+		// answers 200, so a control plane holding a registry row whose query_url
+		// points at the wrong box has no way to notice — the reads simply return
+		// another tenant's data under this zone's name, with nothing invalid
+		// anywhere. probe.Zone compares this value against the slug the registry
+		// expected, and structs.ZoneReachabilityMismatched is what it reports when
+		// they disagree; without this key the best any probe can conclude is
+		// `unverified`.
+		//
+		// Reported alongside `role` rather than instead of it because a control
+		// plane carries a zone slug too (MON_ZONE_SLUG has a default in every
+		// role) and serves no events at all, so the pair is what identifies a
+		// process — see probe.classify, which checks the role FIRST for exactly
+		// that reason.
+		//
+		// Unauthenticated, like every other key here. The slug is not a secret: it
+		// is in the ingest URL of every producer and in the path of every
+		// dashboard link, and withholding it would only mean the one caller that
+		// needs it cannot check.
+		"zone":        env.ZoneSlug,
+		"alerting_ok": AlertingDisabledReason == "",
 	})
 }
 

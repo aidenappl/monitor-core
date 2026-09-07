@@ -41,8 +41,22 @@ func withEmptyCache(t *testing.T) {
 
 func zoneRow(id int64, slug string) *sqlmock.Rows {
 	now := time.Now()
-	return sqlmock.NewRows([]string{"id", "slug", "display_name", "status", "created_at", "updated_at"}).
-		AddRow(id, slug, strings.ToUpper(slug[:1])+slug[1:], "active", now, now)
+	return zoneRowColumns().
+		AddRow(id, slug, strings.ToUpper(slug[:1])+slug[1:], "active",
+			"https://events.example.com", "https://zone.example.com",
+			"unknown", "", "", nil, now, now)
+}
+
+// zoneRowColumns mirrors query.zoneColumns, which scanZone unpacks POSITIONALLY.
+// Written out in full rather than derived so that a column added on one side and
+// not the other fails here instead of mis-scanning in production.
+func zoneRowColumns() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id", "slug", "display_name", "status",
+		"ingest_url", "query_url",
+		"reachability", "reachability_detail", "reported_zone", "last_probe_at",
+		"created_at", "updated_at",
+	})
 }
 
 func projectRowsFor(zoneID int64, slugs ...string) *sqlmock.Rows {
@@ -179,7 +193,7 @@ func TestRefreshCacheRefusesAnUnknownZone(t *testing.T) {
 	// missing zone is a test failure rather than a silent empty cache.
 	mock.ExpectQuery("FROM zones WHERE slug = .").
 		WithArgs("trailblaze").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "slug", "display_name", "status", "created_at", "updated_at"}))
+		WillReturnRows(zoneRowColumns())
 
 	err = refreshCacheFrom(mockDB)
 	if err == nil {

@@ -115,11 +115,14 @@ monitor-core/
     cookies.go session.go  # mon-* cookie writing; issueSession (mint + persist refresh-token family)
     events.go query.go analytics.go stream.go api_keys.go dashboards.go views.go issues.go alerts.go
     HandleListZones/HandleListProjects.router.go   # GET /v1/zones, GET /v1/zones/{zone}/projects — the switcher's registry reads
+    HandleAdminZones.router.go     # POST /admin/zones, PUT /admin/zones/{id}, POST .../retire, POST .../probe — plus the shared registryWriteError / registryPathID / decodeJSONBody helpers
+    HandleAdminProjects.router.go  # POST /admin/zones/{id}/projects, PUT /admin/projects/{id}, POST .../retire
     health.go              # GET /ready (readiness) + the 2s dependency pings /health also reports
     HandleGitHubWebhook.router.go  # POST /webhooks/github — root-mounted, HMAC-authenticated
   github/                  # GitHub link parsing, live-state client, webhook signature verification
     parse.go client.go verify.go
   apikeys/                 # API-key cache (backed by MariaDB, was ClickHouse) + a 30s background refresher
+  probe/zone.go            # Zone reachability probe: GET {query_url}/health + /ready, compares the zone the far end REPORTS against the slug the registry expected, returns a structs.ZoneReachability. 3s total budget (probe.ZONE_PROBE_TIMEOUT); writes nothing itself
   registry/registry.go     # Tenancy-registry cache: this install's zone + its active projects, same 30s ticker shape as apikeys — what a session's ?project selector is validated against
   alerts/ issues/          # Subsystems (each Init()s from main.go). alerts/ keeps only what did not move to MariaDB: the evaluator, router, notifier, hub, and the ClickHouse alert_states/alert_history
   dashboards/ views/       # EMPTY — their tables moved to MariaDB (123/124); the files are tombstones that say where everything went
@@ -333,7 +336,7 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
     — pending account → web redirects to `/pending`), and CSRF **`4030`** (missing cookie) /
     **`4031`** (token mismatch).
   - Three endpoints bypass `responder`: `GET /health`
-    (`{status,enqueued,dropped,pending,clickhouse_ok,mariadb_ok,last_flush_at,role}`),
+    (`{status,enqueued,dropped,pending,clickhouse_ok,mariadb_ok,last_flush_at,role,zone}`),
     `GET /ready` (`{status,clickhouse_ok,mariadb_ok,role[,failing]}`) and `POST /v1/events`
     (`{accepted:<int>}`). Ingest errors are plain text.
   - **`/health` is liveness, `/ready` is readiness — do not merge them.** `/health` always
@@ -550,6 +553,13 @@ GET    /admin/sso-providers                 list providers (secrets never return
 POST   /admin/sso-providers                 create a provider                     [Protected + RequireAdmin]
 PUT    /admin/sso-providers/{slug}          update a provider                     [Protected + RequireAdmin]
 DELETE /admin/sso-providers/{slug}          delete a provider                     [Protected + RequireAdmin]
+POST   /admin/zones                         record a zone (both URLs required)    [Protected + RequireAdmin, control plane only]
+PUT    /admin/zones/{id}                    display_name / ingest_url / query_url [Protected + RequireAdmin, control plane only] — slug & status are REFUSED
+POST   /admin/zones/{id}/retire             soft-delete; 409 with live projects   [Protected + RequireAdmin, control plane only]
+POST   /admin/zones/{id}/probe              probe query_url now + persist verdict [Protected + RequireAdmin, control plane only]
+POST   /admin/zones/{id}/projects           create a project inside a zone        [Protected + RequireAdmin, control plane only]
+PUT    /admin/projects/{id}                 display_name                          [Protected + RequireAdmin, control plane only] — slug, zone_id & status are REFUSED
+POST   /admin/projects/{id}/retire          soft-delete                           [Protected + RequireAdmin, control plane only]
 POST   /webhooks/github                     GitHub pull_request deliveries        [public — HMAC signature IS the auth]
 GET    /v1/issues?status=&service=&assignee=&has_pr=&q=&from=&to=&sort=&order=&history=  filtered list  [QueryAuthMiddleware]
 GET    /v1/issues/{id}                      verbose detail (+links, assignee, repo, history)  [QueryAuthMiddleware]
@@ -750,6 +760,7 @@ registration, cannot drift that way.
 | `alerts`/`issues` `Init` | **no** | yes | yes |
 | Event hub, queue, batcher, alert hub, alert evaluator | **no** | yes | yes |
 | `/auth/*`, `/admin/sso-providers` routes | yes | **no** | yes |
+| `/admin/zones*`, `/admin/projects*` (registry WRITES) | yes | **no** | yes |
 | Ingest, query, analytics, dashboards, views, alerts, issues, `/webhooks/github` routes | **no** | yes | yes |
 | `/health`, `/ready`, `/v1/zones*`, `/v1/service-repos*`, `/v1/api-keys*` | yes | yes | yes |
 
@@ -965,14 +976,52 @@ Four things about it are deliberate:
   absorbed.
 
 **`GET /v1/zones` and `GET /v1/zones/{zone}/projects`** are what a switcher populates from —
-reads for any authenticated session, **no create/update/delete** (the registry is seeded and
-managed out of band in this phase; an immutable, never-reusable slug is not something to mint
-through a form). ⚠️ **Clients must not append `?project=` to either.** Both run through
+reads for any authenticated session. ⚠️ **Clients must not append `?project=` to either.** Both run through
 `QueryAuthMiddleware`, so a stale selection would refuse the exact request needed to discover
 a valid one — answering the registry without a selection is what keeps a bad selection
 recoverable. See `routes/AGENTS.md` for the rest. The projects listing also
 carries **`default_project_slug`**, naming which project an unset `?project` resolves to, so
 the switcher renders that tenant once rather than twice.
+
+**The registry WRITES are a separate surface: `/admin/zones*` and `/admin/projects*`,
+control plane only, `RequireAdmin` on every route** (the table in §5 lists them). Four rules
+govern that surface, and each of them is a failure that has no runtime symptom:
+
+- **A zone row RECORDS infrastructure; it does not create any.** The stack, its ClickHouse,
+  its MariaDB, the DNS record and the certificate are provisioned by hand first. Nothing
+  reconciles a row against reality, so a row whose `query_url` points at the wrong box is
+  syntactically perfect and renders another tenant's data under this zone's name — which is
+  what the probe below exists to catch.
+- **No hard delete, ever.** Retiring sets `status='deleted'` and keeps the row forever, so
+  the `UNIQUE` key on slug makes reuse structurally impossible: events outlive a row by up
+  to 30 days and the occurrence rollup outlives it permanently, so a recycled slug
+  reattaches one tenant's history to another with every reference still valid. There is no
+  `DELETE` verb on the surface and `query/registry_query_test.go` walks the repository to
+  keep it that way. `POST /admin/zones/{id}/retire` refuses with **409** while the zone
+  still owns active projects — the guard is a `NOT EXISTS` inside `RetireZone`'s own
+  `UPDATE`, not a count in the caller, so there is no window to lose a race in.
+- **Slugs are immutable at the API.** A `slug` in an update body is answered **400**, never
+  dropped: a rename that returned `200` and changed nothing would be invisible on this side
+  and permanent on the other. `status` (and `zone_id`, on a project) are refused for the
+  same reason — retirement has a guard, and a second way to reach it is a bypass.
+- **Reserved slugs come from `tools.ValidateSlug`.** The list guards monitor-web's *static*
+  route table; a project called `settings` is shadowed by the app's own page and is
+  permanently unreachable with nothing logged.
+
+**`POST /admin/zones/{id}/probe`** answers "is the box at the end of this row's `query_url`
+actually this zone?" It GETs `{query_url}/health` and `/ready` inside a **3s total budget**
+(`probe.ZONE_PROBE_TIMEOUT` — one wedged zone must not hang the page that warns about wedged
+zones), re-runs `tools.ValidateExternalURL` at probe time (DNS can be re-pointed under a
+stored value), refuses redirects, and stores one of `structs.ZoneReachability` via
+`query.RecordZoneProbe`. ⚠️ **A `200`-only check would be worthless here**: every zone runs
+the same binary and answers `200`, so a `query_url` aimed at another zone would pass and
+mislabel every read. The probe therefore compares the far end's reported **`zone` and
+`role`** (both on `GET /health`) against what the registry expected — `role` FIRST, because
+a control plane carries the same `MON_ZONE_SLUG` default and serves no events, and
+`MON_PUBLIC_URL` makes it the likeliest wrong URL to be typed. `unverified` (answered but
+would not say who it is) is deliberately not `healthy`. **An unreachable zone is a `200`
+from this route** — the probe succeeded, the zone is what is broken, and a `500` here would
+leave an operator unable to tell the two apart.
 
 **API keys are project-scoped on both verbs.** `apikeys.List` returns only the keys of the
 request's project and refuses rather than falling back if none resolved — the page rendering
@@ -1051,7 +1100,8 @@ working without knowing any of this exists:
 | `Issue` | `project` | not `omitempty` — an issue always has one, and its absence would mean a bug rather than a legacy row |
 | `APIKey` (`GET`/`POST /v1/api-keys`) | `project_id`, `project_slug` | `POST` also *accepts* an optional `project_slug`, defaulting to `MON_DEFAULT_PROJECT` |
 
-Two routes were added for the switcher, both reads, both session-available:
+Two routes were added for the switcher, both reads, both session-available (the write
+surface is `/admin/zones*` + `/admin/projects*`, admin-only and control-plane-only):
 
 | Route | Returns |
 |---|---|
@@ -1300,7 +1350,7 @@ deviating.
 | `monitor-web` | The Next.js dashboard. Calls `/v1/*` and `/auth/*` via a server-side proxy that forwards `mon-*` cookies + `X-CSRF-Token`. Its auth model mirrors this repo's — see `monitor-web/AGENTS.md`. |
 | `go-monitor` | Go SDK. POSTs NDJSON to `POST /v1/events` with `X-Api-Key`. **Diff against `go-monitor/AGENTS.md` when touching ingestion** — the wire contract is unchanged by the auth overhaul, but the key it sends must now be the env master key or an `ingest`-scope key; an `admin` key no longer ingests. |
 | `monitor-js` | TypeScript SDK (GitHub only). Same ingestion contract. |
-| `monitor-mcp` | MCP server exposing this API to Claude (`mcp__monitor__*`). **House rule: any new `/v1/*` route should add or consciously skip a matching MCP tool in the same change.** The `/auth/*` + `/admin/sso-providers` surface is browser/cookie-oriented and not part of the MCP tool set. |
+| `monitor-mcp` | MCP server exposing this API to Claude (`mcp__monitor__*`). **House rule: any new `/v1/*` route should add or consciously skip a matching MCP tool in the same change.** The `/auth/*` + `/admin/sso-providers` surface is browser/cookie-oriented and not part of the MCP tool set. The registry **write** surface (`/admin/zones*`, `/admin/projects*`) is **consciously skipped** for now: writing a zone row is an act with hand-provisioned infrastructure behind it and an unreusable slug in front of it, so it wants an operator looking at a form, not an agent inferring one. `monitor_list_zones` already covers the read. |
 
 ---
 

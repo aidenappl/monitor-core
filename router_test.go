@@ -126,7 +126,12 @@ var deployedSurface = []string{
 	"GET /v1/zones",
 	"GET /v1/zones/{zone}/projects",
 	"PATCH /v1/issues/{id}/comments/{commentID}",
+	"POST /admin/projects/{id}/retire",
 	"POST /admin/sso-providers",
+	"POST /admin/zones",
+	"POST /admin/zones/{id}/probe",
+	"POST /admin/zones/{id}/projects",
+	"POST /admin/zones/{id}/retire",
 	"POST /auth/login",
 	"POST /auth/logout",
 	"POST /auth/refresh",
@@ -151,7 +156,9 @@ var deployedSurface = []string{
 	"POST /v1/topn",
 	"POST /v1/views",
 	"POST /webhooks/github",
+	"PUT /admin/projects/{id}",
 	"PUT /admin/sso-providers/{slug}",
+	"PUT /admin/zones/{id}",
 	"PUT /auth/self",
 	"PUT /v1/alert-rules/{id}",
 	"PUT /v1/dashboards/{id}",
@@ -218,6 +225,21 @@ var controlPlaneOnly = []string{
 	"POST /admin/sso-providers",
 	"PUT /admin/sso-providers/{slug}",
 	"DELETE /admin/sso-providers/{slug}",
+
+	// The tenancy registry WRITE surface. A zone must not be able to mint or edit
+	// registry rows: the registry is the map that says which box a zone's data
+	// lives on, and a process that can write its own entry can point a row at
+	// itself — or at another tenant — with every read through it then returning
+	// the wrong data under a name that still looks right. The READS
+	// (GET /v1/zones, GET /v1/zones/{zone}/projects) stay in both roles, because
+	// a switcher has to work wherever it is served from.
+	"POST /admin/zones",
+	"PUT /admin/zones/{id}",
+	"POST /admin/zones/{id}/retire",
+	"POST /admin/zones/{id}/probe",
+	"POST /admin/zones/{id}/projects",
+	"PUT /admin/projects/{id}",
+	"POST /admin/projects/{id}/retire",
 }
 
 // TestBothIsTheDeployedSurface is the no-op guard. MON_ROLE defaults to `both`,

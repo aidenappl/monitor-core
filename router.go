@@ -95,6 +95,55 @@ func buildRouter(role env.Role) *mux.Router {
 		// Pluggable SSO subsystem (Phase 3A): /auth/sso/config, /auth/sso/{slug}/login,
 		// /auth/sso/{slug}/callback, and the /admin/sso-providers CRUD.
 		routes.RegisterSSORoutes(r)
+
+		// ---- Tenancy registry WRITES ----------------------------------------
+		//
+		// ⚠️ CONTROL PLANE ONLY, AND THAT IS THE POINT OF THE GATE. The registry
+		// is the map that says which box a zone's data lives on; a zone process
+		// that could mint or edit rows could point a row at itself, or at
+		// somebody else, and every read made through it would return the wrong
+		// tenant's data under a name that still looks right. Registration is what
+		// enforces it — a zone answers 404 here, which is the honest answer to
+		// "you asked the wrong plane" and is routable by a proxy in front of a
+		// split deployment.
+		//
+		// Admin-only on top of that, exactly as the SSO provider CRUD above is:
+		// its own /admin subrouter with SessionMiddleware, then RequireAdmin per
+		// route. Two subrouters share the /admin prefix and mux is happy with
+		// that — a prefix match whose children do not match falls through to the
+		// next route — so the registry surface stays here in router.go where the
+		// role gate is visible, instead of hiding inside a Register* call.
+		//
+		// The READS are deliberately elsewhere: GET /v1/zones and
+		// GET /v1/zones/{zone}/projects are open to any authenticated session
+		// because the project switcher needs them. Looking and writing are
+		// different privileges.
+		//
+		// NOTE THE ABSENCE OF ANY DELETE. Retirement is a POST to .../retire,
+		// which soft-deletes and keeps the row forever so the UNIQUE key on slug
+		// makes reuse impossible; a DELETE route would be one careless refactor
+		// away from a real one, and a recycled slug silently reattaches the
+		// previous owner's surviving events and its permanent daily rollup to the
+		// new one.
+		//
+		// Named registryAdmin, not `registry`: package main imports the registry
+		// package (the zone/project cache) and a local variable shadowing it here
+		// would compile fine and read as the cache to anyone skimming.
+		registryAdmin := r.PathPrefix("/admin").Subrouter()
+		registryAdmin.Use(middleware.SessionMiddleware)
+		registryAdmin.HandleFunc("/zones", middleware.RequireAdmin(routes.HandleCreateZone)).Methods(http.MethodPost)
+		registryAdmin.HandleFunc("/zones/{id}", middleware.RequireAdmin(routes.HandleUpdateZone)).Methods(http.MethodPut)
+		registryAdmin.HandleFunc("/zones/{id}/retire", middleware.RequireAdmin(routes.HandleRetireZone)).Methods(http.MethodPost)
+		// Probe-now: makes an outbound request to the zone's query_url, compares
+		// what answers against what this row claims, and persists the verdict.
+		// POST rather than GET because it has an effect and must never be
+		// prefetched — see routes.HandleProbeZone.
+		registryAdmin.HandleFunc("/zones/{id}/probe", middleware.RequireAdmin(routes.HandleProbeZone)).Methods(http.MethodPost)
+		// Create hangs off the zone because a project slug is unique only within
+		// one; update and retire take the project's own id, which is global.
+		registryAdmin.HandleFunc("/zones/{id}/projects", middleware.RequireAdmin(routes.HandleCreateProject)).Methods(http.MethodPost)
+		registryAdmin.HandleFunc("/projects/{id}", middleware.RequireAdmin(routes.HandleUpdateProject)).Methods(http.MethodPut)
+		registryAdmin.HandleFunc("/projects/{id}/retire", middleware.RequireAdmin(routes.HandleRetireProject)).Methods(http.MethodPost)
 	}
 
 	// ---- Data plane, root router (MON_ROLE=zone or both) ---------------------

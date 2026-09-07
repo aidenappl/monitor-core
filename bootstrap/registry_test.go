@@ -39,8 +39,15 @@ func TestEnsureZoneAndProjectIsNoOpWhenSeeded(t *testing.T) {
 	now := time.Now()
 	mock.ExpectQuery("FROM zones WHERE slug = .").
 		WithArgs("trailblaze").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "slug", "display_name", "status", "created_at", "updated_at"}).
-			AddRow(int64(1), "trailblaze", "Renamed By An Operator", "active", now, now))
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "slug", "display_name", "status",
+			"ingest_url", "query_url",
+			"reachability", "reachability_detail", "reported_zone", "last_probe_at",
+			"created_at", "updated_at",
+		}).
+			AddRow(int64(1), "trailblaze", "Renamed By An Operator", "active",
+				"https://events.example.com", "https://zone.example.com",
+				"unknown", "", "", nil, now, now))
 	mock.ExpectQuery("FROM projects WHERE .*").
 		WithArgs("default", int64(1)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "zone_id", "slug", "display_name", "status", "created_at", "updated_at"}).

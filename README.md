@@ -134,7 +134,8 @@ Response:
   "clickhouse_ok": true,
   "mariadb_ok": true,
   "last_flush_at": "2026-09-06T12:00:00Z",
-  "role": "both"
+  "role": "both",
+  "zone": "trailblaze"
 }
 ```
 
@@ -143,6 +144,13 @@ container healthcheck points here, and a restart cannot repair ClickHouse). The
 dependency booleans and `last_flush_at` are diagnostics; `dropped` counts both queue
 overflow and batches the writer gave up on. `role` echoes `MON_ROLE` (see **Roles** under
 Configuration) so the plane a process thinks it is can be asked rather than inferred.
+
+`zone` echoes `MON_ZONE_SLUG` — this process's **identity**. It is what makes
+`POST /admin/zones/{id}/probe` able to tell "a monitor-core answered" from "the
+monitor-core I meant answered": every zone runs this same binary and every one of them
+answers `200`, so without it a registry row pointed at the wrong box looks perfectly
+healthy while every read through it returns another tenant's data. Read `role` alongside
+it — a control plane carries a zone slug too and serves no events at all.
 
 ### Readiness
 
@@ -675,9 +683,39 @@ events under the label the user asked for. `AGENTS.md` §6 has the full register
 what changes when a membership table lands.
 
 `GET /v1/zones` and `GET /v1/zones/{zone}/projects` list the registry so a project switcher
-can populate. Both are reads only — the registry is seeded at boot and managed out of band —
-and neither should be called with `?project=`, so a stale selection never blocks discovering
-a valid one.
+can populate. Both are reads, available to any authenticated session, and neither should be
+called with `?project=`, so a stale selection never blocks discovering a valid one.
+
+**Writing the registry is a different privilege and a different plane.** The write surface
+lives under `/admin`, is registered only in a role that runs the control plane, and sits
+behind `RequireAdmin`:
+
+| Route | What it does |
+|-------|--------------|
+| `POST /admin/zones` | record a zone — both URLs required |
+| `PUT /admin/zones/{id}` | edit `display_name` / the URLs; a `slug` or `status` in the body is **refused**, not ignored |
+| `POST /admin/zones/{id}/retire` | soft-delete; `409` while the zone still owns active projects |
+| `POST /admin/zones/{id}/probe` | probe the zone's `query_url` now and persist the verdict |
+| `POST /admin/zones/{id}/projects` | create a project inside a zone |
+| `PUT /admin/projects/{id}` | edit `display_name`; `slug`, `zone_id` and `status` are refused |
+| `POST /admin/projects/{id}/retire` | soft-delete |
+
+Three things about that table are load-bearing. **A zone row records infrastructure; it
+does not create any** — the stack, its ClickHouse, its DNS and its certificate are all
+provisioned by hand first, and a row whose `query_url` points at the wrong box is
+syntactically perfect and renders another tenant's data under this zone's name. **There is
+no `DELETE`** anywhere on it: retiring keeps the row forever so the `UNIQUE` key on slug
+makes a recycled slug impossible, which is what stops a month of surviving events (30-day
+TTL) and a permanent daily rollup reattaching to the next owner. And **slugs are immutable**
+at the API, not merely in the UI — a rename that answered `200` and changed nothing would be
+invisible here and permanent everywhere else.
+
+`POST /admin/zones/{id}/probe` compares what the far end says it is (`zone` + `role` on its
+`/health`) against what the registry expected, and stores one of
+`unknown / unconfigured / unreachable / unverified / mismatched / degraded / healthy`.
+**An unreachable zone is a `200`** — the probe succeeded and the zone is what is broken —
+and `mismatched` is the verdict that pays for the whole mechanism: a `200`-only check would
+pass a `query_url` aimed at another zone and mislabel every read made through it.
 
 > **Transition, expiring 2026-10-06 at the earliest.** Rows written before
 > `migrations/006_events_project.sql` read back with an empty project, and the fill is a
@@ -743,7 +781,8 @@ monitor-core/
   env/env.go                  # Environment configuration + RequireProductionSecrets guard
   env/role.go                 # MON_ROLE: the Role type (app/zone/both) and the fail-fast RequireValidRole guard
   jwt/jwt.go                  # Monitor-owned HS512 access/refresh JWTs (alg-pinned)
-  tools/                      # Password.tool.go (bcrypt 12), Crypto.go (AES-256-GCM), Validate.tool.go, Slug.tool.go
+  tools/                      # Password.tool.go (bcrypt 12), Crypto.go (AES-256-GCM), Validate.tool.go (+ NormalizeEndpointURL), Slug.tool.go
+  probe/zone.go               # Zone reachability probe: calls a zone's /health + /ready and reports healthy/degraded/unverified/MISMATCHED — the check that catches a registry row pointed at the wrong box
   bootstrap/                  # First-run seeding: admin.go (first admin user), registry.go (zone + default project)
   sso/                        # Pluggable SSO wiring onto go-forta/sso: config.go, resolve.go, checkpoint.go, statestore.go, sessionstore.go, backchannel.go
   query/                      # MariaDB query layer (squirrel): users/identities/refresh_tokens/sso_*/api_keys/zones/projects/issues/service_repos/alert_rules/notification_channels/notification_policies/service_groups/dashboards/saved_views

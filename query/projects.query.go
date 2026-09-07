@@ -2,6 +2,7 @@ package query
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -14,6 +15,16 @@ import (
 // projectsTable is unqualified for the same reason zonesTable is — the registry
 // lives in the DSN's default database (monitor_auth).
 const projectsTable = "projects"
+
+// Retirement refusals, as sentinel errors so the handler can map each to a
+// status code instead of parsing a message. There is no ErrProjectHasSomething
+// to match ErrZoneHasActiveProjects, and the asymmetry is real rather than an
+// omission: retiring a project is ALWAYS permitted, because it stops nothing.
+// See RetireProject.
+var (
+	ErrProjectNotFound       = errors.New("project not found")
+	ErrProjectAlreadyRetired = errors.New("project is already retired")
+)
 
 var projectColumns = []string{
 	"id", "zone_id", "slug", "display_name", "status", "created_at", "updated_at",
@@ -217,4 +228,71 @@ func UpdateProject(engine db.Queryable, id int64, req UpdateProjectRequest) (*st
 		return nil, fmt.Errorf("update project: %w", err)
 	}
 	return GetProject(engine, id)
+}
+
+// RetireProject moves a project to status='deleted' and returns the refreshed
+// row.
+//
+// THIS IS THE ONLY RETIREMENT PATH FOR A PROJECT, and — like RetireZone — it is
+// an UPDATE. There is no DeleteProject and there must never be one: the row is
+// kept forever so the UNIQUE(zone_id, slug) key makes the name permanently
+// spent. A recycled project slug is the worse half of the reuse failure the zone
+// side guards against, because the project dimension is what every event is
+// filed under: up to a month of the previous owner's events (30-day TTL) and its
+// permanent daily rollup (no TTL) would reattach to the new owner, with every
+// reference still syntactically valid and nothing anywhere to log.
+//
+// THE ASYMMETRY WITH RetireZone IS DELIBERATE. RetireZone carries a NOT EXISTS
+// guard because retiring a zone strands the live tenants inside it; retiring a
+// project strands nothing, so there is no equivalent predicate here and none
+// should be invented. What IS shared is the shape: the `status = 'active'`
+// predicate lives in the statement, so "already retired" is decided by the same
+// atomic write rather than by a SELECT that could go stale between the two.
+//
+// Ingestion is NOT stopped by this. The api_keys rows pointing at a retired
+// project keep authenticating and their events keep landing under it — retiring
+// a tenant in the registry is a statement about what an operator should be
+// offered, not a kill switch on a credential. Revoke the keys separately; the
+// alternative (a retire that silently starts dropping accepted events) is the
+// lossy failure this whole registry exists to make impossible.
+func RetireProject(engine db.Queryable, id int64) (*structs.Project, error) {
+	query, args, err := sq.Update(projectsTable).
+		Set("status", string(structs.ProjectStatusDeleted)).
+		Where(sq.Eq{"id": id}).
+		Where(sq.Eq{"status": string(structs.ProjectStatusActive)}).
+		ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("build query: %w", err)
+	}
+
+	result, err := engine.Exec(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("retire project %d: %w", id, err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("rows affected: %w", err)
+	}
+	if affected == 0 {
+		return nil, explainRetireProjectRefusal(engine, id)
+	}
+
+	return GetProject(engine, id)
+}
+
+// explainRetireProjectRefusal turns "the UPDATE matched nothing" into the reason.
+//
+// Only two states can produce it — the project does not exist (404) or it was
+// already retired (a no-op the caller can ignore) — and they need different
+// answers, for the same reason explainRetireZoneRefusal separates its three.
+func explainRetireProjectRefusal(engine db.Queryable, id int64) error {
+	project, err := GetProject(engine, id)
+	if err != nil {
+		return fmt.Errorf("retire project %d: %w", id, err)
+	}
+	if project == nil {
+		return fmt.Errorf("retire project %d: %w", id, ErrProjectNotFound)
+	}
+	return fmt.Errorf("retire project %q: %w", project.Slug, ErrProjectAlreadyRetired)
 }

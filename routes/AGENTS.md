@@ -28,6 +28,8 @@ service layer the repo's rules say not to build.
 | `service_repos.go` | `GET /v1/service-repos`, `GET/PUT/DELETE /v1/service-repos/{service}` |
 | `HandleListZones.router.go` | `GET /v1/zones` (active zones) + `registryListPage`, the limit/offset parser both registry routes share |
 | `HandleListProjects.router.go` | `GET /v1/zones/{zone}/projects` (active projects in one zone) — what the project switcher populates from |
+| `HandleAdminZones.router.go` | `POST /admin/zones`, `PUT /admin/zones/{id}`, `POST /admin/zones/{id}/retire`, `POST /admin/zones/{id}/probe` + the shared `registryWriteError` (sentinel → status), `registryPathID` and `decodeJSONBody` helpers |
+| `HandleAdminProjects.router.go` | `POST /admin/zones/{id}/projects`, `PUT /admin/projects/{id}`, `POST /admin/projects/{id}/retire` |
 | `HandleLogin/Register/Refresh/Logout.router.go` | `POST /auth/{login,register,refresh,logout}` (native session auth) |
 | `HandleGetSelf.router.go` | `GET/PUT /auth/self` (current user + set/change password) |
 | `HandleIdentities.router.go` | `GET /auth/self/identities`, `POST/DELETE /auth/self/identities/{slug}` (link/unlink) |
@@ -88,8 +90,9 @@ of registration. Auth details (cookies, JWT, SSO flow, roles) live in `../AGENTS
 ## Which of these routes a process registers
 
 **Registration is not in this package.** `buildRouter(role)` in the repo root owns the whole
-HTTP surface and decides, per `MON_ROLE`, which handlers here are reachable: `/auth/*` and
-the SSO set are control plane, ingest/query/analytics/dashboards/views/alerting/issues and
+HTTP surface and decides, per `MON_ROLE`, which handlers here are reachable: `/auth/*`, the
+SSO set and the `/admin/zones*` + `/admin/projects*` registry writes are control plane,
+ingest/query/analytics/dashboards/views/alerting/issues and
 `POST /webhooks/github` are data plane, and `/health`, `/ready`, the zone/project reads,
 `/v1/service-repos` and `/v1/api-keys` are registered in every role. Under the default
 `MON_ROLE=both` every route in the tables above is registered, in the order it always was —
@@ -165,12 +168,11 @@ Nothing else in the file may build a query against `monitor.events` —
 
 ## The tenancy registry routes
 
-`GET /v1/zones` and `GET /v1/zones/{zone}/projects` are **reads only**, available to any
-authenticated session. There is deliberately no create/update/delete counterpart in this
-phase: the registry is seeded by `bootstrap.EnsureZoneAndProject` and managed out of band.
-Slugs are immutable and never reusable, so a mistyped project minted through a REST call
-could only ever be retired, never corrected — that belongs to an operator with a migration,
-not to a form.
+`GET /v1/zones` and `GET /v1/zones/{zone}/projects` are **reads**, available to any
+authenticated session. The **writes** are a separate surface — `/admin/zones*` and
+`/admin/projects*`, registered only on the control plane and behind `RequireAdmin` (see *The
+registry write surface* below). Looking and writing are different privileges: a switcher has
+to work for everyone, and a process that can mint a registry row can point one anywhere.
 
 - **The zone is a path segment, the project is not.** A project slug is unique only *within*
   its zone, so listing projects by slug alone would return the right rows today (one zone)
@@ -200,6 +202,48 @@ not to a form.
   run through `QueryAuthMiddleware`, so a stale selection would refuse the very request a
   client needs in order to discover a valid one. Answering the registry without a selection is
   what keeps a bad selection recoverable.
+
+## The registry write surface
+
+`POST /admin/zones`, `PUT /admin/zones/{id}`, `POST /admin/zones/{id}/retire`,
+`POST /admin/zones/{id}/probe`, `POST /admin/zones/{id}/projects`,
+`PUT /admin/projects/{id}`, `POST /admin/projects/{id}/retire` — all
+`SessionMiddleware` + `RequireAdmin`, all registered inside `role.RunsControlPlane()` in
+`../router.go`.
+
+- ⚠️ **Control plane only, and registration is the enforcement.** The registry is the map
+  that says which box a zone's data lives on; a zone process able to write it could point a
+  row at itself or at another tenant, and every read through that row would return the wrong
+  data under a name that still looks right. A zone answers 404 here.
+- ⚠️ **There is no `DELETE` verb on this surface, for either entity.** Retirement is
+  `POST .../retire`, an `UPDATE` that keeps the row forever so the `UNIQUE` key on slug makes
+  reuse structurally impossible — a recycled slug silently reattaches up to a month of the
+  previous owner's events plus a permanent daily rollup to the new one. Spelling retirement
+  as `DELETE` would be one refactor away from a handler that actually deletes;
+  `query/registry_query_test.go` walks the repository to keep the verb absent.
+- **Immutable fields are REFUSED, not ignored.** A `slug` (or `zone_id`, or `status`) in an
+  update body is a `400`. The query layer already makes the write impossible — the request
+  structs have no such fields — so what the handler adds is that the caller is *told*: a
+  rename that answered `200` and changed nothing is invisible here and permanent everywhere
+  else.
+- **Validation runs twice, on purpose.** The handler calls `tools.ValidateSlug` /
+  `tools.NormalizeEndpointURL` before the query layer does, so a bad slug or a plaintext URL
+  is a `400` naming the field instead of a `500` carrying a driver error. Both call the *same*
+  definition in `tools/` — one rule, applied at two moments, not two rules.
+- **Errors map through `registryWriteError`:** `ErrZoneNotFound`/`ErrProjectNotFound` → 404,
+  `ErrZoneAlreadyRetired`/`ErrProjectAlreadyRetired`/`ErrZoneHasActiveProjects` → 409,
+  MariaDB 1062 (a spent slug, retired rows included) → 409, 1452 → 409, anything else → 500.
+  Typed sentinels and `errors.Is`, never message parsing — the pattern `api_keys.go` uses.
+- ⚠️ **`POST /admin/zones/{id}/probe` answers `200` for an unreachable zone.** The probe
+  succeeded; the zone is what is broken. It calls `probe.Zone` (3s total budget), persists
+  the verdict with `query.RecordZoneProbe`, and returns the refreshed row. A `500` here would
+  leave the admin page unable to tell "the probe broke" from "the zone is broken" — the same
+  shape as an errors page rendering "no issues" for a failed query. It is a `POST` because it
+  has an effect and must never be prefetched.
+- **`mismatched` is the verdict that matters.** The probe compares the `zone` and `role` the
+  far end reports on its own `/health` against what the registry expected, checking `role`
+  first: a control plane runs the same binary with the same `MON_ZONE_SLUG` default and
+  serves no events, and it is the likeliest wrong URL to be typed.
 
 ## Project-scoped issue reads
 
