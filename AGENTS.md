@@ -1383,14 +1383,27 @@ deviating.
      The tell is in the dry run: `renumbered from position 1 to 5`. A clean cutover
      inserts at positions 1-4 with no renumbering at all.
 
-     Confirm what is there, then clear it — the real policies are still in ClickHouse, so
-     the table should hold nothing but the four seeded defaults:
+     ⚠️ **THIS IS THE MariaDB `monitor` SCHEMA, NOT THE ClickHouse DATABASE OF THE SAME
+     NAME.** Migration 110's header records that collision and it bites hardest right here:
+     the seeded rows to delete are in MariaDB, while the ClickHouse table of the same name
+     still holds the four REAL policies the cutover is about to read. Running the delete
+     against ClickHouse destroys them permanently. ClickHouse rejects a bare `DELETE FROM
+     <table>` with a syntax error (it wants `DELETE FROM … WHERE …`), which is the only
+     thing standing between a mis-targeted paste and data loss — do not "fix" it by adding
+     `WHERE 1=1`.
 
-     ```sql
-     SELECT id, name, position, channel_ids FROM monitor.notification_policies ORDER BY position;
-     -- expect exactly: Critical (P0) — All Channels / High (P1) — PagerDuty + Email /
-     --                 Medium (P2) — Email Only / Low (P3) — Web Only, all channel_ids '[]'
-     DELETE FROM monitor.notification_policies;
+     Confirm what is there, then clear it. The real policies are still in ClickHouse, so
+     the MariaDB table should hold nothing but the four seeded defaults:
+
+     ```sh
+     # from the monitor-mariadb container
+     mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" monitor \
+       -e "SELECT id, name, position, channel_ids FROM notification_policies ORDER BY position;"
+     # expect exactly: Critical (P0) — All Channels / High (P1) — PagerDuty + Email /
+     #                 Medium (P2) — Email Only / Low (P3) — Web Only, all channel_ids '[]'
+
+     mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" monitor \
+       -e "DELETE FROM notification_policies;"
      ```
 
      Then re-run the dry run and check it reports positions 1-4 with no renumbering.
