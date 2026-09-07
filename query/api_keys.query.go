@@ -46,13 +46,6 @@ func scanAPIKey(row apiKeyScanner) (*structs.APIKey, error) {
 	return &k, nil
 }
 
-// ListAPIKeys returns every stored API key (including key_hash, which callers
-// must not serialize) ordered newest-first, each with its project resolved.
-//
-// The project is joined here rather than fetched by the caller because this is
-// what apikeys.refreshCache reads every 30 seconds to rebuild the entire auth
-// cache. Resolving the slug per key afterwards would turn one query into one
-// plus one per key, on a timer, forever.
 // ListAllAPIKeys returns every key across every project.
 //
 // This exists for exactly ONE caller: the apikeys cache refresh. Validation must
@@ -111,11 +104,15 @@ func listAPIKeys(engine db.Queryable, projectSlug *string) ([]structs.APIKey, er
 	return keys, rows.Err()
 }
 
-// GetAPIKeyByID resolves a single key. Returns (nil, nil) when not found.
-func GetAPIKeyByID(engine db.Queryable, id string) (*structs.APIKey, error) {
+// GetAPIKeyByID returns one key, scoped to a project.
+//
+// The project is part of the LOOKUP, not a check applied after it: a key
+// belonging to another tenant must read as absent, so a caller cannot learn that
+// an id exists — or act on it — outside its own project.
+func GetAPIKeyByID(engine db.Queryable, projectSlug, id string) (*structs.APIKey, error) {
 	query, args, err := sq.Select(apiKeyColumns...).
 		From(apiKeysWithProject).
-		Where(sq.Eq{"api_keys.id": id}).
+		Where(sq.Eq{"api_keys.id": id, "projects.slug": projectSlug}).
 		ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("build query: %w", err)
@@ -170,9 +167,23 @@ func CreateAPIKey(engine db.Queryable, req CreateAPIKeyRequest) error {
 	return nil
 }
 
-// DeleteAPIKey hard-deletes a key by id.
-func DeleteAPIKey(engine db.Queryable, id string) error {
-	query, args, err := sq.Delete("api_keys").Where(sq.Eq{"id": id}).ToSql()
+// DeleteAPIKey removes one key, scoped to a project.
+//
+// The project is in the DELETE's own WHERE rather than trusted from the read
+// that preceded it. A mutation has to be defended independently of the handler
+// that called it: the read-then-write pair is not atomic, and a future caller
+// that skips the read — or reorders it — would otherwise delete across tenants
+// with nothing in this function to stop it. Same reasoning the issues upsert
+// records for its own scoping.
+//
+// The join is required because the predicate names projects.slug; api_keys
+// carries only project_id.
+func DeleteAPIKey(engine db.Queryable, projectSlug, id string) error {
+	query, args, err := sq.Delete("api_keys").
+		Where(sq.Expr(
+			"id = ? AND project_id = (SELECT id FROM projects WHERE slug = ?)",
+			id, projectSlug,
+		)).ToSql()
 	if err != nil {
 		return fmt.Errorf("build query: %w", err)
 	}

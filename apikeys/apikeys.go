@@ -167,7 +167,7 @@ func runCacheRefresher(ctx context.Context) {
 
 // refreshCache rebuilds the whole hash->key map from one query.
 //
-// query.ListAPIKeys joins projects, so the tenant binding arrives with the key
+// query.ListAllAPIKeys joins projects, so the tenant binding arrives with the key
 // in the same round trip. The alternative — cache project_id and resolve slugs
 // separately — would add a second query per refresh and a window in which a key
 // is cached with an id whose slug is not yet known, which is exactly the state
@@ -412,10 +412,25 @@ func List(ctx context.Context) ([]APIKey, error) {
 	return keys, nil
 }
 
-// Delete removes an API key by ID.
+// Delete removes an API key by ID, within the caller's project.
+//
+// Scoped for the same reason List is, but the stakes are higher: this is a
+// DESTRUCTIVE cross-tenant verb. Unscoped, an admin key bound to one project
+// could delete another project's ingest credential by id alone and silently stop
+// that tenant's services reporting, with a 401 at the producer as the only
+// symptom. A key outside the caller's project reads as absent, so the id cannot
+// even be probed for existence.
+//
+// The project is passed to the DELETE as well as the lookup — the mutation
+// defends itself rather than trusting the read above it.
 func Delete(ctx context.Context, id string) error {
+	project, ok := scope.GetProject(ctx)
+	if !ok {
+		return scope.ErrNoProject
+	}
+
 	// Get the hash before deleting so we can remove from cache.
-	existing, err := query.GetAPIKeyByID(db.SQL, id)
+	existing, err := query.GetAPIKeyByID(db.SQL, project, id)
 	if err != nil {
 		return fmt.Errorf("failed to look up api key: %w", err)
 	}
@@ -423,7 +438,7 @@ func Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("api key not found")
 	}
 
-	if err := query.DeleteAPIKey(db.SQL, id); err != nil {
+	if err := query.DeleteAPIKey(db.SQL, project, id); err != nil {
 		return fmt.Errorf("failed to delete api key: %w", err)
 	}
 

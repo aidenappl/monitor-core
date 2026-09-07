@@ -157,3 +157,51 @@ func TestListAllAPIKeysIsUnscoped(t *testing.T) {
 		t.Errorf("cache read is no longer unscoped: %v", err)
 	}
 }
+
+// TestDeleteAPIKeyIsProjectScoped guards a DESTRUCTIVE cross-tenant verb.
+//
+// Unscoped, an admin key bound to one project could delete another project's
+// INGEST credential by id alone — silently stopping that tenant's services from
+// reporting, with a 401 at the producer as the only symptom and nothing in
+// Monitor to explain it. The predicate lives in the DELETE itself rather than in
+// the handler that calls it, so a future caller that skips or reorders the
+// lookup still cannot delete across tenants.
+func TestDeleteAPIKeyIsProjectScoped(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	mock.ExpectExec("DELETE FROM api_keys WHERE id = \\? AND project_id = \\(SELECT id FROM projects WHERE slug = \\?\\)").
+		WithArgs("key-1", "atlas").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := DeleteAPIKey(mockDB, "atlas", "key-1"); err != nil {
+		t.Fatalf("DeleteAPIKey: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("delete is not project-scoped — it can destroy another tenant's key: %v", err)
+	}
+}
+
+// TestGetAPIKeyByIDIsProjectScoped pins the other half: a key outside the
+// caller's project must read as ABSENT, so its existence cannot even be probed.
+func TestGetAPIKeyByIDIsProjectScoped(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	mock.ExpectQuery("WHERE api_keys.id = \\? AND projects.slug = \\?").
+		WithArgs("key-1", "atlas").
+		WillReturnRows(apiKeyRows())
+
+	if _, err := GetAPIKeyByID(mockDB, "atlas", "key-1"); err != nil {
+		t.Fatalf("GetAPIKeyByID: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("lookup is not project-scoped: %v", err)
+	}
+}
