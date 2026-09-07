@@ -7,8 +7,31 @@ import (
 	"time"
 )
 
-// uuidRegex matches standard UUID format (with or without hyphens)
-var uuidRegex = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+// correlationIDRegex is the accepted shape of job_id, request_id and trace_id.
+//
+// ⚠️ THIS IS A WIRE CONTRACT WITH THE SDKs, NOT A LOCAL PREFERENCE. It is the
+// only thing standing between a client and total, silent data loss: parseEvents
+// is all-or-nothing, so ONE rejected id 400s the whole batch, and go-monitor's
+// shipper treats 4xx as non-retryable and drops it (shipper.go — "Client error
+// — don't retry"). A service whose ids stop matching this loses 100% of its
+// events with one line on stderr and nothing in Monitor.
+//
+// That is not hypothetical: go-monitor once changed its default job_id and
+// request_id from a UUID to an 8-hex-character token, which this regex rejected.
+// Any service adopting that build would have gone dark.
+//
+// So the accepted set is DELIBERATELY A SUPERSET of every format the SDKs have
+// ever emitted, and widening it is always safe while narrowing it never is:
+//   - a UUID, hyphenated (what v0.0.8 and every deployed service emits today)
+//   - a UUID, unhyphenated (what this comment has always claimed to allow, and
+//     did not — the old pattern required hyphens)
+//   - a compact hex token of 8-64 characters (the log-friendly form go-monitor
+//     wanted; 8 is accepted for compatibility, but see go-monitor's ids.go for
+//     why anything under 16 is too collision-prone to be worth emitting)
+//
+// If you narrow this, you must ship monitor-core BEFORE any SDK that could emit
+// the removed form — and there is no ordering in which the reverse is safe.
+var correlationIDRegex = regexp.MustCompile(`^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{8,64})$`)
 
 // Event represents a single monitoring event
 type Event struct {
@@ -59,14 +82,14 @@ func (e *Event) Validate() error {
 	if e.Name == "" {
 		return errors.New("name is required")
 	}
-	if e.JobID != "" && !uuidRegex.MatchString(e.JobID) {
-		return errors.New("job_id must be a valid UUID")
+	if e.JobID != "" && !correlationIDRegex.MatchString(e.JobID) {
+		return errors.New("job_id must be a UUID or a hex token of 8-64 characters")
 	}
-	if e.RequestID != "" && !uuidRegex.MatchString(e.RequestID) {
-		return errors.New("request_id must be a valid UUID")
+	if e.RequestID != "" && !correlationIDRegex.MatchString(e.RequestID) {
+		return errors.New("request_id must be a UUID or a hex token of 8-64 characters")
 	}
-	if e.TraceID != "" && !uuidRegex.MatchString(e.TraceID) {
-		return errors.New("trace_id must be a valid UUID")
+	if e.TraceID != "" && !correlationIDRegex.MatchString(e.TraceID) {
+		return errors.New("trace_id must be a UUID or a hex token of 8-64 characters")
 	}
 	return nil
 }
