@@ -684,7 +684,9 @@ what changes when a membership table lands.
 
 `GET /v1/zones` and `GET /v1/zones/{zone}/projects` list the registry so a project switcher
 can populate. Both are reads, available to any authenticated session, and neither should be
-called with `?project=`, so a stale selection never blocks discovering a valid one.
+called with `?project=`, so a stale selection never blocks discovering a valid one. Both hide
+retired rows unless asked with `?include_deleted=true` — which the admin registry page does,
+because a spent slug that is simply missing from the list looks free.
 
 **Writing the registry is a different privilege and a different plane.** The write surface
 lives under `/admin`, is registered only in a role that runs the control plane, and sits
@@ -693,7 +695,7 @@ behind `RequireAdmin`:
 | Route | What it does |
 |-------|--------------|
 | `POST /admin/zones` | record a zone — both URLs required |
-| `PUT /admin/zones/{id}` | edit `display_name` / the URLs; a `slug` or `status` in the body is **refused**, not ignored |
+| `PUT /admin/zones/{id}` | edit `display_name` / the URLs; a `slug` or `status` in the body is **refused**, not ignored. Changing `query_url` **discards the stored probe verdict** (back to `unknown`) — it measured the old address |
 | `POST /admin/zones/{id}/retire` | soft-delete; `409` while the zone still owns active projects |
 | `POST /admin/zones/{id}/probe` | probe the zone's `query_url` now and persist the verdict |
 | `POST /admin/zones/{id}/projects` | create a project inside a zone |
@@ -716,6 +718,14 @@ invisible here and permanent everywhere else.
 **An unreachable zone is a `200`** — the probe succeeded and the zone is what is broken —
 and `mismatched` is the verdict that pays for the whole mechanism: a `200`-only check would
 pass a `query_url` aimed at another zone and mislabel every read made through it.
+
+A verdict belongs to the URL it measured, so **editing `query_url` throws it away** rather
+than carrying it forward: `query.UpdateZone` resets `reachability`, `reachability_detail`,
+`reported_zone` and `last_probe_at` whenever the address actually changes. Keeping them
+would leave the row wearing a green `healthy` earned by a box it no longer points at —
+worse than never probing, because `unknown` admits what it does not know. It lives in the
+query layer rather than in the handler so it holds for every caller, not just a UI that
+remembers to re-probe.
 
 > **Transition, expiring 2026-10-06 at the earliest.** Rows written before
 > `migrations/006_events_project.sql` read back with an empty project, and the fill is a

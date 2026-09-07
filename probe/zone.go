@@ -140,10 +140,36 @@ var client = &http.Client{
 // which is the "no issues is the most misleading possible reading of a 500"
 // failure wearing a different hat.
 func Zone(ctx context.Context, zone structs.Zone) Result {
-	if strings.TrimSpace(zone.QueryURL) == "" {
+	// BOTH endpoints are evaluated, and the worse verdict wins.
+	//
+	// The asymmetry between them is counterintuitive and worth stating. A wrong
+	// query_url is the LOUDER failure: an operator opens the zone and sees
+	// another tenant's events — confusing, but visible and reversible. A wrong
+	// ingest_url is the QUIET one. Every go-monitor producer POSTs there, so
+	// their events are filed under another tenant from the moment the row is
+	// saved, nothing on any screen says so, and the data is mixed permanently —
+	// the 30-day TTL does not unmix it, and issue fingerprints derived under the
+	// wrong project cannot be re-keyed afterwards.
+	//
+	// Neither is skipped because the other is missing: a zone with an ingest_url
+	// and no query_url still has producers pointed somewhere, and that somewhere
+	// is exactly what needs checking.
+	queryResult := probeOne(ctx, "query_url", zone.QueryURL, zone.Slug)
+	ingestResult := probeOne(ctx, "ingest_url", zone.IngestURL, zone.Slug)
+	return worseOf(queryResult, ingestResult)
+}
+
+// probeOne resolves a single endpoint to a verdict, attributing the outcome to
+// the field it came from.
+//
+// The label is not decoration: "unreachable" on an admin page sends an operator
+// to the wrong layer if they cannot tell which of the two URLs failed, and the
+// two are frequently different hosts behind different proxies.
+func probeOne(ctx context.Context, label, rawURL, expectSlug string) Result {
+	if strings.TrimSpace(rawURL) == "" {
 		return Result{
 			Reachability: structs.ZoneReachabilityUnconfigured,
-			Detail:       "no query_url recorded for this zone — there is nothing to probe",
+			Detail:       fmt.Sprintf("no %s recorded for this zone — there is nothing to probe", label),
 			ProbedAt:     time.Now().UTC(),
 		}
 	}
@@ -155,15 +181,54 @@ func Zone(ctx context.Context, zone structs.Zone) Result {
 	// internal port scanner. tools.ValidateExternalURL is the one definition of
 	// that rule — see tools/Validate.tool.go — and this calls it rather than
 	// re-deriving it.
-	if err := tools.ValidateExternalURL(zone.QueryURL); err != nil {
+	if err := tools.ValidateExternalURL(rawURL); err != nil {
 		return Result{
 			Reachability: structs.ZoneReachabilityUnreachable,
-			Detail:       fmt.Sprintf("refused to probe %s: %v", zone.QueryURL, err),
+			Detail:       fmt.Sprintf("%s: refused to probe %s: %v", label, rawURL, err),
 			ProbedAt:     time.Now().UTC(),
 		}
 	}
 
-	return probeEndpoint(ctx, zone.QueryURL, zone.Slug)
+	r := probeEndpoint(ctx, rawURL, expectSlug)
+	r.Detail = label + ": " + r.Detail
+	return r
+}
+
+// probeSeverity orders the verdicts so two probes can be combined without
+// inventing a rule at the call site.
+//
+// Mismatched outranks unreachable deliberately. An unreachable zone reports
+// nothing and misleads nobody; a mismatched one answers every request
+// confidently with another tenant's data. Ranking them the other way would let a
+// healthy query_url mask an ingest_url pointed at the wrong zone, which is the
+// precise combination this function exists to surface.
+func probeSeverity(r structs.ZoneReachability) int {
+	switch r {
+	case structs.ZoneReachabilityHealthy:
+		return 0
+	case structs.ZoneReachabilityDegraded:
+		return 1
+	case structs.ZoneReachabilityUnverified:
+		return 2
+	case structs.ZoneReachabilityUnconfigured:
+		return 3
+	case structs.ZoneReachabilityUnreachable:
+		return 4
+	case structs.ZoneReachabilityMismatched:
+		return 5
+	}
+	// An unrecognised verdict sorts ABOVE healthy rather than below it: a state
+	// this function has not been taught about must never be the one that wins and
+	// paints a row green.
+	return 2
+}
+
+// worseOf returns whichever result an operator most needs to see.
+func worseOf(a, b Result) Result {
+	if probeSeverity(b.Reachability) > probeSeverity(a.Reachability) {
+		return b
+	}
+	return a
 }
 
 // probeEndpoint is Zone without the SSRF guard, split out so the guard sits on

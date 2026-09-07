@@ -405,3 +405,74 @@ func TestRegistryDeleteDetectorActuallyDetects(t *testing.T) {
 		}
 	}
 }
+
+// TestUpdateZoneInvalidatesTheVerdictOnRepoint is the regression test for the
+// worst bug this registry can carry, and the reason invalidateZoneProbeOnRepoint
+// exists.
+//
+// Re-pointing query_url without clearing the probe columns leaves the row
+// wearing another address's health: a green 'healthy', a last_probe_at from
+// before the edit, and a reported_zone naming the box it used to reach — while
+// every read now goes somewhere else. Nothing errors and nothing logs, so the
+// only symptom is a dashboard quietly showing one zone's data under another
+// zone's name. That is invariant 1, and a stale 'healthy' is strictly worse than
+// never having probed at all, because 'unknown' admits what it does not know.
+//
+// The ORDER of the two statements is asserted, not incidental: sqlmock matches
+// in order by default, so a future edit that moves the invalidation after the
+// URL write fails here rather than shipping a row whose new address inherited the
+// old one's verdict.
+func TestUpdateZoneInvalidatesTheVerdictOnRepoint(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	newURL := "https://elsewhere.example.com"
+
+	// First: the verdict is discarded, guarded on the URL actually differing.
+	mock.ExpectExec("UPDATE zones SET reachability = .+, reachability_detail = .+, reported_zone = .+, last_probe_at = .+, updated_at = updated_at WHERE id = .+ AND query_url <> .").
+		WithArgs("unknown", ZONE_REPOINTED_DETAIL, "", nil, int64(1), newURL).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Only then: the address moves.
+	mock.ExpectExec("UPDATE zones SET query_url = .+ WHERE id = .").
+		WithArgs(newURL, int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("FROM zones WHERE id = .").WithArgs(int64(1)).WillReturnRows(zoneRows())
+
+	if _, err := UpdateZone(mockDB, 1, UpdateZoneRequest{QueryURL: &newURL}); err != nil {
+		t.Fatalf("UpdateZone: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestUpdateZoneKeepsTheVerdictWhenOnlyTheNameChanges pins the other half of the
+// rule. A display-name edit measures nothing about the address, so wiping the
+// verdict would report a perfectly good zone as never-probed — and a surface that
+// cries 'unknown' after every save teaches operators to scroll past the one time
+// it means a row was re-pointed.
+//
+// No invalidation statement is registered here, so issuing one fails the test.
+func TestUpdateZoneKeepsTheVerdictWhenOnlyTheNameChanges(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	name := "Renamed"
+	mock.ExpectExec("UPDATE zones SET display_name = .+ WHERE id = .").
+		WithArgs(name, int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("FROM zones WHERE id = .").WithArgs(int64(1)).WillReturnRows(zoneRows())
+
+	if _, err := UpdateZone(mockDB, 1, UpdateZoneRequest{DisplayName: &name}); err != nil {
+		t.Fatalf("UpdateZone: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}

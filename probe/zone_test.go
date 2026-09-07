@@ -246,3 +246,60 @@ func TestZoneRefusesAnInternalTarget(t *testing.T) {
 		t.Errorf("Detail = %q, want it to say the target was refused rather than tried", result.Detail)
 	}
 }
+
+// TestZoneConsultsIngestURL closes the quieter half of the mislabelling failure.
+//
+// Verifying only query_url catches the visible mistake — an operator opens the
+// zone and sees another tenant's events — while missing the invisible one: every
+// go-monitor producer POSTs to ingest_url, so a wrong value files their events
+// under another tenant from the moment the row is saved, with nothing on any
+// screen saying so and no way to unmix the data afterwards.
+//
+// Asserted through the SSRF refusal rather than a live server because httptest
+// binds loopback, which tools.ValidateExternalURL correctly refuses; the
+// identity comparison itself is covered by the probeEndpoint tests above. What
+// this pins is that ingest_url is consulted AT ALL, and that a missing
+// query_url does not cause it to be skipped.
+func TestZoneConsultsIngestURL(t *testing.T) {
+	// query_url absent (unconfigured, severity 3) and ingest_url refused by the
+	// SSRF guard (unreachable, severity 4) — the ingest verdict must win, which
+	// is only possible if it was evaluated.
+	got := Zone(context.Background(), structs.Zone{
+		Slug:      "appleby",
+		IngestURL: "http://127.0.0.1:9/health",
+	})
+	if got.Reachability != structs.ZoneReachabilityUnreachable {
+		t.Errorf("verdict = %q, want unreachable — ingest_url was not evaluated", got.Reachability)
+	}
+	if !strings.Contains(got.Detail, "ingest_url") {
+		t.Errorf("detail = %q, want it to name ingest_url — an operator cannot tell which URL failed", got.Detail)
+	}
+
+	// Negative control: with NEITHER set the verdict must fall back to
+	// unconfigured, so the assertion above is about ingest_url specifically and
+	// not about Zone() always returning unreachable.
+	neither := Zone(context.Background(), structs.Zone{Slug: "appleby"})
+	if neither.Reachability != structs.ZoneReachabilityUnconfigured {
+		t.Errorf("with no URLs at all, verdict = %q, want unconfigured", neither.Reachability)
+	}
+}
+
+// TestWorseOfRanksMismatchedAboveUnreachable pins the ordering that makes the
+// combination meaningful: an unreachable zone misleads nobody, a mismatched one
+// answers confidently with another tenant's data.
+func TestWorseOfRanksMismatchedAboveUnreachable(t *testing.T) {
+	unreachable := Result{Reachability: structs.ZoneReachabilityUnreachable}
+	mismatched := Result{Reachability: structs.ZoneReachabilityMismatched}
+	if worseOf(unreachable, mismatched).Reachability != structs.ZoneReachabilityMismatched {
+		t.Error("unreachable outranked mismatched — a silently wrong zone would hide behind a dead one")
+	}
+	if worseOf(mismatched, unreachable).Reachability != structs.ZoneReachabilityMismatched {
+		t.Error("worseOf is not symmetric")
+	}
+	// An unknown verdict must never win against healthy and paint a row green.
+	unknown := Result{Reachability: structs.ZoneReachability("something-new")}
+	healthy := Result{Reachability: structs.ZoneReachabilityHealthy}
+	if worseOf(healthy, unknown).Reachability == structs.ZoneReachabilityHealthy {
+		t.Error("an unrecognised verdict lost to healthy — a new state would silently render as fine")
+	}
+}

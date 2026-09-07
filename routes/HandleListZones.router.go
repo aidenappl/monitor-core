@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/query"
@@ -11,30 +12,45 @@ import (
 	"github.com/aidenappl/monitor-core/structs"
 )
 
-// HandleListZones returns the active zones this install knows about.
+// HandleListZones returns the zones this install knows about.
 //
-// It is a READ available to any authenticated session, and there is deliberately
-// no create/update/delete counterpart: the registry is seeded by
-// bootstrap.EnsureZoneAndProject and managed out of band in this phase. Slugs are
-// immutable and never reusable, so a mistyped zone minted through a REST call
-// could only ever be retired, never corrected — that is a decision for an
-// operator with a migration, not for a form.
+// It is a READ available to any authenticated session. The WRITES live on the
+// control-plane-only, admin-only /admin surface (routes/HandleAdminZones.router.go);
+// looking and changing are different privileges, which is why they are not the
+// same route.
 //
 // Phase 1 is single-zone, so this returns exactly ONE row today. That is the
 // expected and correct output, not a bug to hunt: the switcher showing a single
 // entry is what a single-zone install looks like.
 //
-// Retired zones are excluded, because query.ListZones excludes them by default
-// and this list is what an operator picks from — a retired zone is not a choice.
-// The lookup behind GET /v1/zones/{zone}/projects still resolves one, so a
-// bookmark into a retired zone keeps working rather than 404ing.
+// Retired zones are excluded BY DEFAULT, because this list is what the switcher
+// offers and a retired zone is not a choice. The lookup behind
+// GET /v1/zones/{zone}/projects still resolves one, so a bookmark into a retired
+// zone keeps working rather than 404ing.
+//
+// ?include_deleted=true asks for them back, and the ADMIN REGISTRY PAGE IS WHY IT
+// EXISTS. That page is where retirement is managed, and hiding retired rows there
+// would make a spent slug look free — which is the exact impression the
+// never-reuse rule exists to prevent. An operator who cannot see that `atlas` was
+// retired last month will try to create it again, read the 409 as a bug, and go
+// looking for the row that is "missing". The flag is opt-in rather than the
+// default so no existing caller starts offering retired zones as destinations.
 func HandleListZones(w http.ResponseWriter, r *http.Request) {
 	limit, offset, ok := registryListPage(w, r)
 	if !ok {
 		return
 	}
 
-	zones, err := query.ListZones(db.SQL, query.ListZonesRequest{Limit: limit, Offset: offset})
+	includeDeleted, ok := registryIncludeDeleted(w, r)
+	if !ok {
+		return
+	}
+
+	zones, err := query.ListZones(db.SQL, query.ListZonesRequest{
+		IncludeDeleted: includeDeleted,
+		Limit:          limit,
+		Offset:         offset,
+	})
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to list zones", err)
 		return
@@ -93,4 +109,25 @@ func registryListPage(w http.ResponseWriter, r *http.Request) (limit, offset int
 	}
 
 	return limit, offset, true
+}
+
+// registryIncludeDeleted reads the ?include_deleted selector shared by both
+// registry list routes, writing the refusal and reporting false on a value that
+// is not a boolean.
+//
+// A BAD VALUE IS A 400, NOT A SILENT FALSE. `?include_deleted=yes` treated as
+// "no" answers 200 with a list that is missing exactly the rows the caller asked
+// for, and the caller's next move is to conclude the retired zone is gone — which
+// is the one thing the never-reuse rule needs an operator not to believe.
+func registryIncludeDeleted(w http.ResponseWriter, r *http.Request) (include bool, ok bool) {
+	raw := strings.TrimSpace(r.URL.Query().Get("include_deleted"))
+	if raw == "" {
+		return false, true
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		responder.Error(w, http.StatusBadRequest, "invalid include_deleted "+strconv.Quote(raw)+" (expected true or false)")
+		return false, false
+	}
+	return v, true
 }

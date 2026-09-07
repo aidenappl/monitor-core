@@ -296,6 +296,46 @@ func UpdateZone(engine db.Queryable, id int64, req UpdateZoneRequest) (*structs.
 		if err != nil {
 			return nil, fmt.Errorf("invalid query_url: %w", err)
 		}
+
+		// ⚠️ THE VERDICT IS INVALIDATED BEFORE THE URL MOVES, and this is the
+		// single most load-bearing statement in the file.
+		//
+		// reachability, reported_zone and last_probe_at are a measurement OF A
+		// SPECIFIC URL. Re-point query_url and leave them standing and the row
+		// keeps a green 'healthy' tick, a last_probe_at from before the edit, and
+		// a reported_zone naming the box it USED to reach — while every read now
+		// goes somewhere else entirely. That is invariant 1 exactly: one zone's
+		// data under another zone's name, every reference valid, nothing logged.
+		// It is strictly worse than never probing, because 'unknown' admits it
+		// does not know and a stale 'healthy' asserts something false.
+		//
+		// It also restores the property structs.Zone documents as impossible to
+		// violate — "LastProbeAt is nil when the zone has never been probed, and
+		// Reachability is ZoneReachabilityUnknown in exactly that case, the two
+		// cannot disagree" — which a re-point silently broke.
+		//
+		// WHY A SEPARATE STATEMENT rather than a CASE folded into the UPDATE
+		// below. The condition has to read the OLD query_url, and in MariaDB a
+		// single-table UPDATE evaluates its SET assignments left to right, so a
+		// CASE would be correct only while it stayed textually above the
+		// `Set("query_url", ...)` line — a silent, invisible dependency on
+		// statement order that the first tidy-up reorders away. Guarding on
+		// `query_url <> ?` in a WHERE cannot be got wrong by rearrangement.
+		//
+		// The order of the two statements FAILS CLOSED: if the second one dies,
+		// the row is left pointing at the old URL with no verdict, which reads as
+		// "needs probing" — true, and harmless. Reversed, a failure would leave
+		// the new URL wearing the old URL's health.
+		//
+		// The guard means an unchanged query_url (a form that resubmits every
+		// field, which is what the admin UI sends) keeps its verdict instead of
+		// spuriously resetting to 'unknown'. A reset on every save would train
+		// operators to ignore 'unknown', and this whole surface depends on them
+		// not doing that.
+		if err := invalidateZoneProbeOnRepoint(engine, id, url); err != nil {
+			return nil, err
+		}
+
 		q = q.Set("query_url", url)
 		hasUpdate = true
 	}
@@ -313,6 +353,47 @@ func UpdateZone(engine db.Queryable, id int64, req UpdateZoneRequest) (*structs.
 		return nil, fmt.Errorf("update zone: %w", err)
 	}
 	return GetZone(engine, id)
+}
+
+// ZONE_REPOINTED_DETAIL is the reachability_detail left on a zone whose
+// query_url was just changed.
+//
+// It is phrased as an instruction rather than a description because it is what
+// an operator reads on the admin page immediately after saving an edit, and
+// "unknown" with no reason beside it looks like a bug in the page rather than a
+// deliberate refusal to carry the previous URL's verdict forward.
+const ZONE_REPOINTED_DETAIL = "query_url was changed — the previous verdict measured a different address and has been discarded. Probe this zone to confirm it answers as itself."
+
+// invalidateZoneProbeOnRepoint clears the stored probe verdict IF, AND ONLY IF,
+// the zone's query_url is actually about to change.
+//
+// The comparison lives in the WHERE clause so the decision and the write are one
+// statement: reading the current URL and then deciding in Go would reintroduce
+// the read-then-write gap RetireZone's header argues against, and here the row
+// lost in that gap is a health verdict attached to the wrong address.
+//
+// `updated_at` is held at its own value for the reason RecordZoneProbe spells
+// out: this runs alongside a real edit that will restamp it a moment later, and
+// a column that moves twice for one operator action is a column nobody can read
+// backwards.
+func invalidateZoneProbeOnRepoint(engine db.Queryable, id int64, newQueryURL string) error {
+	query, args, err := sq.Update(zonesTable).
+		Set("reachability", string(structs.ZoneReachabilityUnknown)).
+		Set("reachability_detail", ZONE_REPOINTED_DETAIL).
+		Set("reported_zone", "").
+		Set("last_probe_at", nil).
+		Set("updated_at", sq.Expr("updated_at")).
+		Where(sq.Eq{"id": id}).
+		Where(sq.NotEq{"query_url": newQueryURL}).
+		ToSql()
+	if err != nil {
+		return fmt.Errorf("build query: %w", err)
+	}
+
+	if _, err := engine.Exec(query, args...); err != nil {
+		return fmt.Errorf("invalidate zone probe for %d: %w", id, err)
+	}
+	return nil
 }
 
 // CountActiveProjects returns how many live tenants a zone still owns.

@@ -1007,6 +1007,23 @@ govern that surface, and each of them is a failure that has no runtime symptom:
 - **Reserved slugs come from `tools.ValidateSlug`.** The list guards monitor-web's *static*
   route table; a project called `settings` is shadowed by the app's own page and is
   permanently unreachable with nothing logged.
+- **A probe verdict belongs to the URL it measured, and dies with it.** `PUT
+  /admin/zones/{id}` that changes `query_url` clears `reachability`,
+  `reachability_detail`, `reported_zone` and `last_probe_at` back to `unknown` — in
+  `query.UpdateZone`, via `invalidateZoneProbeOnRepoint`, so it holds for *every* caller and
+  not just the one client that remembers to re-probe. Leaving them standing is the same
+  mislabelling failure as a wrong `query_url`, only with a green tick on top: the row keeps
+  a `healthy` from before the edit, a `last_probe_at` that predates it, and a `reported_zone`
+  naming the box it *used* to reach, while every read now goes somewhere else. A stale
+  `healthy` is strictly worse than never probing, because `unknown` admits what it does not
+  know. It is a **separate statement guarded on `query_url <> ?`**, run *before* the URL
+  moves: the guard means an unchanged URL (the admin form resubmits every field) keeps its
+  verdict rather than resetting on every save — a surface that cries `unknown` after every
+  edit trains operators to ignore the one time it matters — and the ordering fails closed,
+  since a crash between the two leaves the *old* URL with no verdict, which is true and
+  harmless. It is not folded into the main `UPDATE` as a `CASE` because MariaDB evaluates
+  `SET` assignments left to right, which would make correctness depend on the clause staying
+  textually above `Set("query_url", …)`. `query/registry_query_test.go` pins both halves.
 
 **`POST /admin/zones/{id}/probe`** answers "is the box at the end of this row's `query_url`
 actually this zone?" It GETs `{query_url}/health` and `/ready` inside a **3s total budget**
@@ -1110,6 +1127,13 @@ surface is `/admin/zones*` + `/admin/projects*`, admin-only and control-plane-on
 
 Both accept `limit`/`offset` and default to `db.MAX_LIMIT` rather than the house 50 — a
 switcher that silently truncated would hide a tenant. Neither may be called with `?project=`.
+
+Both also accept **`?include_deleted=true`**, which puts retired rows back in the list.
+Opt-in, so no switcher starts offering a retired zone as a destination — and the **admin
+registry page turns it on**, because that is where retirement is managed and a spent slug
+that is simply absent looks free. A non-boolean value is a `400` rather than a silent
+`false`: a list quietly missing the rows you asked for is how an operator concludes a retired
+zone is gone.
 
 `GET /v1/*` also now accepts **`?project=<slug>`** from a **session**, which selects the
 project being read (see §6 *The project asymmetry*): unknown or retired → `400` naming the

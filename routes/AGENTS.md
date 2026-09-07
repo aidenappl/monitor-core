@@ -26,8 +26,8 @@ service layer the repo's rules say not to build.
 | `issues.go` | `GET /v1/issues`, `GET/PUT /v1/issues/{id}`, `GET /v1/issues/{id}/events` + `requireProject` |
 | `issue_timeline.go` | `GET /v1/issues/{id}/timeline`, `/history`, the three `comments` verbs and the three `links` verbs — all behind `requireIssue` |
 | `service_repos.go` | `GET /v1/service-repos`, `GET/PUT/DELETE /v1/service-repos/{service}` |
-| `HandleListZones.router.go` | `GET /v1/zones` (active zones) + `registryListPage`, the limit/offset parser both registry routes share |
-| `HandleListProjects.router.go` | `GET /v1/zones/{zone}/projects` (active projects in one zone) — what the project switcher populates from |
+| `HandleListZones.router.go` | `GET /v1/zones` (active zones, or all with `?include_deleted=true`) + `registryListPage` and `registryIncludeDeleted`, the query parsers both registry routes share |
+| `HandleListProjects.router.go` | `GET /v1/zones/{zone}/projects` (active projects in one zone, or all with `?include_deleted=true`) — what the project switcher populates from |
 | `HandleAdminZones.router.go` | `POST /admin/zones`, `PUT /admin/zones/{id}`, `POST /admin/zones/{id}/retire`, `POST /admin/zones/{id}/probe` + the shared `registryWriteError` (sentinel → status), `registryPathID` and `decodeJSONBody` helpers |
 | `HandleAdminProjects.router.go` | `POST /admin/zones/{id}/projects`, `PUT /admin/projects/{id}`, `POST /admin/projects/{id}/retire` |
 | `HandleLogin/Register/Refresh/Logout.router.go` | `POST /auth/{login,register,refresh,logout}` (native session auth) |
@@ -184,6 +184,11 @@ to work for everyone, and a process that can mint a registry row can point one a
   the *listing* to active rows because that is what an operator picks from, while
   `HandleListProjects` accepts a retired zone so a bookmark into one can still render its
   switcher and move the user somewhere live.
+- **`?include_deleted=true` asks for the retired rows back, and the admin registry page is
+  why it exists.** Retirement is managed there, and a spent slug that is simply missing from
+  the list looks free — the exact impression the never-reuse rule exists to prevent. It is
+  opt-in so the switcher's default stays "places you can go", and a non-boolean value is a
+  `400` rather than a silent `false`.
 - **The projects listing carries `default_project_slug` alongside the rows.** It names which
   project an unset `?project` resolves to (`env.DefaultProjectSlug`), and the switcher needs
   it to avoid rendering that tenant TWICE — once as the "nothing selected" row and once under
@@ -244,6 +249,18 @@ to work for everyone, and a process that can mint a registry row can point one a
   far end reports on its own `/health` against what the registry expected, checking `role`
   first: a control plane runs the same binary with the same `MON_ZONE_SLUG` default and
   serves no events, and it is the likeliest wrong URL to be typed.
+- ⚠️ **`PUT /admin/zones/{id}` that moves `query_url` DISCARDS the stored verdict.** The
+  handler does nothing for this — `query.UpdateZone` does it (`invalidateZoneProbeOnRepoint`),
+  deliberately, so it holds for every caller rather than only for a client that remembers to
+  re-probe afterwards. `reachability` goes back to `unknown` and
+  `reachability_detail`/`reported_zone`/`last_probe_at` go with it, because all four measured
+  the *old* address. A row that kept them would wear a green `healthy`, a `last_probe_at`
+  from before the edit and a `reported_zone` naming the box it used to reach, while every
+  read went somewhere else entirely — the mislabelling this surface exists to prevent, with a
+  tick beside it. Re-probing is therefore a **separate operator action after any URL edit**,
+  and the UI's auto-probe is a convenience on top of that, not the guarantee. An update that
+  leaves `query_url` alone (or resubmits the same value, which the admin form does) keeps its
+  verdict.
 
 ## Project-scoped issue reads
 

@@ -56,7 +56,19 @@ func HandleListProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	projects, err := query.ListProjects(db.SQL, zone.ID, query.ListProjectsRequest{Limit: limit, Offset: offset})
+	// Same opt-in as the zone list, for the same reason: the admin registry page
+	// manages retirement and must be able to see a spent slug, while the switcher
+	// must not offer one. See registryIncludeDeleted in HandleListZones.router.go.
+	includeDeleted, ok := registryIncludeDeleted(w, r)
+	if !ok {
+		return
+	}
+
+	projects, err := query.ListProjects(db.SQL, zone.ID, query.ListProjectsRequest{
+		IncludeDeleted: includeDeleted,
+		Limit:          limit,
+		Offset:         offset,
+	})
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to list projects", err)
 		return
