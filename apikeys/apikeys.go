@@ -400,7 +400,7 @@ func List(ctx context.Context) ([]APIKey, error) {
 	if !ok {
 		return nil, scope.ErrNoProject
 	}
-	keys, err := query.ListAPIKeys(db.SQL, project)
+	keys, err := query.ListAPIKeys(db.SQL, strings.TrimSpace(env.ZoneSlug), project)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list api keys: %w", err)
 	}
@@ -430,7 +430,7 @@ func Delete(ctx context.Context, id string) error {
 	}
 
 	// Get the hash before deleting so we can remove from cache.
-	existing, err := query.GetAPIKeyByID(db.SQL, project, id)
+	existing, err := query.GetAPIKeyByID(db.SQL, strings.TrimSpace(env.ZoneSlug), project, id)
 	if err != nil {
 		return fmt.Errorf("failed to look up api key: %w", err)
 	}
@@ -438,7 +438,7 @@ func Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("api key not found")
 	}
 
-	if err := query.DeleteAPIKey(db.SQL, project, id); err != nil {
+	if err := query.DeleteAPIKey(db.SQL, strings.TrimSpace(env.ZoneSlug), project, id); err != nil {
 		return fmt.Errorf("failed to delete api key: %w", err)
 	}
 

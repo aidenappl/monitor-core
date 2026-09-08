@@ -29,7 +29,16 @@ var apiKeyColumns = []string{
 // project slug and stamp every one of its events with a blank tenant. Failing
 // closed on a binding that should be impossible is worth more than a resilience
 // that quietly mis-files data.
-const apiKeysWithProject = "api_keys JOIN projects ON projects.id = api_keys.project_id"
+//
+// ⚠️ ZONES IS JOINED BECAUSE A PROJECT SLUG IS NOT UNIQUE. The constraint is
+// `uq_projects_zone_slug (zone_id, slug)` (migration 116) — `default` names one
+// project PER ZONE, and the control plane's projects table carries rows for
+// every zone it knows about. A predicate on projects.slug alone therefore names
+// a SET, not a row. Every scoped read and the delete below pair it with
+// zones.slug, which together are unique by that constraint.
+const apiKeysWithProject = "api_keys " +
+	"JOIN projects ON projects.id = api_keys.project_id " +
+	"JOIN zones ON zones.id = projects.zone_id"
 
 type apiKeyScanner interface {
 	Scan(dest ...interface{}) error
@@ -57,7 +66,7 @@ func scanAPIKey(row apiKeyScanner) (*structs.APIKey, error) {
 // Every other reader wants ListAPIKeys. If you are adding a second caller here,
 // that is the signal you want the scoped one.
 func ListAllAPIKeys(engine db.Queryable) ([]structs.APIKey, error) {
-	return listAPIKeys(engine, nil)
+	return listAPIKeys(engine, "", nil)
 }
 
 // ListAPIKeys returns the keys belonging to one project.
@@ -67,17 +76,24 @@ func ListAllAPIKeys(engine db.Queryable) ([]structs.APIKey, error) {
 // the same class of lie as showing every project's events would be. A caller
 // wanting the whole inventory switches project, exactly as it would to see
 // another project's issues.
-func ListAPIKeys(engine db.Queryable, projectSlug string) ([]structs.APIKey, error) {
-	return listAPIKeys(engine, &projectSlug)
+func ListAPIKeys(engine db.Queryable, zoneSlug, projectSlug string) ([]structs.APIKey, error) {
+	return listAPIKeys(engine, zoneSlug, &projectSlug)
 }
 
 // listAPIKeys is the one builder both readers share. A nil projectSlug means
 // every project — expressible only here, never from outside the package, so the
 // unscoped read cannot be reached by passing an empty string by accident.
-func listAPIKeys(engine db.Queryable, projectSlug *string) ([]structs.APIKey, error) {
+func listAPIKeys(engine db.Queryable, zoneSlug string, projectSlug *string) ([]structs.APIKey, error) {
 	q := sq.Select(apiKeyColumns...).From(apiKeysWithProject)
+	// The zone is applied for the SCOPED read only. The unscoped one is the
+	// auth cache, which loads whatever this process's own database holds — and
+	// that database IS this zone's. Narrowing it by a slug read from env would
+	// make every credential in the install stop authenticating the moment
+	// MON_ZONE_SLUG were mistyped, which is a far worse failure than the one it
+	// would prevent, and one apikeys.Create already makes impossible by
+	// resolving zone-then-project before it binds.
 	if projectSlug != nil {
-		q = q.Where(sq.Eq{"projects.slug": *projectSlug})
+		q = q.Where(sq.Eq{"zones.slug": zoneSlug, "projects.slug": *projectSlug})
 	}
 
 	query, args, err := q.
@@ -109,10 +125,14 @@ func listAPIKeys(engine db.Queryable, projectSlug *string) ([]structs.APIKey, er
 // The project is part of the LOOKUP, not a check applied after it: a key
 // belonging to another tenant must read as absent, so a caller cannot learn that
 // an id exists — or act on it — outside its own project.
-func GetAPIKeyByID(engine db.Queryable, projectSlug, id string) (*structs.APIKey, error) {
+func GetAPIKeyByID(engine db.Queryable, zoneSlug, projectSlug, id string) (*structs.APIKey, error) {
 	query, args, err := sq.Select(apiKeyColumns...).
 		From(apiKeysWithProject).
-		Where(sq.Eq{"api_keys.id": id, "projects.slug": projectSlug}).
+		Where(sq.Eq{
+			"api_keys.id":   id,
+			"zones.slug":    zoneSlug,
+			"projects.slug": projectSlug,
+		}).
 		ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("build query: %w", err)
@@ -178,11 +198,14 @@ func CreateAPIKey(engine db.Queryable, req CreateAPIKeyRequest) error {
 //
 // The join is required because the predicate names projects.slug; api_keys
 // carries only project_id.
-func DeleteAPIKey(engine db.Queryable, projectSlug, id string) error {
+func DeleteAPIKey(engine db.Queryable, zoneSlug, projectSlug, id string) error {
 	query, args, err := sq.Delete("api_keys").
 		Where(sq.Expr(
-			"id = ? AND project_id = (SELECT id FROM projects WHERE slug = ?)",
-			id, projectSlug,
+			"id = ? AND project_id = ("+
+				"SELECT p.id FROM projects p "+
+				"JOIN zones z ON z.id = p.zone_id "+
+				"WHERE z.slug = ? AND p.slug = ?)",
+			id, zoneSlug, projectSlug,
 		)).ToSql()
 	if err != nil {
 		return fmt.Errorf("build query: %w", err)

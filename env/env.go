@@ -111,6 +111,11 @@ var (
 	ZoneSlug           string
 	DefaultProjectSlug string
 
+	// ZoneSlugExplicit is false when ZoneSlug came from the fallback rather than
+	// from the environment. Read by RequireZoneIdentity and reported on /health,
+	// so "which zone am I" can be answered without guessing whether anyone chose.
+	ZoneSlugExplicit bool
+
 	// GitHub integration for issue links. Both are OPTIONAL — with neither set,
 	// links are still stored and rendered, they just carry no live state and no
 	// webhook updates. GitHub must never be required for issue triage to work.
@@ -156,7 +161,19 @@ func Load() {
 	CryptoKey = getEnv("MON_CRYPTO_KEY", devCryptoKey) // exactly 32 bytes
 	CookieDomain = getEnv("MON_COOKIE_DOMAIN", "")
 	CookieInsecure = getEnv("MON_COOKIE_INSECURE", "false") == "true"
-	PublicBaseURL = getEnv("MON_PUBLIC_URL", "https://api.monitor.appleby.cloud")
+	// ⚠️ NO DEFAULT, DELIBERATELY. This used to fall back to the CONTROL PLANE's
+	// own URL, and bootstrap.ensureZone seeds a fresh zone's ingest_url AND
+	// query_url from it — so a zone that forgot to set it recorded a registry row
+	// pointing at the control plane, and the empty-guard there could never fire
+	// because the default was non-empty. Worse in combination with a defaulted
+	// MON_ZONE_SLUG: probe.classify only rejects role=="app", and the control
+	// plane runs "both", so the slug check then compared "trailblaze" against
+	// "trailblaze" and returned HEALTHY on a row pointing at the wrong box.
+	//
+	// Empty is safe for an existing install: the guard in bootstrap.ensureZone
+	// only runs when the zone row does not yet exist, so an upgrade that omits
+	// this still boots. Both deployed stacks set it explicitly.
+	PublicBaseURL = getEnv("MON_PUBLIC_URL", "")
 	WebBaseURL = getEnv("MON_WEB_URL", "https://monitor.appleby.cloud")
 
 	BatchSize = getEnvInt("BATCH_SIZE", 1000)
@@ -175,7 +192,12 @@ func Load() {
 	// Tenancy registry seed. Both are read once, by bootstrap.EnsureZoneAndProject,
 	// and both are validated as slugs there — a typo fails the boot rather than
 	// minting a permanently misnamed row, since slugs are immutable.
-	ZoneSlug = getEnv("MON_ZONE_SLUG", "trailblaze")
+	// The default is retained for local dev and for the install that predates the
+	// role split, but whether it was USED is now recorded: a zone that silently
+	// inherits "trailblaze" seeds a second zone row under that name, binds its
+	// keys to it, and reports it on /health, with nothing in the boot log to say
+	// so. See RequireZoneIdentity.
+	ZoneSlug, ZoneSlugExplicit = getEnvExplicit("MON_ZONE_SLUG", "trailblaze")
 	DefaultProjectSlug = getEnv("MON_DEFAULT_PROJECT", "default")
 
 	// Sourced from Keyring in production. No dev fallback and no panic: absent
@@ -208,11 +230,46 @@ func RequireProductionSecrets() error {
 	return nil
 }
 
-func getEnv(key, defaultVal string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
+// RequireZoneIdentity refuses to start a DATA PLANE that never chose a zone.
+//
+// A defaulted MON_ZONE_SLUG is survivable on the control plane — "trailblaze" is
+// genuinely its zone, and that is the install the default was written for. On
+// MON_ROLE=zone it is never right: a data plane exists precisely because it is
+// NOT the control plane's zone, so inheriting that name means it seeds a second
+// zone row called "trailblaze" in its own registry, binds every key it mints to
+// it, and answers /health as "trailblaze". Nothing downstream errors — the probe
+// is the only thing that would notice, and only if someone remembers to run it.
+//
+// Scoped to MON_ROLE=zone on purpose: the deployed control plane runs "both" and
+// is unaffected, so this fails only the configuration that is unambiguously
+// wrong. Call after RequireValidRole, which establishes MonRole.
+func RequireZoneIdentity() error {
+	if MonRole == RoleZone && !ZoneSlugExplicit {
+		return fmt.Errorf(
+			"MON_ZONE_SLUG is unset and MON_ROLE=zone: a data plane must name its own zone, "+
+				"and defaulting to %q would seed a second zone under the control plane's name",
+			ZoneSlug)
 	}
-	return defaultVal
+	return nil
+}
+
+func getEnv(key, defaultVal string) string {
+	val, _ := getEnvExplicit(key, defaultVal)
+	return val
+}
+
+// getEnvExplicit is getEnv that also reports whether the value came from the
+// environment rather than the fallback.
+//
+// The distinction matters only where a default is PLAUSIBLE BUT WRONG — a value
+// the process can run on while meaning something else entirely. MON_ZONE_SLUG is
+// the case that motivated it: every other unset var either fails immediately or
+// is genuinely optional.
+func getEnvExplicit(key, defaultVal string) (string, bool) {
+	if val := os.Getenv(key); val != "" {
+		return val, true
+	}
+	return defaultVal, false
 }
 
 func getEnvInt(key string, defaultVal int) int {

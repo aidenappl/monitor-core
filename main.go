@@ -104,6 +104,29 @@ func main() {
 	log.Printf("monitor-core role: %s (control plane: %t, data plane: %t)",
 		env.MonRole, env.MonRole.RunsControlPlane(), env.MonRole.RunsDataPlane())
 
+	// Say which zone this process believes it is, and — the load-bearing half —
+	// whether anyone chose. A defaulted slug is the one configuration mistake
+	// that produces a working process serving the wrong tenant's name, so it is
+	// announced next to the role rather than left to be inferred from /health.
+	if env.ZoneSlugExplicit {
+		log.Printf("monitor-core zone: %s", env.ZoneSlug)
+	} else {
+		log.Printf("monitor-core zone: %s ⚠️ MON_ZONE_SLUG is unset — this is the fallback, not a choice", env.ZoneSlug)
+	}
+	if err := env.RequireZoneIdentity(); err != nil {
+		log.Fatalf("FATAL: %v", err)
+	}
+
+	// MON_PUBLIC_URL lost its default because that default was the control
+	// plane's own URL (see env.go). Unset is now honest rather than misleading,
+	// but it is not harmless, and the two ways it bites are different enough to
+	// name separately: a fresh zone cannot seed its registry endpoints, and a
+	// control plane builds SSO redirect_uris that are relative paths rather than
+	// origins — which the IdP rejects with an error naming neither.
+	if strings.TrimSpace(env.PublicBaseURL) == "" {
+		log.Printf("⚠️ MON_PUBLIC_URL is unset — a new zone cannot record its ingest/query endpoints, and SSO redirect_uris will be malformed")
+	}
+
 	if env.IngestKey == "" {
 		log.Fatal("FATAL: MONITOR_API_KEY must be set — refusing to start without ingest authentication")
 	}

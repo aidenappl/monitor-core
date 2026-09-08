@@ -36,7 +36,7 @@ func TestListAPIKeysJoinsProject(t *testing.T) {
 	}
 	defer mockDB.Close()
 
-	mock.ExpectQuery("FROM api_keys JOIN projects ON projects.id = api_keys.project_id").
+	mock.ExpectQuery("FROM api_keys JOIN projects ON projects.id = api_keys.project_id JOIN zones ON zones.id = projects.zone_id").
 		WillReturnRows(apiKeyRows())
 
 	keys, err := ListAllAPIKeys(mockDB)
@@ -124,11 +124,11 @@ func TestListAPIKeysScopesToProject(t *testing.T) {
 	}
 	defer mockDB.Close()
 
-	mock.ExpectQuery("WHERE projects.slug = ?").
-		WithArgs("atlas").
+	mock.ExpectQuery("WHERE projects.slug = \\? AND zones.slug = \\?").
+		WithArgs("atlas", "appleby").
 		WillReturnRows(apiKeyRows())
 
-	if _, err := ListAPIKeys(mockDB, "atlas"); err != nil {
+	if _, err := ListAPIKeys(mockDB, "appleby", "atlas"); err != nil {
 		t.Fatalf("ListAPIKeys: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -147,7 +147,7 @@ func TestListAllAPIKeysIsUnscoped(t *testing.T) {
 	}
 	defer mockDB.Close()
 
-	mock.ExpectQuery("^SELECT (?s).* FROM api_keys JOIN projects ON projects.id = api_keys.project_id ORDER BY").
+	mock.ExpectQuery("^SELECT (?s).* FROM api_keys JOIN projects ON projects.id = api_keys.project_id JOIN zones ON zones.id = projects.zone_id ORDER BY").
 		WillReturnRows(apiKeyRows())
 
 	if _, err := ListAllAPIKeys(mockDB); err != nil {
@@ -173,11 +173,11 @@ func TestDeleteAPIKeyIsProjectScoped(t *testing.T) {
 	}
 	defer mockDB.Close()
 
-	mock.ExpectExec("DELETE FROM api_keys WHERE id = \\? AND project_id = \\(SELECT id FROM projects WHERE slug = \\?\\)").
-		WithArgs("key-1", "atlas").
+	mock.ExpectExec("DELETE FROM api_keys WHERE id = \\? AND project_id = \\(SELECT p.id FROM projects p JOIN zones z ON z.id = p.zone_id WHERE z.slug = \\? AND p.slug = \\?\\)").
+		WithArgs("key-1", "appleby", "atlas").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if err := DeleteAPIKey(mockDB, "atlas", "key-1"); err != nil {
+	if err := DeleteAPIKey(mockDB, "appleby", "atlas", "key-1"); err != nil {
 		t.Fatalf("DeleteAPIKey: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -194,14 +194,94 @@ func TestGetAPIKeyByIDIsProjectScoped(t *testing.T) {
 	}
 	defer mockDB.Close()
 
-	mock.ExpectQuery("WHERE api_keys.id = \\? AND projects.slug = \\?").
-		WithArgs("key-1", "atlas").
+	mock.ExpectQuery("WHERE api_keys.id = \\? AND projects.slug = \\? AND zones.slug = \\?").
+		WithArgs("key-1", "atlas", "appleby").
 		WillReturnRows(apiKeyRows())
 
-	if _, err := GetAPIKeyByID(mockDB, "atlas", "key-1"); err != nil {
+	if _, err := GetAPIKeyByID(mockDB, "appleby", "atlas", "key-1"); err != nil {
 		t.Fatalf("GetAPIKeyByID: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("lookup is not project-scoped: %v", err)
 	}
+}
+
+// TestAPIKeyReadsAreZoneScoped is the regression guard for a defect that was
+// live: every scoped read and the delete filtered on projects.slug ALONE.
+//
+// A project slug is unique only per zone — `uq_projects_zone_slug (zone_id, slug)`
+// in migration 116 — and the control plane's projects table carries rows for
+// every zone it knows about. So `slug = 'default'` names one row per zone, and
+// the failure was not a leak but a CRASH: DeleteAPIKey's predicate was
+// `project_id = (SELECT id FROM projects WHERE slug = ?)`, an uncorrelated
+// scalar subquery, which returns two rows the moment a second zone owns a
+// project called `default` — MariaDB ER_SUBSELECT_NO_1_ROW (1242), surfaced to
+// the operator as a bare 500 on every key deletion.
+//
+// That state is one click away at any time: creating a `default` project for a
+// second zone is the obvious first move when wiring one up.
+//
+// Asserted as SQL SHAPE rather than behaviour because sqlmock cannot hold two
+// zones. What matters is that the zone reaches the predicate at all — if it
+// does, the pair is unique by the constraint above and neither the crash nor the
+// cross-tenant read is expressible.
+func TestAPIKeyReadsAreZoneScoped(t *testing.T) {
+	t.Run("delete correlates the subquery to a zone", func(t *testing.T) {
+		mockDB, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock.New: %v", err)
+		}
+		defer mockDB.Close()
+
+		// JOIN zones … WHERE z.slug = ? AND p.slug = ? is what makes the
+		// subquery single-row. Without the join it is the 1242 above.
+		mock.ExpectExec("JOIN zones z ON z.id = p.zone_id WHERE z.slug = \\? AND p.slug = \\?").
+			WithArgs("key-1", "appleby", "atlas").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		if err := DeleteAPIKey(mockDB, "appleby", "atlas", "key-1"); err != nil {
+			t.Fatalf("DeleteAPIKey: %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("delete subquery is not zone-correlated — it returns >1 row and 500s: %v", err)
+		}
+	})
+
+	t.Run("get names the zone", func(t *testing.T) {
+		mockDB, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock.New: %v", err)
+		}
+		defer mockDB.Close()
+
+		mock.ExpectQuery("zones.slug = \\?").
+			WithArgs("key-1", "atlas", "appleby").
+			WillReturnRows(apiKeyRows())
+
+		if _, err := GetAPIKeyByID(mockDB, "appleby", "atlas", "key-1"); err != nil {
+			t.Fatalf("GetAPIKeyByID: %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("lookup is not zone-scoped: %v", err)
+		}
+	})
+
+	t.Run("list names the zone", func(t *testing.T) {
+		mockDB, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock.New: %v", err)
+		}
+		defer mockDB.Close()
+
+		mock.ExpectQuery("zones.slug = \\?").
+			WithArgs("atlas", "appleby").
+			WillReturnRows(apiKeyRows())
+
+		if _, err := ListAPIKeys(mockDB, "appleby", "atlas"); err != nil {
+			t.Fatalf("ListAPIKeys: %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("list is not zone-scoped: %v", err)
+		}
+	})
 }
