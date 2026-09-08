@@ -47,7 +47,11 @@ func TestRoundTrip(t *testing.T) {
 		mint     func() (string, time.Time, error)
 		validate func(string) (int64, error)
 	}{
-		{"access", func() (string, time.Time, error) { return NewAccessToken(42) }, ValidateAccessToken},
+		{
+			"access",
+			func() (string, time.Time, error) { return NewAccessToken(42, "admin") },
+			func(tok string) (int64, error) { uid, _, err := ValidateAccessToken(tok); return uid, err },
+		},
 		{"refresh", func() (string, time.Time, error) { return NewRefreshToken(42) }, ValidateRefreshToken},
 	}
 	for _, tc := range tests {
@@ -79,7 +83,7 @@ func TestExpiredRejected(t *testing.T) {
 
 func TestWrongTypeRejected(t *testing.T) {
 	// An access token must not pass refresh validation and vice-versa.
-	access, _, err := NewAccessToken(42)
+	access, _, err := NewAccessToken(42, "admin")
 	if err != nil {
 		t.Fatalf("mint access: %v", err)
 	}
@@ -91,7 +95,7 @@ func TestWrongTypeRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mint refresh: %v", err)
 	}
-	if _, err := ValidateAccessToken(refresh); err == nil {
+	if _, _, err := ValidateAccessToken(refresh); err == nil {
 		t.Fatal("refresh token accepted as access token")
 	}
 }
@@ -120,7 +124,7 @@ func TestAlgConfusionRejected(t *testing.T) {
 }
 
 func TestTamperedSignatureRejected(t *testing.T) {
-	tok, _, err := NewAccessToken(42)
+	tok, _, err := NewAccessToken(42, "admin")
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}

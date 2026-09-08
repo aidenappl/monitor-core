@@ -102,7 +102,7 @@ func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
 		log.Printf("sso callback: failed to cache sso session for user %d: %v", user.ID, err)
 	}
 
-	if err := issueSession(w, user.ID); err != nil {
+	if err := issueSession(w, user.ID, user.Role); err != nil {
 		log.Printf("sso callback: failed to issue session for user %d: %v", user.ID, err)
 		redirectLoginError(w, r, "sso_session_failed")
 		return

@@ -62,7 +62,7 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := issueSession(w, user.ID); err != nil {
+	if err := issueSession(w, user.ID, user.Role); err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to start session", err)
 		return
 	}

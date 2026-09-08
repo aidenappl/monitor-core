@@ -19,8 +19,8 @@ import (
 // scratch — SSO callback (Phase 3) and native login/register (Phase 3.5). The
 // rotating-refresh flow (HandleRefresh) does NOT use this; it mints successors
 // inside its own rotation transaction.
-func issueSession(w http.ResponseWriter, userID int64) error {
-	rawRefresh, refreshExpiry, err := setTokenCookies(w, userID)
+func issueSession(w http.ResponseWriter, userID int64, role string) error {
+	rawRefresh, refreshExpiry, err := setTokenCookies(w, userID, role)
 	if err != nil {
 		return err
 	}

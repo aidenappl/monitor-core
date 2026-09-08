@@ -131,10 +131,51 @@ func withUser(ctx context.Context, user *structs.User) context.Context {
 
 // validateSessionToken resolves an access JWT to an active user, applying the
 // SSO revocation checkpoint when the hook is installed.
+//
+// ⚠️ TWO PATHS, CHOSEN BY ROLE, because only one of them has a users table.
+//
+// A CONTROL PLANE owns identity: it reads the live row, requires Active, and
+// runs the SSO checkpoint. Nothing about that changes.
+//
+// A ZONE (MON_ROLE=zone) has its own MariaDB with no users in it — bootstrap
+// seeds an admin only on the control plane (main.go), by design. Its
+// GetUserByID therefore returns nil for a perfectly valid session, and the zone
+// 401s every request. The browser then refreshes (which succeeds, at the control
+// plane), retries, 401s again, and bounces through /login in a loop — the
+// symptom is a page that never loads rather than an error that says why.
+//
+// So a zone trusts the ACCESS TOKEN as the identity assertion. The signature is
+// the check: both planes share MON_JWT_SIGNING_KEY, the parser is pinned to
+// HS512 and issuer-pinned, and only the control plane can mint. The zone is not
+// deciding who the user is — it is reading a statement the control plane signed.
+//
+// WHAT THIS COSTS, stated plainly rather than discovered later:
+//   - No Active check at the zone. A disabled account keeps reading zone data
+//     until its access token expires — at most 15 minutes (jwt.accessTokenExpiry).
+//   - No SSO revocation checkpoint at the zone, bounded the same way.
+//   - The role is a snapshot from mint time, so a demotion lags by the same 15
+//     minutes at the zone and not at all at the control plane.
+//
+// Login, refresh and revocation all remain control-plane-only, so this opens no
+// new way in; it lets an already-issued token outlive its revocation, briefly.
+// Closing that gap means the control plane doing the fan-out itself, which is
+// the larger design this defers to.
+//
+// Email and Name are deliberately left empty: the token does not carry them, and
+// inventing a value would put a fabricated identity into audit rows. Nothing a
+// zone serves reads them — /auth/self is a control-plane route.
 func validateSessionToken(tokenStr string) *structs.User {
-	userID, err := jwt.ValidateAccessToken(tokenStr)
+	userID, role, err := jwt.ValidateAccessToken(tokenStr)
 	if err != nil {
 		return nil
+	}
+
+	if !env.MonRole.RunsControlPlane() {
+		// A token minted before Claims.Role existed carries no role. Fail CLOSED:
+		// reads work, RequireEditor and RequireAdmin refuse. The next refresh
+		// mints a token that has it, so a live session heals inside one access
+		// lifetime without anyone being logged out.
+		return &structs.User{ID: userID, Role: role, Active: true}
 	}
 
 	user, err := query.GetUserByID(db.SQL, userID)

@@ -21,19 +21,46 @@ type Claims struct {
 	jwtlib.RegisteredClaims
 	UserID int64  `json:"user_id"`
 	Type   string `json:"type"` // "access" or "refresh"
+
+	// Role travels in the ACCESS token so a data plane can authorise a request
+	// without a users table.
+	//
+	// A zone (MON_ROLE=zone) has its own MariaDB and no users in it — identity
+	// lives on the control plane — so middleware.validateSessionToken cannot do
+	// its usual GetUserByID there. It builds the user from these claims instead,
+	// which means the role has to be one of them or every write in a zone 403s
+	// on RequireEditor.
+	//
+	// Set on ACCESS tokens only. A refresh token is exchanged at the control
+	// plane, which reads the live row — putting a role in it would just create a
+	// second, staler copy of a fact that is already authoritative there.
+	//
+	// ⚠️ THIS IS A SNAPSHOT, and its staleness is bounded by the 15-minute access
+	// expiry, not by the role change. Demote someone and a zone honours their old
+	// role until their current access token dies. The control plane is unaffected
+	// — it still reads the row on every request.
+	//
+	// `omitempty` keeps tokens minted before this field existed valid: they
+	// simply carry no role, and a user built from one fails CLOSED (reads work,
+	// RequireEditor and RequireAdmin refuse). The next refresh mints a token with
+	// the role in it, so an existing session heals within one access lifetime
+	// without anyone logging out.
+	Role string `json:"role,omitempty"`
 }
 
-// NewAccessToken mints a 15-minute HS512 access token for userID.
-func NewAccessToken(userID int64) (string, time.Time, error) {
-	return newToken(userID, "access", accessTokenExpiry)
+// NewAccessToken mints a 15-minute HS512 access token for userID, carrying the
+// role so a zone can authorise without a users table. See Claims.Role.
+func NewAccessToken(userID int64, role string) (string, time.Time, error) {
+	return newToken(userID, role, "access", accessTokenExpiry)
 }
 
-// NewRefreshToken mints a 7-day HS512 refresh token for userID.
+// NewRefreshToken mints a 7-day HS512 refresh token for userID. No role: it is
+// redeemed at the control plane, which reads the live row.
 func NewRefreshToken(userID int64) (string, time.Time, error) {
-	return newToken(userID, "refresh", refreshTokenExpiry)
+	return newToken(userID, "", "refresh", refreshTokenExpiry)
 }
 
-func newToken(userID int64, typ string, ttl time.Duration) (string, time.Time, error) {
+func newToken(userID int64, role string, typ string, ttl time.Duration) (string, time.Time, error) {
 	expiresAt := time.Now().Add(ttl)
 	claims := Claims{
 		RegisteredClaims: jwtlib.RegisteredClaims{
@@ -43,6 +70,7 @@ func newToken(userID int64, typ string, ttl time.Duration) (string, time.Time, e
 		},
 		UserID: userID,
 		Type:   typ,
+		Role:   role,
 	}
 
 	token := jwtlib.NewWithClaims(jwtlib.SigningMethodHS512, claims)
@@ -91,15 +119,15 @@ func ValidateToken(tokenStr string) (*Claims, error) {
 }
 
 // ValidateAccessToken validates the token and requires Type == "access".
-func ValidateAccessToken(tokenStr string) (int64, error) {
+func ValidateAccessToken(tokenStr string) (int64, string, error) {
 	claims, err := ValidateToken(tokenStr)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if claims.Type != "access" {
-		return 0, fmt.Errorf("expected access token, got %q", claims.Type)
+		return 0, "", fmt.Errorf("expected access token, got %q", claims.Type)
 	}
-	return claims.UserID, nil
+	return claims.UserID, claims.Role, nil
 }
 
 // ValidateRefreshToken validates the token and requires Type == "refresh".

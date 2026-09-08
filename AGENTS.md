@@ -494,7 +494,7 @@ HS512** via `WithValidMethods` and the keyfunc re-checks the method (defeats
 |---|---|---|
 | `IngestAuthMiddleware` | `POST /v1/events` | env master key (`MONITOR_API_KEY`) **or** a DB **ingest-scope** key. Admin keys → `401`: they are query credentials that live in dashboards and MCP configs, and reading events does not imply permission to forge them. |
 | `QueryAuthMiddleware` | all other `/v1/*` | env master key **or** DB **admin-scope** key **or** a valid Monitor session (`mon-access-token`/Bearer, incl. SSO checkpoint). Ingest keys → `403`. Injects the project every read is scoped to: **credential-derived** for the two key branches, a validated **`?project=` selector** (defaulting to `MON_DEFAULT_PROJECT`) for a session — see §6 *The project asymmetry*. |
-| `SessionMiddleware` (`Protected`) | `/auth/*`, `/admin/*` | a valid access JWT (Bearer or `mon-access-token`) → loads the active user into context. `RequireAdmin`/`RequireEditor`/`RejectPending` gate on `role`. |
+| `SessionMiddleware` (`Protected`) | `/auth/*`, `/admin/*` | a valid access JWT (Bearer or `mon-access-token`) → puts the user in context. `RequireAdmin`/`RequireEditor`/`RejectPending` gate on `role`. **Resolves the user two ways** — control plane reads the live row (`Active` + SSO checkpoint); a zone builds it from the token's claims. See *Zone session trust* below. |
 | `CSRFMiddleware` (global) | all unsafe methods | `mon-csrf` cookie == `X-CSRF-Token` header (constant-time). Safe methods, Bearer clients, `X-Api-Key` clients, and `/auth/{login,register,refresh}` + SSO callbacks are exempt. |
 
 Both `X-Api-Key` middlewares compare the env master key with `subtle.ConstantTimeCompare` via
@@ -796,6 +796,36 @@ registration, cannot drift that way.
 - **Asymmetry worth knowing:** a zone still *verifies* access tokens — `QueryAuthMiddleware`
   falls back to `SessionMiddleware` on `/v1` — it just does not *issue* them. Issuing and
   verifying are different jobs; the control plane issues, both planes verify.
+- **Zone session trust — a zone has no users table, so it trusts the token.**
+  `bootstrap.EnsureAdminUser` runs on the control plane only, so a zone's `monitor_auth.users`
+  is empty by design. `middleware.validateSessionToken` therefore branches on
+  `env.MonRole.RunsControlPlane()`:
+  - **Control plane** — unchanged: `GetUserByID`, require `Active`, run the SSO checkpoint.
+  - **Zone** — build `structs.User` from the access token's claims. The signature is the
+    check: both planes share `MON_JWT_SIGNING_KEY`, the parser is HS512- and issuer-pinned,
+    and only the control plane can mint. The zone is not deciding who the caller is; it is
+    reading a statement the control plane signed.
+
+  This is why `jwt.Claims` carries **`Role`** on access tokens (not refresh — those are
+  redeemed at the control plane, which reads the live row). Without it every write in a zone
+  403s on `RequireEditor`, which reads exactly that field.
+
+  ⚠️ **What it costs:** no `Active` check and no SSO checkpoint at a zone, and the role is a
+  mint-time snapshot — so a disabled or demoted user keeps their old access at a zone until
+  the token expires, **bounded at 15 minutes** (`jwt.accessTokenExpiry`). Login, refresh and
+  revocation stay control-plane-only, so no new way in is created; an already-issued token
+  merely outlives its revocation, briefly. Closing that gap means the control plane doing the
+  fan-out itself — the larger design this defers to.
+
+  A token minted before `Claims.Role` existed carries no role and fails **closed**: reads
+  work, `RequireEditor`/`RequireAdmin` refuse, and the next refresh heals the session inside
+  one access lifetime without logging anyone out. Pinned by `middleware/session_zone_test.go`,
+  which also asserts a refresh token cannot be spent as a session at a zone — the type pin is
+  what keeps the revocation gap at minutes rather than the refresh token's 7 days.
+
+  **Symptom if this regresses:** the zone 401s every request, the browser refreshes
+  successfully against the control plane, retries, 401s again and bounces through `/login` —
+  a page that never loads rather than an error that says why.
 - **The three shared `/v1` surfaces** (`zones`, `service-repos`, `api-keys`) are pure
   MariaDB and stay registered in **both** roles. That is a deferral, not a verdict: which
   plane *owns* them is the config-pull question, and inventing an answer with no second

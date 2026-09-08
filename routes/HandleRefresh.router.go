@@ -78,7 +78,7 @@ func HandleRefresh(w http.ResponseWriter, r *http.Request) {
 
 	// Mint the successor tokens. The refresh token's hash is persisted; the raw
 	// value only ever reaches the client via the cookie.
-	newAccess, accessExp, err := jwt.NewAccessToken(user.ID)
+	newAccess, accessExp, err := jwt.NewAccessToken(user.ID, user.Role)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to mint access token", err)
 		return
