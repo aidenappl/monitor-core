@@ -27,11 +27,57 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-push:
+  # ⚠️ THIS IS ITS OWN JOB, AND MUST NOT GAIN A KEYRING STEP. It exists only to
+  # turn a committed JSON file into two matrix expressions, which looks like it
+  # belongs in build-and-push — where the first version of it lived, and failed.
+  #
+  # keyring-actions injects ~20 secrets and registers EVERY value with
+  # ::add-mask::, including public ones (NEXT_PUBLIC_MONITOR_API_URL,
+  # NEXT_PUBLIC_COOKIE_DOMAIN). One of those values appears verbatim inside a
+  # `health` URL in deploy-targets.json — so GitHub saw a masked value in the
+  # job output and refused to emit it:
+  #
+  #     ! Skip output 'zones' since it may contain secret.
+  #
+  # That is a WARNING, not an error. build-and-push went green, both matrices
+  # resolved to nothing, neither deploy job was created, and the run failed with
+  # no failing step to look at. The image shipped; nothing deployed.
+  #
+  # Masking is registered per-job, so the whole fix is this separation. Keep it.
+  targets:
     runs-on: ubuntu-latest
     outputs:
-      zones: ${{ steps.targets.outputs.zones }}
-      control_plane: ${{ steps.targets.outputs.control_plane }}
+      zones: ${{ steps.read.outputs.zones }}
+      control_plane: ${{ steps.read.outputs.control_plane }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Read deploy targets
+        id: read
+        run: |
+          ZONES=$(jq -c '[.[] | select(.role != "both" and .role != "app")]' .github/deploy-targets.json)
+          PLANE=$(jq -c '[.[] | select(.role == "both" or .role == "app")]' .github/deploy-targets.json)
+
+          # An empty matrix SKIPS its job silently, which is indistinguishable in
+          # the Actions UI from a deploy that worked — the exact failure this
+          # workflow was written to end. Fail loudly instead.
+          if [ "$ZONES" = "[]" ] || [ -z "$ZONES" ]; then
+            echo "::error title=No zone targets::deploy-targets.json produced no zone entries. An empty matrix would skip every zone deploy silently."
+            exit 1
+          fi
+          if [ "$PLANE" = "[]" ] || [ -z "$PLANE" ]; then
+            echo "::error title=No control-plane target::deploy-targets.json produced no entry with role 'both' or 'app'."
+            exit 1
+          fi
+
+          echo "zones=$ZONES"         >> "$GITHUB_OUTPUT"
+          echo "control_plane=$PLANE" >> "$GITHUB_OUTPUT"
+          echo "zones: $ZONES"
+          echo "control plane: $PLANE"
+
+  build-and-push:
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
@@ -83,21 +129,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Split into zones vs control plane so the ordering rule above can be a
-      # job dependency. Reading the list from a committed file means adding a
-      # zone is a one-line reviewable change, not workflow surgery.
-      - name: Read deploy targets
-        id: targets
-        run: |
-          ZONES=$(jq -c '[.[] | select(.role != "both" and .role != "app")]' .github/deploy-targets.json)
-          PLANE=$(jq -c '[.[] | select(.role == "both" or .role == "app")]' .github/deploy-targets.json)
-          echo "zones=$ZONES"         >> "$GITHUB_OUTPUT"
-          echo "control_plane=$PLANE" >> "$GITHUB_OUTPUT"
-          echo "zones: $ZONES"
-          echo "control plane: $PLANE"
-
   deploy-zones:
-    needs: build-and-push
+    needs: [targets, build-and-push]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     strategy:
@@ -106,7 +139,7 @@ jobs:
       # to reach the verification step for every target it can.
       fail-fast: false
       matrix:
-        target: ${{ fromJSON(needs.build-and-push.outputs.zones) }}
+        target: ${{ fromJSON(needs.targets.outputs.zones) }}
     steps:
       - name: Deploy ${{ matrix.target.zone }}
         id: deploy
@@ -154,13 +187,13 @@ jobs:
     # leaving the control plane on an older build than its zones is the safer
     # half of a bad situation, and `always()` keeps the failure attributed to
     # the zone that actually failed rather than cascading.
-    needs: [build-and-push, deploy-zones]
-    if: always() && github.ref == 'refs/heads/main' && needs.build-and-push.result == 'success'
+    needs: [targets, build-and-push, deploy-zones]
+    if: always() && github.ref == 'refs/heads/main' && needs.targets.result == 'success' && needs.build-and-push.result == 'success'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: ${{ fromJSON(needs.build-and-push.outputs.control_plane) }}
+        target: ${{ fromJSON(needs.targets.outputs.control_plane) }}
     steps:
       - name: Deploy ${{ matrix.target.zone }}
         id: deploy
