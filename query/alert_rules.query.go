@@ -3,6 +3,7 @@ package query
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,6 +12,38 @@ import (
 	"github.com/aidenappl/monitor-core/structs"
 	"github.com/google/uuid"
 )
+
+// ErrNoAlertingProject is returned by every read in the four alerting query
+// files that was handed an empty project. It is the alerting counterpart of
+// ErrNoIssueProject (query/issues.query.go) and exists for the same reason: "I
+// do not know whose alerting configuration this is" must be an error the caller
+// has to handle, never a query that quietly returns every tenant's.
+//
+// It is a SEPARATE sentinel from ErrNoIssueProject rather than one shared
+// "no project" error, because the two name different call sites and a handler
+// that catches the wrong one would report the wrong table. Same rule, different
+// tables.
+var ErrNoAlertingProject = errors.New("no project supplied for an alerting read")
+
+// scopeAlerting attaches the tenancy predicate to a read of one of the four
+// alerting tables.
+//
+// The column is passed in table-qualified rather than derived, because all four
+// tables are read in the same package and an unqualified `project` would be
+// ambiguous the moment any of these grows a join — MariaDB reports that as a
+// query error, which on the evaluator's read is alerting stopping wholesale.
+//
+// NOT NAMED `scopeTo`. A generic name in a package this shared is a collision
+// waiting to happen — query/ is edited by whoever is working on any table in it,
+// and two people each adding "the obvious shared helper" is a duplicate
+// declaration rather than a merge conflict anybody sees coming. The alerting
+// prefix says which four files own it.
+func scopeAlerting(q sq.SelectBuilder, column, project string) (sq.SelectBuilder, error) {
+	if project == "" {
+		return q, ErrNoAlertingProject
+	}
+	return q.Where(sq.Eq{column: project}), nil
+}
 
 // Alert priorities. Untyped string constants rather than a typed enum, matching
 // structs.AlertRule — see the note on that type for why the typed-enum pass is
@@ -58,6 +91,7 @@ const alertRulesTable = "monitor.alert_rules"
 // carries the full note; TestAlertRuleSQLQuotesReservedWords pins it.
 var alertRuleColumns = []string{
 	"monitor.alert_rules.id",
+	"monitor.alert_rules.project",
 	"monitor.alert_rules.name",
 	"monitor.alert_rules.description",
 	"monitor.alert_rules.type",
@@ -79,11 +113,17 @@ var alertRuleColumns = []string{
 // alertRuleInsertColumns names the same columns for a write, where `condition`
 // IS unqualified and therefore MUST be backticked.
 var alertRuleInsertColumns = []string{
-	"id", "name", "description", "type", "priority", "query_filters", "metric",
+	"id", "project", "name", "description", "type", "priority", "query_filters", "metric",
 	"field", "`condition`", "threshold", "evaluation_interval_seconds",
 	"for_seconds", "cooldown_seconds", "notification_channel_ids", "enabled",
 	"created_at", "updated_at",
 }
+
+// alertRulesProjectColumn is the one string every scoped read of this table
+// binds against. Named once because it appears in four builders, and a typo in
+// one of them is a query error rather than a silent widening — but only for as
+// long as they all agree.
+const alertRulesProjectColumn = "monitor.alert_rules.project"
 
 type alertRuleScanner interface {
 	Scan(dest ...interface{}) error
@@ -92,7 +132,7 @@ type alertRuleScanner interface {
 func scanAlertRule(row alertRuleScanner) (*structs.AlertRule, error) {
 	var r structs.AlertRule
 	if err := row.Scan(
-		&r.ID, &r.Name, &r.Description, &r.Type, &r.Priority, &r.QueryFilters,
+		&r.ID, &r.Project, &r.Name, &r.Description, &r.Type, &r.Priority, &r.QueryFilters,
 		&r.Metric, &r.Field, &r.Condition, &r.Threshold,
 		&r.EvaluationIntervalSecs, &r.ForSeconds, &r.CooldownSeconds,
 		&r.NotificationChannelIDs, &r.Enabled, &r.CreatedAt, &r.UpdatedAt,
@@ -148,7 +188,18 @@ type CreateAlertRuleRequest struct {
 // preserved rather than tidied: priority is advisory (it only selects a routing
 // policy) whereas type and condition decide whether the rule can be evaluated at
 // all.
-func CreateAlertRule(engine db.Queryable, req CreateAlertRuleRequest) (*structs.AlertRule, error) {
+// The project is a LEADING parameter rather than a field of the request, for the
+// reason CreateAlertRuleRequest already gives about id and created_at: a field a
+// caller can send is a field a caller can set, and "which tenant does this rule
+// belong to" is decided by the credential, never by the body. The handler takes
+// it from requireProject and passes it here.
+func CreateAlertRule(engine db.Queryable, project string, req CreateAlertRuleRequest) (*structs.AlertRule, error) {
+	// Checked before anything else because the column is NOT NULL with no
+	// default (migration 127): an empty project reaches MariaDB as errno 1364
+	// naming the column, where this names the request that had no tenant.
+	if project == "" {
+		return nil, ErrNoAlertingProject
+	}
 	if req.Name == "" {
 		return nil, fmt.Errorf("name is required")
 	}
@@ -168,6 +219,7 @@ func CreateAlertRule(engine db.Queryable, req CreateAlertRuleRequest) (*structs.
 	now := time.Now().UTC()
 	rule := structs.AlertRule{
 		ID:                     uuid.New().String(),
+		Project:                project,
 		Name:                   req.Name,
 		Description:            req.Description,
 		Type:                   req.Type,
@@ -216,7 +268,7 @@ func CreateAlertRule(engine db.Queryable, req CreateAlertRuleRequest) (*structs.
 
 	qStr, args, err := sq.Insert(alertRulesTable).
 		Columns(alertRuleInsertColumns...).
-		Values(rule.ID, rule.Name, rule.Description, rule.Type, rule.Priority,
+		Values(rule.ID, rule.Project, rule.Name, rule.Description, rule.Type, rule.Priority,
 			rule.QueryFilters, rule.Metric, rule.Field, rule.Condition, rule.Threshold,
 			rule.EvaluationIntervalSecs, rule.ForSeconds, rule.CooldownSeconds,
 			rule.NotificationChannelIDs, rule.Enabled, rule.CreatedAt, rule.UpdatedAt).
@@ -231,21 +283,42 @@ func CreateAlertRule(engine db.Queryable, req CreateAlertRuleRequest) (*structs.
 	return &rule, nil
 }
 
-// ListAlertRules returns every rule, newest first.
+// ListAlertRules returns one project's rules, newest first.
 //
 // Unpaginated, matching the endpoint it serves. db.MAX_LIMIT is deliberately not
 // applied: this is the whole alerting configuration, six rows on the live
 // instance, and a truncated list would silently hide rules from the page an
 // operator uses to check that nothing is missing.
-func ListAlertRules(engine db.Queryable) ([]structs.AlertRule, error) {
+func ListAlertRules(engine db.Queryable, project string) ([]structs.AlertRule, error) {
 	q := sq.Select(alertRuleColumns...).From(alertRulesTable).
 		OrderBy("monitor.alert_rules.created_at DESC", "monitor.alert_rules.id ASC")
 
+	q, err := scopeAlerting(q, alertRulesProjectColumn, project)
+	if err != nil {
+		return nil, err
+	}
 	return queryAlertRules(engine, q)
 }
 
-// ListEnabledAlertRules returns the rules the evaluator should run. Called every
-// 15 seconds by Evaluator.evaluateAll.
+// ListEnabledAlertRules returns the rules the evaluator should run, ACROSS EVERY
+// PROJECT. Called every 15 seconds by Evaluator.evaluateAll.
+//
+// UNSCOPED ON PURPOSE, and it is the one read in this file that is. The
+// evaluator is a zone-wide daemon: it has no request, no credential and no
+// project, and its job is to run every project's rules, not one project's.
+// Scoping it would silently stop evaluating every tenant outside whatever
+// project the caller happened to name — alerting that reports healthy while
+// firing nothing, which is the worst failure this service has.
+//
+// The tenancy is applied ONE LAYER UP instead, and that is what makes this safe
+// rather than an omission: alerts.Evaluator.evaluateAll stamps each returned
+// rule's own Project onto the context before evaluating it, so the AGGREGATE is
+// scoped even though the listing is not. That is the whole shape of the fix for
+// the zone-wide evaluation gap — the rule row must be visible for its project to
+// be readable at all.
+//
+// If you are adding a second caller here, it almost certainly wants
+// ListAlertRules.
 func ListEnabledAlertRules(engine db.Queryable) ([]structs.AlertRule, error) {
 	q := sq.Select(alertRuleColumns...).From(alertRulesTable).
 		Where(sq.Eq{"monitor.alert_rules.enabled": true}).
@@ -277,13 +350,25 @@ func queryAlertRules(engine db.Queryable, q sq.SelectBuilder) ([]structs.AlertRu
 	return rules, rows.Err()
 }
 
-// GetAlertRule returns one rule by id, or (nil, nil) when there is none.
+// GetAlertRule returns one rule by id within a project, or (nil, nil) when there
+// is none.
 //
 // Absence is not an error here, following GetServiceRepo and GetIssue: the
 // caller decides whether a missing row is a 404, a skip, or the normal case.
-func GetAlertRule(engine db.Queryable, id string) (*structs.AlertRule, error) {
+//
+// The project is part of the LOOKUP, not a check applied after it — the rule
+// api_keys.query.go states. A rule belonging to another tenant must read as
+// ABSENT, so a caller cannot learn that an id exists outside its own project,
+// and cannot then hand that id to POST /v1/alert-rules/{id}/test and read an
+// aggregate over the other tenant's events.
+func GetAlertRule(engine db.Queryable, project, id string) (*structs.AlertRule, error) {
 	q := sq.Select(alertRuleColumns...).From(alertRulesTable).
 		Where(sq.Eq{"monitor.alert_rules.id": id}).Limit(1)
+
+	q, err := scopeAlerting(q, alertRulesProjectColumn, project)
+	if err != nil {
+		return nil, err
+	}
 
 	qStr, args, err := q.ToSql()
 	if err != nil {
@@ -343,8 +428,8 @@ func (r UpdateAlertRuleRequest) IsEmpty() bool {
 // handler renders any error from this call as a 400 with its message, so
 // returning (nil, nil) would turn a well-understood 400 into whatever the
 // handler does with a nil rule.
-func UpdateAlertRule(engine db.Queryable, id string, req UpdateAlertRuleRequest) (*structs.AlertRule, error) {
-	existing, err := GetAlertRule(engine, id)
+func UpdateAlertRule(engine db.Queryable, project, id string, req UpdateAlertRuleRequest) (*structs.AlertRule, error) {
+	existing, err := GetAlertRule(engine, project, id)
 	if err != nil {
 		return nil, err
 	}
@@ -428,7 +513,14 @@ func UpdateAlertRule(engine db.Queryable, id string, req UpdateAlertRuleRequest)
 	// CURRENT_TIMESTAMP(3), so MariaDB stamps it — and only when a column
 	// actually changed value, which is more truthful than the old code's
 	// unconditional time.Now().
-	qStr, args, err := u.Where(sq.Eq{"id": id}).ToSql()
+	//
+	// `project` is in the UPDATE's OWN WHERE rather than trusted from the
+	// GetAlertRule above. The read-then-write pair is not atomic, and a future
+	// caller that skips the read — or reorders it — would otherwise be able to
+	// retarget another tenant's rule at its own notification channels, which is
+	// a redirect of somebody else's alerts rather than merely a read of them.
+	// Same reasoning DeleteAPIKey records.
+	qStr, args, err := u.Where(sq.Eq{"id": id, "project": project}).ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build sql query: %w", err)
 	}
@@ -436,16 +528,27 @@ func UpdateAlertRule(engine db.Queryable, id string, req UpdateAlertRuleRequest)
 	if _, err := engine.Exec(qStr, args...); err != nil {
 		return nil, fmt.Errorf("failed to update alert rule: %w", err)
 	}
-	return GetAlertRule(engine, id)
+	return GetAlertRule(engine, project, id)
 }
 
-// DeleteAlertRule removes one rule and reports whether it existed.
+// DeleteAlertRule removes one rule within a project and reports whether it
+// existed.
 //
 // The rule's ClickHouse alert_states row is NOT cleaned up here — that is a
 // different store, and alerts.DeleteRule is the caller that does both. Splitting
 // it that way keeps this file a pure MariaDB query layer.
-func DeleteAlertRule(engine db.Queryable, id string) (bool, error) {
-	qStr, args, err := sq.Delete(alertRulesTable).Where(sq.Eq{"id": id}).ToSql()
+//
+// The project is in the DELETE's OWN WHERE and no read precedes it. Unscoped,
+// an admin key bound to one project could silence another tenant's alerting by
+// id alone — no notifications, no error, and nothing in the product to explain
+// why the alerts stopped.
+func DeleteAlertRule(engine db.Queryable, project, id string) (bool, error) {
+	if project == "" {
+		return false, ErrNoAlertingProject
+	}
+
+	qStr, args, err := sq.Delete(alertRulesTable).
+		Where(sq.Eq{"id": id, "project": project}).ToSql()
 	if err != nil {
 		return false, fmt.Errorf("failed to build sql query: %w", err)
 	}

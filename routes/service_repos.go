@@ -12,9 +12,21 @@ import (
 	"github.com/gorilla/mux"
 )
 
-// HandleListServiceRepos returns every service→repository mapping.
+// Service→repository mappings are per project as of migration 133: the primary
+// key is (project, service), because a service name is unique only inside one
+// project's event stream. Every handler here therefore resolves its tenant with
+// requireProject (routes/issues.go) and threads it into the query, so `api` in
+// one project and `api` in another are two mappings rather than one contested
+// row.
+
+// HandleListServiceRepos returns this project's service→repository mappings.
 func HandleListServiceRepos(w http.ResponseWriter, r *http.Request) {
-	repos, err := query.ListServiceRepos(db.SQL)
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	repos, err := query.ListServiceRepos(db.SQL, project)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to list service repositories", err)
 		return
@@ -22,15 +34,24 @@ func HandleListServiceRepos(w http.ResponseWriter, r *http.Request) {
 	responder.New(w, repos)
 }
 
-// HandleGetServiceRepo returns one service's mapping.
+// HandleGetServiceRepo returns one service's mapping in this project.
+//
+// A mapping another tenant made for the same service name reads as absent and
+// 404s, which is the same answer an unmapped service gives — the caller learns
+// nothing about what other projects have mapped.
 func HandleGetServiceRepo(w http.ResponseWriter, r *http.Request) {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
 	service := mux.Vars(r)["service"]
 	if service == "" {
 		responder.Error(w, http.StatusBadRequest, "service is required")
 		return
 	}
 
-	repo, err := query.GetServiceRepo(db.SQL, service)
+	repo, err := query.GetServiceRepo(db.SQL, project, service)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to fetch service repository", err)
 		return
@@ -51,8 +72,19 @@ type upsertServiceRepoBody struct {
 	DefaultBranch *string `json:"default_branch"`
 }
 
-// HandleUpsertServiceRepo creates or replaces a service's mapping.
+// HandleUpsertServiceRepo creates or replaces a service's mapping in this
+// project.
+//
+// The upsert now collides on (project, service) rather than on `service` alone,
+// so mapping `api` here can no longer silently rewrite another tenant's mapping
+// for a service that merely shares its name — which is what migration 133 exists
+// to stop.
 func HandleUpsertServiceRepo(w http.ResponseWriter, r *http.Request) {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
 	service := mux.Vars(r)["service"]
 	if service == "" {
 		responder.Error(w, http.StatusBadRequest, "service is required")
@@ -79,7 +111,7 @@ func HandleUpsertServiceRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	saved, err := query.UpsertServiceRepo(db.SQL, query.UpsertServiceRepoRequest{
+	saved, err := query.UpsertServiceRepo(db.SQL, project, query.UpsertServiceRepoRequest{
 		Service:       service,
 		Owner:         owner,
 		Repo:          repo,
@@ -92,15 +124,24 @@ func HandleUpsertServiceRepo(w http.ResponseWriter, r *http.Request) {
 	responder.New(w, saved)
 }
 
-// HandleDeleteServiceRepo removes a service's mapping.
+// HandleDeleteServiceRepo removes this project's mapping for a service.
+//
+// Deleting is scoped for the same reason reading is: unmapping `api` must not
+// unmap it for every other project that runs a service by that name, which would
+// strip their issues of repository links with nothing to explain it.
 func HandleDeleteServiceRepo(w http.ResponseWriter, r *http.Request) {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
 	service := mux.Vars(r)["service"]
 	if service == "" {
 		responder.Error(w, http.StatusBadRequest, "service is required")
 		return
 	}
 
-	deleted, err := query.DeleteServiceRepo(db.SQL, service)
+	deleted, err := query.DeleteServiceRepo(db.SQL, project, service)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to delete service repository", err)
 		return

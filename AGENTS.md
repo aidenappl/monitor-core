@@ -94,7 +94,7 @@ monitor-core/
   db/
     clickhouse.go          # ClickHouse connection (db.Connect/db.Close) + batch Writer + ValidateDatabaseName + the per-query max_memory_usage ceiling
     sql.go                 # MariaDB connection (db.SQL), db.Queryable, db.RunMigrations (embeds db/migrations/*.sql)
-    migrations/            # MariaDB DDL: identity + tenancy + issues + alert/dashboard config (100_users … 124_saved_views)
+    migrations/            # MariaDB DDL: identity + tenancy + issues + alert/dashboard config (100_users … 133_service_repos_project)
   jwt/jwt.go               # Monitor-owned HS512 access/refresh JWTs (mint + validate, alg-pinned)
   tools/                   # Password.tool.go (bcrypt 12), Crypto.go (AES-256-GCM), Validate.tool.go (SSRF guard), Slug.tool.go (zone/project slug rule + reserved names)
   bootstrap/               # First-run seeding: admin.go (first admin user), registry.go (the single zone + default project)
@@ -124,11 +124,11 @@ monitor-core/
   apikeys/                 # API-key cache (backed by MariaDB, was ClickHouse) + a 30s background refresher
   probe/zone.go            # Zone reachability probe: GET {query_url}/health + /ready, compares the zone the far end REPORTS against the slug the registry expected, returns a structs.ZoneReachability. 3s total budget (probe.ZONE_PROBE_TIMEOUT); writes nothing itself
   registry/registry.go     # Tenancy-registry cache: this install's zone + its active projects, same 30s ticker shape as apikeys — what a session's ?project selector is validated against
-  alerts/ issues/          # Subsystems (each Init()s from main.go). alerts/ keeps only what did not move to MariaDB: the evaluator, router, notifier, hub, and the ClickHouse alert_states/alert_history
+  alerts/ issues/          # Subsystems (each Init()s from main.go). alerts/ keeps only what did not move to MariaDB: the evaluator, router, notifier, hub, and the ClickHouse alert_states/alert_history (both created by migrations/007, not by Init)
   dashboards/ views/       # EMPTY — their tables moved to MariaDB (123/124); the files are tombstones that say where everything went
   cutover/config.go        # One-time ClickHouse → MariaDB copy for the six config tables (`monitor-core backfill-config`). Its own package so it can be deleted whole
   cutover/guard.go         # Boot refusal when that copy has not run — the only thing that makes a mis-ordered cutover loud (§8)
-  migrations/              # ClickHouse DDL (001_schema … 006_events_project) + embed.go (in-app runner, rewrites the database name)
+  migrations/              # ClickHouse DDL (001_schema … 007_alert_tables) + embed.go (in-app runner, rewrites the database name)
     manual/                # one-off reconciliation SQL — NOT embedded, NOT rewritten, run by hand
   Devfile.yaml Dockerfile docker-compose.yml docker-compose.dev.yml
 ```
@@ -287,8 +287,23 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
     deferrable constraints. The test asserts statement ORDER, so dropping the negating
     `UPDATE`, moving it after the assignments, or taking the whole thing out of its
     transaction each fail here rather than the first time somebody drags a policy. It also
-    pins that the seeder fires only on an empty table — the condition that keeps it and
-    `backfill-config` from both populating the routing list.
+    pins that the seeder fires only when **this project** has no policies — the condition
+    that keeps it and `backfill-config` from both populating one project's routing list —
+    and that the vacate step's `WHERE` is the project and nothing else (§6 *Stores*).
+  - `query/alerting_scope_test.go` — that every scoped builder for
+    `notification_channels`, `service_groups` and `notification_policies` emits a project
+    predicate with the right bound argument, that each mutation carries `project` in its
+    **own** `WHERE`, and that the four seeded defaults go in **disabled** in one
+    project-scoped statement. `alert_rules_query_test.go` holds the same for rules, plus a
+    table asserting that **every** exported builder across all four tables returns
+    `ErrNoAlertingProject` for an empty project before any statement reaches the database.
+  - `alerts/router_test.go` — that a rule's own `notification_channel_ids` fallback is
+    consulted when, and only when, no policy matched. The enabled-empty-policy case is the
+    live defect reproduced; the disabled case is the fix.
+  - `alerts/alert_hub_test.go` and `routes/alerts_test.go` — that the alert SSE tail
+    delivers only within a project (via `scope.Matches`, including the empty-stamp
+    transition arm) and that the handler refuses a request with no project *before*
+    subscribing.
   - `query/alert_rules_query_test.go` — that `condition` is **backticked** wherever it
     appears unqualified. It is a MariaDB reserved word; the reads all keep working, so the
     first symptom of losing the quotes is a 500 the next time somebody edits a rule. Also
@@ -397,7 +412,7 @@ IdP means filling in the form at `/admin/sso`, not shipping a build.
 | `monitor.issues` | one row per (project, fingerprint) — identity, counts, first/last seen, and the mutable triage state (status, priority, title, assignee) |
 | `monitor.issue_timeline` | append-only polymorphic feed: comments, status transitions, regressions, assignment, PR events |
 | `monitor.issue_links` | linked GitHub PRs/issues/commits with a cached state, refreshed by webhook |
-| `monitor.service_repos` | which source repository each reporting service is built from |
+| `monitor.service_repos` | which source repository each reporting service is built from, **per project** — PK `(project, service)` since 133 |
 
 **Monitor watches many services across more than one GitHub org**, so an issue in
 `scraper-service` and an issue in `website` do not belong to the same repo — and neither belongs
@@ -408,6 +423,23 @@ The mapping is **many-to-one and explicit**. The estate runs `auth-service-v1` b
 under its own name, all built from one repo. Stripping a `-vN` suffix would be a guess that
 silently mislabels anything off-convention, so nothing is derived from the service name. A service
 with no row is simply unmapped: links still work, they just cannot be resolved from a bare `#123`.
+
+⚠️ **The primary key changed in migration 133, from `service` to `(project, service)`** — the only
+one of 127-133 that is a key change rather than an added column. A service name is unique inside
+one project's event stream and nowhere else, so the old key made "which repo is `api` built from"
+a single zone-wide answer: two tenants both running `api` could not map it to different
+repositories at all, and the second `PUT` silently overwrote the first, pointing every issue in
+both projects at one tenant's repo. Every read, the upsert and the delete now bind the project, so
+`api` here and `api` there are two mappings. `idx_service_repos_lookup (provider, owner, repo)` is
+deliberately **left alone** — see the webhook below, which is the one caller with no project.
+
+⚠️ **One unscoped read survives: `query.ListServiceReposFor`, and it is deprecated.** Its single
+caller is `enrichIssues` (`routes/issues.go`), which decorates a page of issues with their
+repositories and should call `ListServiceReposForProject` — every issue on the page carries a
+project. Until it does, the unscoped one **omits any service name mapped in more than one
+project** rather than picking one: the obvious "last row wins" would put a foreign `owner/repo`
+on somebody's issue and a foreign URL behind "view source", whereas omitting it degrades to the
+unmapped state every caller already renders. Do not give it a second caller.
 
 **Tokens are per-owner**, because a fine-grained PAT is scoped to a single org. `github.TokenFor`
 derives the env var name from the owner — `TeamTrailblaze` → `MON_GITHUB_TOKEN_TEAMTRAILBLAZE`,
@@ -580,10 +612,10 @@ DELETE /v1/issues/{id}/comments/{commentID} soft-delete a comment               
 GET    /v1/issues/{id}/links                list linked PRs/issues/commits        [QueryAuthMiddleware]
 POST   /v1/issues/{id}/links                link a url, owner/repo#n, or #n       [QueryAuthMiddleware]
 DELETE /v1/issues/{id}/links/{linkID}       remove a link                         [QueryAuthMiddleware]
-GET    /v1/service-repos                    every service → repository mapping    [QueryAuthMiddleware]
-GET    /v1/service-repos/{service}          one mapping (404 when unmapped)       [QueryAuthMiddleware]
-PUT    /v1/service-repos/{service}          create/replace a mapping              [QueryAuthMiddleware]
-DELETE /v1/service-repos/{service}          remove a mapping                      [QueryAuthMiddleware]
+GET    /v1/service-repos                    this project's service → repo mappings [QueryAuthMiddleware]
+GET    /v1/service-repos/{service}          one mapping (404 when unmapped here)   [QueryAuthMiddleware]
+PUT    /v1/service-repos/{service}          create/replace this project's mapping  [QueryAuthMiddleware]
+DELETE /v1/service-repos/{service}          remove this project's mapping          [QueryAuthMiddleware]
 ```
 
 Native flows: `HandleLogin` returns a neutral 401 on every failure (no email
@@ -645,6 +677,19 @@ Unknown event types return **200**, not 4xx: GitHub retries on failure and event
 webhook that keeps erroring, so acknowledging what we ignore is what keeps the ones we care about
 flowing. Timeline writes are keyed on `gh:{owner}/{repo}#{n}:{type}`, so GitHub's at-least-once
 redelivery collapses to one entry.
+
+⚠️ **It is the one handler with no project, and that is structural.** Every `/v1` route resolves a
+tenant with `requireProject`; a delivery names `owner/repo` and nothing else, so there is nothing
+here to resolve one from. What that means per database touch:
+
+| Touch | Scope | Why |
+|---|---|---|
+| `ListIssueIDsForPR`, `UpdateIssueLinkState` | **cross-project** | `monitor.issue_links` is `TenancyDerived`: a link row exists only because someone who could already read that issue created it, and "this PR is now merged, titled X, by Y" is GitHub's fact, identical in every project that linked it. Scoping them would refresh one tenant's chip and leave the rest stale — worse, and no safer |
+| `ListServicesForRepo` | **cross-project**, by necessity | the repository is the only key the delivery carries, which is why 133 leaves `idx_service_repos_lookup` alone. It returns **`(project, service)` pairs**, not bare names, precisely so what happens next *can* be scoped |
+| the timeline entry's `affected_services` | **per issue's own project** | `affectedServicesForIssue` probes `query.GetIssue(engine, project, id)` once per candidate project; a foreign issue reads as absent, so the project that returns a row is the issue's own. Before this, a repo mapped in two projects put **both** tenants' service names on **both** tenants' timelines |
+
+The rule the handler follows: **a lookup keyed by something GitHub knows may cross projects;
+anything written onto an issue must be narrowed to that issue's project first.**
 
 **The public SSO config contract (`GET /auth/sso/config`) — shared shape:**
 
@@ -830,18 +875,28 @@ registration, cannot drift that way.
   MariaDB and stay registered in **both** roles. That is a deferral, not a verdict: which
   plane *owns* them is the config-pull question, and inventing an answer with no second
   zone to test it against would be worse than leaving today's behaviour alone.
-- **Deliberately NOT built in this phase** — do not add them speculatively: a config-pull
-  protocol, a zone agent, per-zone credentials, zone fan-out, cross-zone queries, per-user
-  project memberships, or a second zone. Consequently a `zone`-only process today expects
-  its zone/project rows and its `users` rows to already be present in its MariaDB; nothing
-  yet replicates them from the control plane.
+- **A SECOND ZONE EXISTS.** `trailblaze` runs `MON_ROLE=both` (control plane *and* its own
+  zone); `appleby` runs `MON_ROLE=zone`. An earlier version of this list named "a second
+  zone" among the things not built, which stopped being true on 2026-09-08.
+- **Still deliberately NOT built** — do not add them speculatively: a config-pull protocol,
+  a zone agent, minted per-zone credentials, zone fan-out, cross-zone queries, and per-user
+  project memberships. Consequently a `zone`-only process expects its zone/project rows and
+  its `users` rows to already be present in its own MariaDB; **nothing replicates them from
+  the control plane**, and the control plane's only outbound path to a zone is `probe.Zone`
+  (two GETs against `/health` and `/ready`). Managing a zone's projects, keys, alert rules
+  or dashboards means talking to that zone directly.
+  - The `users` half is handled rather than missing: `middleware.validateSessionToken`
+    builds the user from the access token's claims when `!RunsControlPlane()`, because a
+    zone's `users` table is empty by design. See §6 *Zone session trust*.
 - **`backfill-issues` and `backfill-config` need the data plane** and refuse to run under
   `MON_ROLE=app`, naming the variable — both read legacy ClickHouse tables.
 - **`alerts.Init` is still data-plane, and it now seeds MariaDB.** The four default
   notification policies are a MariaDB write made from the data-plane block rather than from
   `bootstrap/`, so that the set of processes creating those rows is exactly what it was
   before the tables moved. Moving it to the control plane would be a silent behaviour
-  change dressed as tidying.
+  change dressed as tidying. It seeds **`env.DefaultProjectSlug` only** — that is the only
+  project a boot step can name, and a project created later needs no seed because the
+  seeded set is written **disabled** (below). It issues **no DDL at all** any more.
 - Pinned by `router_test.go` (the full `both` inventory, the app/zone splits, and that
   `both` is exactly the union of the two) and `env/role_test.go` (parsing, the fail-fast
   refusal, the capability table).
@@ -879,9 +934,13 @@ same-schema foreign key is worth more than the tidiness of separating them.
   `settings` would be shadowed by the app's own page and unreachable with nothing logged
   anywhere. The list changes when the frontend's routes change, which is not a schema
   migration.
-- **Phase 1 is single-zone.** There is no fan-out, no zone routing, no config pull and no
-  role switch — `bootstrap.EnsureZoneAndProject` guarantees exactly one of each so
-  everything downstream can assume a project exists.
+- **One zone per PROCESS, which is not the same as one zone per install.** There is still no
+  fan-out, no cross-zone query and no config pull, and monitor-core never routes between
+  zones — but there *is* a role switch (`MON_ROLE`), monitor-web *does* route each request
+  to the selected zone's `query_url`, and two zones are live.
+  `bootstrap.EnsureZoneAndProject` runs in EVERY role and guarantees this process's own zone
+  and default project exist, so everything downstream can assume a project — which is why a
+  zone seeds itself rather than waiting for a control plane it cannot reach.
 
 - **On the ClickHouse side the dimension is one column**, `events.project`, added by
   `migrations/006_events_project.sql` as a plain `LowCardinality(String)` **not** in the
@@ -1137,6 +1196,29 @@ Ingest decides whose data a row *is*; this decides who may *read* it. **Every re
   map on the grounds that alert evaluation is timer-driven, which was true of one of its two
   callers. When adding an entry, name the callers you checked.
 
+**MariaDB is scoped by a column match, not by `scope.ProjectPredicate`.** That package owns the
+ClickHouse predicate and nothing else, so the `monitor.*` tables use the same rule expressed in
+squirrel: a per-table `scope<Table>` helper beside `scopeIssues` (`query/issues.query.go`) that
+returns a sentinel error rather than an empty predicate when handed an empty project. `dashboards`
+(131), `saved_views` (132) and `service_repos` (133) each have one — `ErrNoDashboardProject`,
+`ErrNoSavedViewProject`, `ErrNoServiceRepoProject`. The helpers are per table on purpose: one
+generic helper taking a table name is a copied call site away from putting a
+`monitor.dashboards.project` predicate on a saved-views read.
+
+Three rules hold across all of them, and each names a failure it prevents:
+
+- **The project is part of the LOOKUP, not a check after it** (the rule `query/api_keys.query.go`
+  states). A row in another project reads as **absent**, so `GET /v1/dashboards/{id}` with a
+  foreign id 404s exactly like a nonexistent one — no learning that an id exists by the shape of
+  the refusal. Ids travel into monitor-web URLs and shared links, so scoping only the list would
+  leave the boundary resting on ids staying secret.
+- **Mutations bind the project in their OWN `WHERE`**, never inheriting it from a preceding read.
+  `UpdateDashboard` reads first, but that read is not the check: the pair is not atomic and a
+  future caller may skip it.
+- **Every `INSERT` sets `project` explicitly.** The column is `NOT NULL` **with no default**, so
+  an omitted one is errno 1364 at runtime — the builders refuse an empty project before the
+  statement is issued, and say which field was missing.
+
 **The empty-string transition — dated, with a removal trigger.** Rows written before 006 read
 back as `''`, and the backfill is a manual mutation, so **the default project — and only the
 default project — also matches the empty string** (`(project = ? OR project = '')`). Any other
@@ -1155,6 +1237,14 @@ working without knowing any of this exists:
 | any `Event` (query, `/v1/issues/{id}/events`, SSE frames) | `project` | `omitempty`, so a pre-006 row with an empty project omits the key rather than sending `""` |
 | `Issue` | `project` | not `omitempty` — an issue always has one, and its absence would mean a bug rather than a legacy row |
 | `APIKey` (`GET`/`POST /v1/api-keys`) | `project_id`, `project_slug` | `POST` also *accepts* an optional `project_slug`, defaulting to `MON_DEFAULT_PROJECT` |
+| `Dashboard` (`/v1/dashboards*`) | `project` | not `omitempty` — 131 made the column `NOT NULL`, so a blank one would mean a bug |
+| `SavedView` (`/v1/views*`) | `project` | same (132) |
+| `ServiceRepo` (`/v1/service-repos*`, and the `repository` on an issue) | `project` | same (133), where it is also **half the primary key** |
+
+None of the three **accepts** a `project` in a request body. The tenant comes from the
+credential, so no JSON field can file a dashboard, a view or a mapping into a project the caller
+cannot read back — and `UpdateDashboardRequest` deliberately has no `project` either, because
+that would be a tenant move dressed as an edit.
 
 Two routes were added for the switcher, both reads, both session-available (the write
 surface is `/admin/zones*` + `/admin/projects*`, admin-only and control-plane-only):
@@ -1202,23 +1292,78 @@ Handlers resolve it through `routes.requireProject`, which 500s exactly as
   single gate for the timeline, the occurrence history, all three comment verbs and all three
   link verbs, so scoping it covers eight endpoints at once.
 
-**One known gap and one deliberate divergence, both dated 2026-09-06:**
+**Alerting is scoped in MariaDB too, by the same mechanism as issues.** Migrations 127-130
+gave `alert_rules`, `notification_channels`, `notification_policies` and `service_groups` a
+`project` column, and every exported builder in their four query files now takes a leading
+`project`. An empty one returns `query.ErrNoAlertingProject` rather than a query without the
+predicate — the alerting counterpart of `query.ErrNoIssueProject`, kept as a separate sentinel
+so a handler that catches the wrong one names the wrong table rather than silently widening.
+Handlers resolve it through the same `routes.requireProject`. Four properties are worth
+knowing:
 
-- **TIMER-DRIVEN alert evaluation is zone-wide.** `Evaluator.Run` has a background context,
-  no credential and therefore no project, so `alerts.queryAggForRange` aggregates across every
-  project and a rule's threshold counts the whole instance. A rule *can* opt in via a `project`
-  filter (that is why `project` joined `FilterColumns`); the alert tables still have no project
-  column. **The HTTP half is NOT a gap and is now scoped:** `EvaluateRuleNow`, reached from
-  `POST /v1/alert-rules/{id}/test`, passes the request's context, so `scope.ProjectPredicate`
-  applies and the aggregate returned to the caller is their own project's. Unscoped it was an
-  oracle rather than a gap — a rule carries a caller-chosen aggregation, field and filter set,
-  so an admin key bound to one project could read back a count or a `max()` over every
-  project's events, one number per request, with no row crossing the boundary to notice. The
-  old safety argument ("no rule can read a project its author cannot already read, because rule
-  authorship is admin-scoped") was true when admin meant global and became false when
-  `QueryAuthMiddleware` made admin a scope over *verbs*. **Consequence, on purpose:** a rule's
-  test result and the value that fires it can disagree once a second project exists. See the
-  `KNOWN GAP` header on `alerts/evaluator.go`.
+- **Reads scope by LOOKUP, not by a check after it.** A rule, channel, policy or group in
+  another project reads as *absent* — a 404 indistinguishable from one that never existed —
+  so an id cannot be probed, and cannot then be handed to an endpoint that acts on it.
+- **Mutations carry `project = ?` in their own `WHERE`.** Never inherited from the read that
+  precedes them: read-then-write is not atomic and a future caller may skip the read. For a
+  *policy* that matters more than for a read — retargeting another tenant's policy at your own
+  channels redirects their alerts to you.
+- **`ListEnabledAlertRules` is the one deliberate exception and stays unscoped.** The
+  evaluator is a zone-wide daemon with no request, and must run every project's rules;
+  scoping it would stop evaluating every tenant outside the named project — alerting that
+  reports healthy and fires nothing. The tenancy is applied one layer up instead (below).
+  `query/alert_rules_query_test.go` asserts the scoped list and the unscoped one as a pair, so
+  a change that collapses them breaks exactly one.
+- **`notification_channels` rows carry credentials.** Since 126 the config is encrypted at
+  rest and `json:"-"`, but `GetNotificationChannel` is what `POST
+  /v1/notification-channels/{id}/test` *sends through* — unscoped, one tenant could page
+  another tenant's on-call rotation by id alone.
+
+**The two ClickHouse alerting tables are scoped too** (`migrations/007_alert_tables.sql` adds
+`project` to both), through `scope.ProjectPredicate` rather than a column list — the same
+mechanism as `monitor.events`, reached via `alerts.projectPredicate`, which stamps the project
+the *caller* resolved onto the context so there is one implementation of the empty-string
+transition rule rather than a second copy that drifts:
+
+- **`GET /v1/alert-history` was a zone-wide read.** The rows are not metadata: `rule_name` is
+  operator-written and routinely names a service, a customer or an environment, and `message`
+  is the sentence the evaluator built from it. That is another tenant's incident log, served
+  through the page an operator opens to review their own. Now `alerts.ListHistory(ctx, project,
+  …)`, with the project predicate bound **before** the optional `rule_id` so the argument order
+  does not depend on whether the caller passed a rule.
+- **`GET /v1/alerts/stream` fanned every rule's state changes to every subscriber.**
+  `AlertHub.Subscribe` now takes a project, `AlertEvent` carries one taken from the rule's own
+  column, and `Publish` filters with `scope.Matches` — the same delegation `services/hub.go`
+  makes, so the alert tail and the stored history cannot answer the same question differently.
+  The project is server-derived: `routes.HandleStreamAlerts` resolves it with `requireProject`
+  and refuses *before* subscribing, and an empty project is rejected by `scope.Matches` as a
+  second, fail-closed lock.
+- **`alert_states` needs no manual backfill; `alert_history` does.** The evaluator rewrites
+  every enabled rule's state row on its own interval and the `ReplacingMergeTree` collapses
+  the unstamped version away, so those repair themselves within one evaluation pass.
+  `alert_history` is append-only and nothing rewrites a row, so it gets
+  `migrations/manual/backfill_alert_history_project.sql` — a mutation, run by hand, for the
+  reason `backfill_events_project.sql` states at length.
+
+**CLOSED — timer-driven alert evaluation was zone-wide** (recorded 2026-09-06, closed by
+migration 127). `Evaluator.Run` had a background context, no credential and therefore no
+project, so `alerts.queryAggForRange` aggregated across every project and a rule's threshold
+counted the whole instance. `alert_rules.project` gives the timer a project without a request:
+`evaluateAll` builds `scope.WithProject(ctx, rule.Project)` **per rule** and passes it down, and
+`buildAggQuery`'s `errors.Is(err, scope.ErrNoProject)` fall-through is **deleted**, so an
+unscoped aggregate is now unconstructable rather than merely unusual. The HTTP half was never
+a gap but an *oracle*, and was closed first: a rule carries a caller-chosen aggregation, field
+and filter set, so an admin key bound to one project could read back a `count()` or a `max()`
+over every project's events, one number per request, with no row crossing the boundary to
+notice. (The old safety argument — "no rule can read a project its author cannot already read,
+because rule authorship is admin-scoped" — was true when admin meant global and became false
+when `QueryAuthMiddleware` made admin a scope over *verbs*.) The consequence that used to be
+documented as deliberate — a rule's test value and its firing value disagreeing — **is gone**:
+`TestTimerAndTestEndpointBuildTheSameStatement` asserts the two paths emit a byte-identical
+statement with identical bound args for one rule. `queryAggForRange` had already come out of
+`scope/chokepoint_test.go`'s exemption map when the HTTP half was closed, and stays out.
+
+**One deliberate divergence remains, dated 2026-09-06:**
 - **`monitor.issue_occurrences_daily` has no project column** (005 keys it on
   `(issue_id, day)`), so it cannot be aggregated per project without joining `monitor.issues`.
   Since migration 118 this is a schema nicety, not a boundary: issue ids are derived from a
@@ -1248,13 +1393,37 @@ migrations 119-124 — every alerting and dashboard setting.
 | Table | Store | Why |
 |---|---|---|
 | `events`, `issue_occurrences_daily` | ClickHouse | facts, columnar, TTL'd |
-| `alert_states` | ClickHouse | one row per rule, rewritten by a 15s timer |
-| `alert_history` | ClickHouse | append-only transitions, **90-day TTL** (no MariaDB equivalent) |
+| `alert_states` | ClickHouse | one row per rule, rewritten by a 15s timer; `project` since `migrations/007` |
+| `alert_history` | ClickHouse | append-only transitions, **90-day TTL** (no MariaDB equivalent); `project` since `migrations/007` |
 | `monitor.issues`, `issue_timeline`, `issue_links` | MariaDB | triage state, uniqueness, FKs (111-114) |
-| `monitor.service_repos` | MariaDB | explicit mapping (115) |
-| `monitor.alert_rules`, `notification_channels`, `notification_policies`, `service_groups` | MariaDB | alerting configuration (119-122) |
-| `monitor.dashboards`, `monitor.saved_views` | MariaDB | saved UI state (123-124) |
+| `monitor.service_repos` | MariaDB | explicit mapping (115), keyed `(project, service)` since 133 |
+| `monitor.alert_rules`, `notification_channels`, `notification_policies`, `service_groups` | MariaDB | alerting configuration (119-122), project-scoped (127-130); channel config is **encrypted at rest and never served** (126) |
+| `monitor.dashboards`, `monitor.saved_views` | MariaDB | saved UI state (123-124), project-scoped (131-132); `saved_views`' page index became `(project, page)` |
 | `monitor_auth.*` | MariaDB | identity + tenancy (100-109, 116-117) |
+
+**Notification-channel config is encrypted and never returned** (migration 126). `config`
+held Slack webhooks, SMTP passwords and PagerDuty routing keys in plaintext AND was served:
+it was in `notificationChannelColumns`, scanned into a `json:"config"` field, and
+`GET /v1/notification-channels` sits on the ordinary `/v1` subrouter — so every credential in
+a zone was readable by any authenticated session or admin-scope API key. 120's own header had
+flagged this and named the deadline ("zero notification channels on the live instance today,
+so the cheapest moment to do it is before anyone creates one"); that was still true, so the
+migration moved zero rows.
+
+- Writes go to `config_enc` (AES-256-GCM via `tools.Encrypt`, the same treatment
+  `sso_providers.client_secret` already had). `config` is relaxed to NULL and kept only as
+  the read fallback for a row an older binary may have written.
+- `structs.NotificationChannel.Config` is **`json:"-"`**, and that tag *is* the security
+  property — a redaction applied in a handler protects only the handler that remembered.
+  `alerts/notifier.go` keeps reading it (decrypted) to actually send; the API renders
+  `config_summary` instead, built by `structs.SummariseChannelConfig`, which fails closed:
+  any shape it does not recognise returns a generic label rather than any part of the input.
+- A decrypt failure is an **error**, not an empty config — an empty one would look saved,
+  render in the list, and silently never deliver. The likeliest cause is the wrong
+  `MON_CRYPTO_KEY`.
+- ⚠️ **This makes `MON_CRYPTO_KEY` genuinely required on a zone.** It was already demanded by
+  `env.RequireProductionSecrets` in every role while being consumed only by control-plane SSO
+  code; a zone now actually uses it. The requirement stopped being a wart by becoming true.
 
 **What getting it wrong cost, both times.** Eight tables were originally created by ad-hoc
 `CREATE TABLE IF NOT EXISTS` inside package `Init()` functions at boot, with no migration
@@ -1285,16 +1454,70 @@ and (3) assigns `1..N` into the now-empty positive range. That is why
 order and follow. `query/notification_policies_query_test.go` fails if the vacate step is
 dropped, reordered, or taken out of its transaction.
 
-**Two known inconsistencies, recorded rather than left to be found:**
+**The vacate step is scoped to one project and MUST stay that way** (migration 129). It is
+the one statement in the repo where a missing project predicate does not merely widen a read,
+it *corrupts rows the request never named*: negating every project's positions while phase two
+reassigns only this project's leaves every other tenant's policies at negative positions
+permanently — still ordered among themselves, but ahead of this project's under any
+`ORDER BY position`, and unrecoverable without a manual rewrite. Negation stays injective
+under `(project, position)` because it never touches the project half of the pair.
+`TestVacateStatementCannotCollide` asserts the `WHERE` is the project **and nothing else**:
+too narrow leaves live positive positions to collide with, too wide is the corruption above.
 
-- `alert_states` and `alert_history` are still created by an ad-hoc `CREATE TABLE` in
-  `alerts.Init`, which is exactly the pattern 119 condemns. They are the last two in the
-  repo created that way; giving them files means a ClickHouse migration (`migrations/007…`),
-  a different runner with its own re-runnability story, and it is a separate change.
-- **None of the six moved tables has a `project` column.** Adding one would partition six
-  live configuration sets between tenants that share them today — a behaviour change, not a
-  move — and it is the same question as the evaluator's zone-wide gap. What the move does is
-  make it cheap: one migration per table, against a store that can enforce the result.
+**The four seeded default policies are written `enabled = 0`, and the seeder is gated per
+PROJECT.** Both halves are decisions, not details:
+
+- **The gate.** It was "the table is empty". Under 129 this table holds every project's
+  routing order at once, so a table-wide count would let the first project set up
+  permanently block every later one from being seeded — silently, with the later project
+  simply booting to an empty routing table. It is now `COUNT(*) … WHERE project = ?`, which
+  still keeps the seeder and `backfill-config` from both populating one project's list.
+- **The `enabled = 0`.** The seeded set ships with empty `channel_ids` — it always has — and
+  `alerts.matchedChannelIDs` treats "a policy matched" as reason to skip the rule's own
+  `notification_channel_ids` fallback. **Enabled, those four match every alert by priority
+  (P0-P3 is the whole enum), carry `continue_matching = false`, and route to nothing** — so a
+  seeded, unedited project does not merely lack routing, it actively *suppresses* the per-rule
+  channels an operator did configure, with nothing logged and nothing erroring. Disabled, the
+  router's `!policy.Enabled` continue skips them, the fallback stays reachable, and the rows
+  survive as a fillable template. The alternative considered was "do not seed non-default
+  projects", which fixes the tenancy question and none of the routing one — it would leave the
+  *default* project, the one every existing install actually runs, with the suppressing set
+  intact. Existing rows are untouched: the gate means the seeder only ever runs for a project
+  with no policies at all.
+
+**Alerting reports whether it can actually reach anybody.** All six rules on the deployed
+instance carried `notification_channel_ids: []`, so alerting evaluated on schedule,
+transitioned state, wrote history — and notified nobody, with no error and nothing in the API
+that said so. Two surfaces now do:
+
+- `Router.Route` returns the number of channels it actually resolved and dispatched to, and
+  logs `alert router: WARN alert %s fired and matched no notification destination …` when
+  that is zero — on resolve as well as on fire, since a resolution nobody is told about is the
+  same missing signal. It is a WARN and not an error because nothing failed: the rule
+  evaluated correctly and the transition is real. What is wrong is the *configuration*.
+- `GET /v1/alert-rules` and `GET /v1/alert-rules/{id}` carry **`has_destinations`** (bool) on
+  each `RuleWithState`. It is computed from the same pure helpers `Route` uses
+  (`alerts.matchedChannelIDs` → `alerts.countDestinations`), so the badge cannot disagree with
+  what happens when the rule fires, and a **dangling channel id does not count** — ids live in
+  JSON arrays with no FK, so a deleted channel leaves its id behind and the router skips it.
+  The listing costs **five queries regardless of rule count**: rules, states, policies,
+  channels and service groups are each read once and matched in memory. Those three routing
+  reads are best-effort — a failure yields `has_destinations: false`, the conservative
+  direction, rather than failing the page.
+
+**Both recorded inconsistencies are now closed:**
+
+- `alert_states` and `alert_history` were the last two tables in the repo created by an
+  ad-hoc `CREATE TABLE` in an `Init()`, which is exactly the pattern 119 condemns. They have
+  a file now — `migrations/007_alert_tables.sql` — and `alerts.Init` issues **no DDL at all**.
+  That file carries **both** a `CREATE TABLE IF NOT EXISTS` (for fresh installs) **and** an
+  `ALTER TABLE … ADD COLUMN IF NOT EXISTS project`, because the tables already exist on every
+  deployed zone and a `CREATE … IF NOT EXISTS` is a no-op there — its new column would never
+  appear. Neither statement alone is sufficient.
+- **All six moved tables now have a `project` column** (127-132, plus `service_repos` in 133).
+  Partitioning them *is* a behaviour change and was taken deliberately, one migration per
+  table, against a store that can enforce the result — see the alerting bullets in §6
+  *Scoping the read path* for what each one bought.
 
 **Legacy ClickHouse tables are left in place, unread.** `monitor-core backfill-config` can
 only be re-run while they exist. Drop them by hand once a release has passed, along with
@@ -1448,11 +1671,16 @@ deviating.
   - **Alerting stops, invisibly.** `alert_rules` is empty, so `listEnabledRules` returns
     nothing and the evaluator has nothing to evaluate. No error, no log line, no alert —
     there is no code path that distinguishes "no rules configured" from "six rules gone".
-  - **The default notification policies double.** `alerts.Init` seeds four defaults into an
-    empty policies table; the backfill then appends the four ClickHouse originals after them
-    (nothing collides — positions are renumbered from `MAX+1`), leaving eight policies of
-    which four match every alert by priority and route it nowhere. Running the guard *before*
-    `alerts.Init` means this state is never created rather than created and then explained.
+  - **The default notification policies double.** `alerts.Init` seeds four defaults into a
+    project with no policies; the backfill then appends the four ClickHouse originals after
+    them (nothing collides — positions are renumbered from `MAX+1`), leaving eight policies.
+    Running the guard *before* `alerts.Init` means this state is never created rather than
+    created and then explained. **The blast radius is smaller than it was but the ordering
+    still stands:** the seeded four now go in `enabled = 0` (§6 *Stores*), so they no longer
+    capture every alert and route it nowhere — they are dead weight an operator has to
+    recognise and delete, not silent misrouting. An install that seeded on an OLDER build
+    still has four *enabled* empty-channel defaults, and the recovery steps below are for
+    exactly that case.
 
   The guard is a **one-shot, not a permanent tripwire**. It short-circuits on a
   `cutover:config_backfill_completed_at` row in `settings`, stamped by `BackfillConfig` only
@@ -1666,10 +1894,11 @@ deviating.
   | Script | What it does | When to run it |
   |---|---|---|
   | `backfill_events_project.sql` | Stamps `MON_DEFAULT_PROJECT` onto every `events` row written before `006_events_project.sql`, which reads back with an empty `project`. | Once, any time after 006 has deployed. Until it has run *and* 30 days have passed, the empty-string arm in `scope.ProjectPredicate`/`scope.Matches` is what keeps that history visible — the two are a pair (§6). |
+  | `backfill_alert_history_project.sql` | Stamps `MON_DEFAULT_PROJECT` onto every `alert_history` row written before `007_alert_tables.sql`, which reads back with an empty `project`. | Once, any time after 007 has deployed. **There is deliberately no equivalent for `alert_states`** — the evaluator rewrites every enabled rule's state row on its own interval and the `ReplacingMergeTree` collapses the unstamped version away, so those repair themselves. `alert_history` is append-only and nothing rewrites a row. The 90-day TTL gives this file a shelf life: once every pre-007 part has aged out, nothing can be unstamped. |
   | `delete_orphaned_issue_rollups.sql` | Deletes `issue_occurrences_daily` rows whose `issue_id` is no longer present in `monitor.issues`. | Only after the pre-118 issues have been dealt with **and their rows DELETEd**. It keys on absence, not on age or status, so it is a deliberate no-op while those rows still exist. |
   | `dedupe_issues_by_fingerprint.sql` | Folds the duplicate rows one fingerprint acquired in the **legacy ClickHouse** `issues` table, before ids were derived from the fingerprint. | **Historical — do not run it now.** Issues moved to MariaDB (`111_create_issues.sql`); the ClickHouse table it edits is unread. Kept only until that table is dropped. |
 
-  Three properties are shared by all three files, and each is the reason the file is where
+  Three properties are shared by all four files, and each is the reason the file is where
   it is rather than a style preference:
 
   - **They live in `migrations/manual/` and must never move up a directory.** The ClickHouse
@@ -1776,8 +2005,10 @@ deviating.
   §6 *Stores* lists. A schema with no migration file has no history, no review and — as the
   discarded `_ = db.Conn.Exec(ctx, "ALTER TABLE …alert_rules ADD COLUMN … priority")` in the
   old `alerts.Init` showed — no way to report that it failed. MariaDB DDL goes in
-  `db/migrations/`, ClickHouse DDL in `migrations/`. The two survivors (`alert_states`,
-  `alert_history`) are a recorded exception, not a precedent.
+  `db/migrations/`, ClickHouse DDL in `migrations/`. **There are no survivors left:** the last
+  two (`alert_states`, `alert_history`) moved to `migrations/007_alert_tables.sql`, so this
+  rule now has no recorded exception and adding one would be a new precedent, not a
+  continuation.
 - **Configuration goes in MariaDB, facts go in ClickHouse** (§6 *Stores* has the rule and
   the table). If a human edits the row, or two rows must not collide, it is not a ClickHouse
   table — that engine cannot enforce uniqueness and deduplicates only when a background

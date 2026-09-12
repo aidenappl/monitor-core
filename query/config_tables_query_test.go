@@ -43,7 +43,7 @@ func TestJSONValidationAppliesOnlyToServerParsedColumns(t *testing.T) {
 
 		// No expectations registered, so any statement issued fails the call —
 		// which is what proves the guard refused it rather than the column.
-		_, err = CreateNotificationChannel(mockDB, CreateNotificationChannelRequest{
+		_, err = CreateNotificationChannel(mockDB, "default", CreateNotificationChannelRequest{
 			Name: "ops", Type: "slack", Config: "not json",
 		})
 		if err == nil || !strings.Contains(err.Error(), "config must be valid JSON") {
@@ -58,7 +58,7 @@ func TestJSONValidationAppliesOnlyToServerParsedColumns(t *testing.T) {
 		}
 		defer mockDB.Close()
 
-		_, err = CreateServiceGroup(mockDB, CreateServiceGroupRequest{
+		_, err = CreateServiceGroup(mockDB, "default", CreateServiceGroupRequest{
 			Name: "payments", Services: "atlas-api, forta-api",
 		})
 		if err == nil || !strings.Contains(err.Error(), "services must be valid JSON") {
@@ -74,10 +74,10 @@ func TestJSONValidationAppliesOnlyToServerParsedColumns(t *testing.T) {
 		defer mockDB.Close()
 
 		mock.ExpectExec("INSERT INTO monitor.dashboards").
-			WithArgs(sqlmock.AnyArg(), "Overview", "", "", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WithArgs(sqlmock.AnyArg(), "default", "Overview", "", "", sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
-		d, err := CreateDashboard(mockDB, CreateDashboardRequest{Name: "Overview"})
+		d, err := CreateDashboard(mockDB, "default", CreateDashboardRequest{Name: "Overview"})
 		if err != nil {
 			t.Fatalf("CreateDashboard: %v", err)
 		}
@@ -97,12 +97,12 @@ func TestJSONValidationAppliesOnlyToServerParsedColumns(t *testing.T) {
 		defer mockDB.Close()
 
 		mock.ExpectExec("INSERT INTO monitor.saved_views").
-			WithArgs(sqlmock.AnyArg(), "5xx only", "level=error&limit=100", "events", sqlmock.AnyArg()).
+			WithArgs(sqlmock.AnyArg(), "default", "5xx only", "level=error&limit=100", "events", sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		// A query string, not JSON — which is exactly why this column is not a
 		// JSON one. `page` defaults to "events" when the caller omits it.
-		v, err := CreateSavedView(mockDB, CreateSavedViewRequest{
+		v, err := CreateSavedView(mockDB, "default", CreateSavedViewRequest{
 			Name: "5xx only", QueryParams: "level=error&limit=100",
 		})
 		if err != nil {
@@ -121,6 +121,11 @@ func TestJSONValidationAppliesOnlyToServerParsedColumns(t *testing.T) {
 // the handler has always had. A predicate that leaked in unconditionally would
 // bind the empty string and return nothing, which reads as "you have no saved
 // views" rather than as an error.
+//
+// The PROJECT is the opposite kind of parameter and is asserted alongside on
+// purpose: it is present in both cases, because an absent tenant is an error
+// rather than a wildcard. The two live one line apart in ListSavedViews and
+// confusing them is the mistake this pins.
 func TestListSavedViewsPageFilter(t *testing.T) {
 	t.Run("page given filters", func(t *testing.T) {
 		mockDB, mock, err := sqlmock.New()
@@ -129,11 +134,11 @@ func TestListSavedViewsPageFilter(t *testing.T) {
 		}
 		defer mockDB.Close()
 
-		mock.ExpectQuery("WHERE monitor.saved_views.page = \\?").
-			WithArgs("issues").
-			WillReturnRows(sqlmock.NewRows([]string{"id", "name", "query_params", "page", "created_at"}))
+		mock.ExpectQuery("WHERE monitor.saved_views.project = \\? AND monitor.saved_views.page = \\?").
+			WithArgs("atlas", "issues").
+			WillReturnRows(sqlmock.NewRows([]string{"id", "project", "name", "query_params", "page", "created_at"}))
 
-		if _, err := ListSavedViews(mockDB, "issues"); err != nil {
+		if _, err := ListSavedViews(mockDB, "atlas", "issues"); err != nil {
 			t.Fatalf("ListSavedViews: %v", err)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
@@ -141,21 +146,22 @@ func TestListSavedViewsPageFilter(t *testing.T) {
 		}
 	})
 
-	t.Run("page absent lists everything", func(t *testing.T) {
+	t.Run("page absent lists everything in the project", func(t *testing.T) {
 		mockDB, mock, err := sqlmock.New()
 		if err != nil {
 			t.Fatalf("sqlmock.New: %v", err)
 		}
 		defer mockDB.Close()
 
-		mock.ExpectQuery("^SELECT (?s).* FROM monitor.saved_views ORDER BY").
-			WillReturnRows(sqlmock.NewRows([]string{"id", "name", "query_params", "page", "created_at"}))
+		mock.ExpectQuery("^SELECT (?s).* FROM monitor.saved_views WHERE monitor.saved_views.project = \\? ORDER BY").
+			WithArgs("atlas").
+			WillReturnRows(sqlmock.NewRows([]string{"id", "project", "name", "query_params", "page", "created_at"}))
 
-		if _, err := ListSavedViews(mockDB, ""); err != nil {
+		if _, err := ListSavedViews(mockDB, "atlas", ""); err != nil {
 			t.Fatalf("ListSavedViews: %v", err)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("an absent page acquired a WHERE clause: %v", err)
+			t.Errorf("an absent page acquired a page predicate: %v", err)
 		}
 	})
 }
@@ -176,8 +182,8 @@ func TestListsReturnEmptySlicesNotNil(t *testing.T) {
 	defer mockDB.Close()
 
 	mock.ExpectQuery("FROM monitor.notification_channels").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "type", "config", "created_at"}))
-	channels, err := ListNotificationChannels(mockDB)
+		WillReturnRows(sqlmock.NewRows([]string{"id", "project", "name", "type", "config", "config_enc", "created_at"}))
+	channels, err := ListNotificationChannels(mockDB, "default")
 	if err != nil {
 		t.Fatalf("ListNotificationChannels: %v", err)
 	}
@@ -186,8 +192,8 @@ func TestListsReturnEmptySlicesNotNil(t *testing.T) {
 	}
 
 	mock.ExpectQuery("FROM monitor.service_groups").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "description", "services", "created_at", "updated_at"}))
-	groups, err := ListServiceGroups(mockDB)
+		WillReturnRows(sqlmock.NewRows([]string{"id", "project", "name", "description", "services", "created_at", "updated_at"}))
+	groups, err := ListServiceGroups(mockDB, "default")
 	if err != nil {
 		t.Fatalf("ListServiceGroups: %v", err)
 	}
@@ -196,8 +202,8 @@ func TestListsReturnEmptySlicesNotNil(t *testing.T) {
 	}
 
 	mock.ExpectQuery("FROM monitor.dashboards").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "description", "config", "created_at", "updated_at"}))
-	boards, err := ListDashboards(mockDB)
+		WillReturnRows(sqlmock.NewRows([]string{"id", "project", "name", "description", "config", "created_at", "updated_at"}))
+	boards, err := ListDashboards(mockDB, "default")
 	if err != nil {
 		t.Fatalf("ListDashboards: %v", err)
 	}
@@ -206,8 +212,8 @@ func TestListsReturnEmptySlicesNotNil(t *testing.T) {
 	}
 
 	mock.ExpectQuery("FROM monitor.saved_views").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "query_params", "page", "created_at"}))
-	views, err := ListSavedViews(mockDB, "")
+		WillReturnRows(sqlmock.NewRows([]string{"id", "project", "name", "query_params", "page", "created_at"}))
+	views, err := ListSavedViews(mockDB, "default", "")
 	if err != nil {
 		t.Fatalf("ListSavedViews: %v", err)
 	}

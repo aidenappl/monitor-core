@@ -336,8 +336,16 @@ func HandleCreateIssueLink(w http.ResponseWriter, r *http.Request) {
 
 	// The service's repository is the fallback for a bare number. Failing to
 	// resolve it is not fatal — a full URL needs no fallback at all.
+	//
+	// Scoped by the ISSUE'S project (migration 133 made it half the mapping's
+	// primary key), taken from the row rather than re-read off the context: it is
+	// the same value by construction, since requireIssue resolved this issue
+	// through a project-scoped lookup, and reading it here keeps the fallback
+	// bound to the issue it is a fallback FOR. Unscoped, `#42` typed against a
+	// service another tenant also runs would resolve to THEIR repository and mint
+	// a link to a pull request in it.
 	var fallbackOwner, fallbackRepo string
-	if repo, err := query.GetServiceRepo(db.SQL, issue.Service); err == nil && repo != nil {
+	if repo, err := query.GetServiceRepo(db.SQL, issue.Project, issue.Service); err == nil && repo != nil {
 		fallbackOwner, fallbackRepo = repo.Owner, repo.Repo
 	}
 

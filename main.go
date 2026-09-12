@@ -15,11 +15,14 @@ import (
 	"github.com/aidenappl/monitor-core/alerts"
 	"github.com/aidenappl/monitor-core/apikeys"
 	"github.com/aidenappl/monitor-core/bootstrap"
+	"github.com/aidenappl/monitor-core/buildinfo"
 	"github.com/aidenappl/monitor-core/cutover"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/issues"
 	"github.com/aidenappl/monitor-core/migrations"
+	"github.com/aidenappl/monitor-core/preflight"
+	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/registry"
 	"github.com/aidenappl/monitor-core/routes"
 	"github.com/aidenappl/monitor-core/services"
@@ -30,7 +33,7 @@ import (
 // subcommands are the one-off operator actions this binary accepts instead of
 // serving. Listed in one place so the unknown-argument error can name them all,
 // rather than an operator guessing which spelling this build understands.
-var subcommands = []string{"backfill-issues", "backfill-config [--dry-run]"}
+var subcommands = []string{"backfill-issues", "backfill-config [--dry-run]", "check-env", "version"}
 
 // requireKnownCommand rejects an argument this build does not implement.
 //
@@ -77,6 +80,14 @@ func main() {
 	// Optionally load secrets from Keyring before reading env vars.
 	// Requires KEYRING_URL, KEYRING_ACCESS_KEY_ID, and KEYRING_SECRET_ACCESS_KEY
 	// to be set in the environment. Silently skipped if they are absent.
+	//
+	// The environment is SNAPSHOTTED around the injection so preflight can say
+	// which variables Keyring REPLACED rather than filled in. That distinction
+	// is the whole diagnosis of an incident that cost hours: Keyring injects
+	// before env.Load() and getEnv reads os.Getenv first, so Keyring silently
+	// wins over anything the container set — and a broadly-granted token
+	// overrode a zone's CLICKHOUSE_* with another zone's, with nothing logged.
+	envBeforeKeyring := preflight.Snapshot()
 	if client, err := keyring.New(); err == nil {
 		if err := client.InjectEnv(ctx); err != nil {
 			log.Printf("keyring: failed to inject secrets: %v", err)
@@ -85,6 +96,45 @@ func main() {
 
 	// Load configuration (picks up any values injected by Keyring above).
 	env.Load()
+
+	// Diagnose the configuration before anything tries to USE it, so a mistake is
+	// reported as itself rather than as whatever fails first because of it. A
+	// literal "${…}" in a DSN is the motivating case: unresolved, it surfaces as
+	// "Access denied ... (using password: YES)", which is indistinguishable from
+	// a wrong password, a stale volume, or the Keyring override above.
+	preflightChecks := preflight.Env()
+	preflightChecks = append(preflightChecks, preflight.KeyringOverrides(envBeforeKeyring, preflight.Snapshot())...)
+	preflightFatal := preflight.Report(preflightChecks)
+
+	// `monitor-core check-env` is the SAME checks, run standalone and exiting on
+	// the result. One code path, deliberately: a doctor that could disagree with
+	// what the boot enforces is a doctor nobody can trust, and the disagreement
+	// would surface as "it passes the check and still will not start".
+	//
+	// It runs here — after Keyring and env.Load, before any connection — so it
+	// works against a stack that does not exist yet, which is exactly when a zone
+	// is being stood up and the answer is most wanted.
+	if len(os.Args) > 1 && os.Args[1] == "check-env" {
+		if preflightFatal {
+			log.Fatal("check-env: configuration is not usable — see above")
+		}
+		log.Printf("check-env: %d finding(s), none fatal", len(preflightChecks))
+		return
+	}
+
+	// `monitor-core version` prints the build identity without connecting to
+	// anything, so it answers "which image is this?" on a box whose stores are
+	// down — which is when that question tends to get asked.
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		info := buildinfo.Get()
+		fmt.Printf("%s %s\ncommit:  %s\nbuilt:   %s\ngo:      %s\nrole:    %s\nzone:    %s\n",
+			info.Service, info.Version, info.Commit, info.BuildTime, info.Go, env.MonRole, env.ZoneSlug)
+		return
+	}
+
+	if preflightFatal {
+		log.Fatal("FATAL: preflight found a configuration error that would misdiagnose itself later — see above")
+	}
 
 	// Settle which plane this process is before anything reads the answer. An
 	// unrecognised MON_ROLE stops the boot rather than degrading to the default —
@@ -209,10 +259,47 @@ func main() {
 	}
 	defer db.CloseSQL()
 
+	// Diagnose the `monitor` schema grant BEFORE the migration runner needs it,
+	// so the missing GRANT is reported as a missing GRANT rather than as an
+	// Error 1044 from inside migration 110 that names neither the grant nor the
+	// fix. That misdiagnosis cost hours on the second zone.
+	if schemaChecks := preflight.MonitorSchema(db.SQL); preflight.Report(schemaChecks) {
+		log.Fatal("FATAL: the database is not usable by this service — see the remedy above")
+	}
+
 	// Apply the MariaDB auth-schema migrations at startup.
 	if err := db.RunMigrations(); err != nil {
 		log.Fatalf("❌ failed to run MariaDB migrations: %v", err)
 	}
+
+	// Establish this install's identity and record what schema it is on, both
+	// for GET /version.
+	//
+	// AFTER the migrations, because the settings table has to exist and the
+	// counts have to be final; BEFORE the server listens, because neither can
+	// change while the process runs and /version exists to be polled.
+	//
+	// Neither is fatal. A process that cannot mint an install id is still a
+	// perfectly good Monitor — it just cannot be told apart from another install
+	// by a probe — and refusing to boot over a diagnostic would trade a real
+	// outage for a missing label.
+	if installID, err := bootstrap.EnsureInstallID(db.SQL); err != nil {
+		log.Printf("⚠️ could not establish an install id (GET /version will omit it): %v", err)
+	} else {
+		routes.InstallID = installID
+	}
+
+	if applied, latest, err := query.AppliedMigrations(db.SQL); err != nil {
+		log.Printf("⚠️ could not read the MariaDB migration ledger: %v", err)
+	} else {
+		routes.Schema.MariaDBApplied = applied
+		routes.Schema.MariaDBLatest = latest
+	}
+	// Reported in every role: the files are compiled into the binary whether or
+	// not this process runs a ClickHouse, and it is the binary a drift check is
+	// comparing. See migrations.Inventory for why this is a file count rather
+	// than an applied count — that runner keeps no ledger.
+	routes.Schema.ClickHouseFiles, routes.Schema.ClickHouseLatest = migrations.Inventory()
 
 	// `monitor-core backfill-issues` copies the legacy ClickHouse issues table
 	// into MariaDB and exits without serving. Placed after both migration runners
@@ -318,6 +405,13 @@ func main() {
 	if err := bootstrap.EnsureZoneAndProject(db.SQL); err != nil {
 		log.Fatalf("❌ failed to bootstrap the tenancy registry: %v", err)
 	}
+
+	// Report rows filed under a project this zone does not have. A diagnostic,
+	// not a gate: the migrations backfill `project` with the literal 'default'
+	// because SQL cannot read the environment, so an install that overrode
+	// MON_DEFAULT_PROJECT ends up with dashboards and rules under a project
+	// nobody selects — present, uncorrupted, and invisible.
+	bootstrap.VerifyConfigTenancy(db.SQL)
 
 	// ---- Identity: CONTROL PLANE ONLY ----------------------------------------
 	//

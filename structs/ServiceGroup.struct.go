@@ -15,7 +15,13 @@ import "time"
 // rather than reported, so it silently matches nothing — which is why 122 stores
 // it in a JSON column and refuses the write instead.
 type ServiceGroup struct {
-	ID          string    `json:"id"`
+	ID string `json:"id"`
+	// Project is the tenant this group belongs to (migration 130). A group names
+	// SERVICES, and a service name is unique only within one project's event
+	// stream — two tenants each running an `api` is the ordinary case, so a
+	// zone-wide group would silently pull in the other tenant's service of the
+	// same name.
+	Project     string    `json:"project"`
 	Name        string    `json:"name"`
 	Description string    `json:"description"`
 	Services    string    `json:"services"`

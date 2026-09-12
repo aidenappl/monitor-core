@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/env"
+	"github.com/aidenappl/monitor-core/tools"
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -278,10 +280,15 @@ func backfillAlertRules(ctx context.Context) (Report, error) {
 	// `condition` is backticked: this is an unqualified use of a MariaDB reserved
 	// word. Without the backticks the statement is a syntax error that only
 	// appears when the cutover is actually run.
+	// `project` is stamped here for the reason migrations 127-133 backfill it with
+	// a literal: the column is NOT NULL with no default, so an INSERT that omits it
+	// fails errno 1364 and aborts the whole backfill on its first row. Unlike the
+	// migrations, Go CAN read the environment, so this uses the configured default
+	// rather than a hardcoded 'default'.
 	const insert = "INSERT INTO monitor.alert_rules " +
-		"(id, name, description, type, priority, query_filters, metric, field, `condition`, threshold, " +
+		"(id, project, name, description, type, priority, query_filters, metric, field, `condition`, threshold, " +
 		"evaluation_interval_seconds, for_seconds, cooldown_seconds, notification_channel_ids, enabled, created_at, updated_at) " +
-		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 
 	for rows.Next() {
 		var (
@@ -333,7 +340,7 @@ func backfillAlertRules(ctx context.Context) (Report, error) {
 			return report, err
 		}
 
-		if err := insertRow("monitor.alert_rules", id, insert, id, name, description, ruleType, priority, queryFilters,
+		if err := insertRow("monitor.alert_rules", id, insert, id, env.DefaultProjectSlug, name, description, ruleType, priority, queryFilters,
 			metric, field, condition, threshold, evalInterval, forSeconds, cooldown, channelIDs,
 			enabled == 1, chTime(createdAt), chTime(updatedAt)); err != nil {
 			return report, describeInsertError("alert_rules", id, err)
@@ -362,7 +369,17 @@ func backfillNotificationChannels(ctx context.Context) (Report, error) {
 	}
 	defer rows.Close()
 
-	const insert = "INSERT INTO monitor.notification_channels (id, name, type, config, created_at) VALUES (?, ?, ?, ?, ?)"
+	// Writes the CIPHERTEXT column, exactly as query.CreateNotificationChannel
+	// does. A cutover that kept writing plaintext would quietly reintroduce the
+	// disclosure migration 126 exists to close — on the one code path whose whole
+	// job is to carry old rows forward, which is where it would be least looked
+	// for. `config` is left NULL for the same reason it is there.
+	// `project` is stamped here for the reason migrations 127-133 backfill it with
+	// a literal: the column is NOT NULL with no default, so an INSERT that omits it
+	// fails errno 1364 and aborts the whole backfill on its first row. Unlike the
+	// migrations, Go CAN read the environment, so this uses the configured default
+	// rather than a hardcoded 'default'.
+	const insert = "INSERT INTO monitor.notification_channels (id, project, name, type, config, config_enc, created_at) VALUES (?, ?, ?, ?, NULL, ?, ?)"
 
 	for rows.Next() {
 		var id, name, chType, config string
@@ -386,7 +403,12 @@ func backfillNotificationChannels(ctx context.Context) (Report, error) {
 			return report, err
 		}
 
-		if err := insertRow("monitor.notification_channels", id, insert, id, name, chType, config, chTime(createdAt)); err != nil {
+		encrypted, err := tools.Encrypt(config)
+		if err != nil {
+			return report, fmt.Errorf("failed to encrypt config for notification_channels row %s: %w", id, err)
+		}
+
+		if err := insertRow("monitor.notification_channels", id, insert, id, env.DefaultProjectSlug, name, chType, encrypted, chTime(createdAt)); err != nil {
 			return report, describeInsertError("notification_channels", id, err)
 		}
 		report.Copied++
@@ -411,7 +433,12 @@ func backfillServiceGroups(ctx context.Context) (Report, error) {
 	}
 	defer rows.Close()
 
-	const insert = "INSERT INTO monitor.service_groups (id, name, description, services, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
+	// `project` is stamped here for the reason migrations 127-133 backfill it with
+	// a literal: the column is NOT NULL with no default, so an INSERT that omits it
+	// fails errno 1364 and aborts the whole backfill on its first row. Unlike the
+	// migrations, Go CAN read the environment, so this uses the configured default
+	// rather than a hardcoded 'default'.
+	const insert = "INSERT INTO monitor.service_groups (id, project, name, description, services, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
 
 	for rows.Next() {
 		var id, name, description, services string
@@ -429,7 +456,7 @@ func backfillServiceGroups(ctx context.Context) (Report, error) {
 			return report, err
 		}
 
-		if err := insertRow("monitor.service_groups", id, insert, id, name, description, services, chTime(createdAt), chTime(updatedAt)); err != nil {
+		if err := insertRow("monitor.service_groups", id, insert, id, env.DefaultProjectSlug, name, description, services, chTime(createdAt), chTime(updatedAt)); err != nil {
 			return report, describeInsertError("service_groups", id, err)
 		}
 		report.Copied++
@@ -476,9 +503,14 @@ func backfillNotificationPolicies(ctx context.Context) (Report, error) {
 	}
 	defer rows.Close()
 
+	// `project` is stamped here for the reason migrations 127-133 backfill it with
+	// a literal: the column is NOT NULL with no default, so an INSERT that omits it
+	// fails errno 1364 and aborts the whole backfill on its first row. Unlike the
+	// migrations, Go CAN read the environment, so this uses the configured default
+	// rather than a hardcoded 'default'.
 	const insert = "INSERT INTO monitor.notification_policies " +
-		"(id, name, description, position, matchers, channel_ids, continue_matching, repeat_interval_seconds, enabled, is_default, created_at, updated_at) " +
-		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+		"(id, project, name, description, position, matchers, channel_ids, continue_matching, repeat_interval_seconds, enabled, is_default, created_at, updated_at) " +
+		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 
 	for rows.Next() {
 		var (
@@ -504,7 +536,7 @@ func backfillNotificationPolicies(ctx context.Context) (Report, error) {
 			return report, err
 		}
 
-		if err := insertRow("monitor.notification_policies", id, insert, id, name, description, nextPosition, matchers, channelIDs,
+		if err := insertRow("monitor.notification_policies", id, insert, id, env.DefaultProjectSlug, name, description, nextPosition, matchers, channelIDs,
 			continueMatching == 1, repeatInterval, enabled == 1, isDefault == 1,
 			chTime(createdAt), chTime(updatedAt)); err != nil {
 			return report, describeInsertError("notification_policies", id, err)
@@ -535,7 +567,17 @@ func backfillDashboards(ctx context.Context) (Report, error) {
 	}
 	defer rows.Close()
 
-	const insert = "INSERT INTO monitor.dashboards (id, name, description, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
+	// `project` is stamped rather than copied: the legacy ClickHouse table
+	// predates the tenancy dimension entirely, so there is nothing in the source
+	// row to carry across. env.DefaultProjectSlug is the same reading migration
+	// 131 gives its own backfill — a row written before any project existed
+	// belongs to the default one — with the advantage that this path CAN read the
+	// environment, so an install that overrode MON_DEFAULT_PROJECT lands its rows
+	// where its keys already write instead of in a project nothing reads.
+	//
+	// It is not optional: the column is NOT NULL with no default, so an insert
+	// without it fails as errno 1364 on the first row and aborts the cutover.
+	const insert = "INSERT INTO monitor.dashboards (id, project, name, description, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
 
 	for rows.Next() {
 		var id, name, description, config string
@@ -552,7 +594,7 @@ func backfillDashboards(ctx context.Context) (Report, error) {
 		// config is copied verbatim, including an empty one. It is an opaque
 		// client-owned blob in a LONGTEXT — migration 123 argues why it is not a
 		// JSON column — so there is nothing here to validate or repair.
-		if err := insertRow("monitor.dashboards", id, insert, id, name, description, config, chTime(createdAt), chTime(updatedAt)); err != nil {
+		if err := insertRow("monitor.dashboards", id, insert, id, env.DefaultProjectSlug, name, description, config, chTime(createdAt), chTime(updatedAt)); err != nil {
 			return report, describeInsertError("dashboards", id, err)
 		}
 		report.Copied++
@@ -581,7 +623,9 @@ func backfillSavedViews(ctx context.Context) (Report, error) {
 	}
 	defer rows.Close()
 
-	const insert = "INSERT INTO monitor.saved_views (id, name, query_params, page, created_at) VALUES (?, ?, ?, ?, ?)"
+	// Stamped with the default project, for the reason backfillDashboards gives:
+	// the legacy rows predate tenancy, and the column is NOT NULL with no default.
+	const insert = "INSERT INTO monitor.saved_views (id, project, name, query_params, page, created_at) VALUES (?, ?, ?, ?, ?, ?)"
 
 	seen := map[string]bool{}
 	for rows.Next() {
@@ -601,7 +645,7 @@ func backfillSavedViews(ctx context.Context) (Report, error) {
 			page = "events"
 		}
 
-		if err := insertRow("monitor.saved_views", id, insert, id, name, queryParams, page, chTime(createdAt)); err != nil {
+		if err := insertRow("monitor.saved_views", id, insert, id, env.DefaultProjectSlug, name, queryParams, page, chTime(createdAt)); err != nil {
 			return report, describeInsertError("saved_views", id, err)
 		}
 		report.Copied++

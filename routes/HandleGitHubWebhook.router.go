@@ -59,6 +59,32 @@ type githubWebhookPayload struct {
 // and refreshes the chip; resolving stays a deliberate human or agent action.
 // GitHub itself only honours closing keywords on the default branch, and
 // silently resolving someone's issue is a surprising thing for a webhook to do.
+//
+// ---------------------------------------------------------------------------
+// TENANCY: this is the one handler in the service with NO project of its own.
+//
+// Every /v1 route resolves a tenant with requireProject, because a credential
+// names one. A GitHub delivery names owner/repo and nothing else, so there is no
+// requireProject here and there cannot be — which makes it worth stating exactly
+// which of its three database touches are cross-project and why each is sound.
+//
+//  1. query.ListIssueIDsForPR and query.UpdateIssueLinkState span every project,
+//     by design. monitor.issue_links is TenancyDerived (structs/tenancy.go): a
+//     link row exists only because somebody who could already read that issue
+//     created it, and the fact being written — this PR is now merged, titled
+//     this, by this author — is GitHub's, identical for every project that
+//     linked it. Scoping them would mean one delivery refreshing one tenant's
+//     chip and leaving the others stale, which is worse and no safer.
+//
+//  2. query.ListServicesForRepo spans every project because it must: the repo is
+//     the only key the delivery carries. It returns (project, service) PAIRS so
+//     what happens next can be scoped — see affectedServicesForIssue, which is
+//     where the tenant is finally pinned down, one issue at a time.
+//
+// The rule the whole handler follows: a lookup keyed by something GitHub knows
+// may cross projects; anything WRITTEN onto an issue must be narrowed to that
+// issue's own project first.
+// ---------------------------------------------------------------------------
 func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxWebhookBody))
 	if err != nil {
@@ -151,17 +177,36 @@ func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	dedupeKey := fmt.Sprintf("gh:%s/%s#%d:%s", owner, repo, number, entryType)
 	body_ := prTimelineBody(entryType, owner, repo, number, title)
 
-	// Which services this repo builds. Best-effort context on the entry: a merge
-	// in one repo can affect several services (auth-service-v1 and -v2 share a
-	// repo), and the reader of a timeline usually wants to know which. A failure
-	// here must not cost the entry itself.
-	affected, err := query.ListServicesForRepo(db.SQL, owner, repo)
+	// Which services this repo builds, and IN WHICH PROJECT each mapping lives.
+	// Best-effort context on the entry: a merge in one repo can affect several
+	// services (auth-service-v1 and -v2 share a repo), and the reader of a
+	// timeline usually wants to know which. A failure here must not cost the
+	// entry itself.
+	//
+	// This lookup is deliberately CROSS-PROJECT and cannot be otherwise: a
+	// delivery names owner/repo and nothing else, so there is no tenant to scope
+	// by at this point — which is why migration 133 leaves
+	// idx_service_repos_lookup (provider, owner, repo) alone while changing the
+	// primary key. The scoping happens one step later, per issue.
+	mapped, err := query.ListServicesForRepo(db.SQL, owner, repo)
 	if err != nil {
 		log.Printf("github webhook: failed to resolve services for %s/%s: %v", owner, repo, err)
-		affected = nil
+		mapped = nil
+	}
+
+	// Grouped by project so each issue can be annotated with ITS OWN project's
+	// services. Before 133 this was a flat []string, and a repository mapped in
+	// two projects put both tenants' service inventories on both tenants'
+	// timelines — one project's service names leaking into another's issue
+	// history, through a delivery neither of them can see or audit.
+	servicesByProject := map[string][]string{}
+	for _, m := range mapped {
+		servicesByProject[m.Project] = append(servicesByProject[m.Project], m.Service)
 	}
 
 	for _, issueID := range issueIDs {
+		affected := affectedServicesForIssue(db.SQL, issueID, servicesByProject)
+
 		if _, err := query.AppendTimelineEntry(db.SQL, query.AppendTimelineEntryRequest{
 			IssueID: issueID,
 			Type:    entryType,
@@ -187,6 +232,47 @@ func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeWebhookOK(w, fmt.Sprintf("updated %d issue(s)", len(issueIDs)))
+}
+
+// affectedServicesForIssue narrows a repository's mapped services to the ones
+// belonging to the SAME project as the issue about to be annotated.
+//
+// HOW THE PROJECT IS FOUND, given the delivery carries none. query.GetIssue
+// treats the project as part of the LOOKUP rather than as a check applied after
+// it, so an issue that belongs to another project reads as (nil, nil). Asking for
+// the issue once per candidate project therefore identifies its project by
+// construction: exactly one can return a row, because an issue id exists in
+// exactly one project. Map iteration order is unspecified and does not matter for
+// the same reason — there is no second candidate that could also match.
+//
+// The candidates are only the projects this repository is mapped in, which is one
+// in every install that has not split its zone and a handful at worst. This runs
+// once per linked issue on a webhook delivery, not on a read path.
+//
+// WHAT IT PREVENTS: `affected_services` is stored in the timeline entry's
+// metadata and rendered beside the merge. Passing every mapped service would show
+// project B's service names on project A's issue whenever both map the same
+// repository — the exact case migration 133's composite primary key was added to
+// make expressible.
+//
+// Returning nil is the normal answer when nothing matches: the repository may be
+// mapped in no project at all, or only in projects that own none of these issues.
+// The entry is still written — `affected_services` has always been decoration,
+// and losing it must not cost the timeline entry it decorates.
+func affectedServicesForIssue(engine db.Queryable, issueID string, servicesByProject map[string][]string) []string {
+	for project, services := range servicesByProject {
+		issue, err := query.GetIssue(engine, project, issueID)
+		if err != nil {
+			// Best-effort, like every other enrichment on this path: a failed
+			// probe costs the annotation, never the entry.
+			log.Printf("github webhook: failed to resolve issue %s in project %s: %v", issueID, project, err)
+			continue
+		}
+		if issue != nil {
+			return services
+		}
+	}
+	return nil
 }
 
 // timelineTypeForPRAction maps a pull_request action to a timeline entry type,

@@ -13,8 +13,14 @@ import (
 
 const notificationPoliciesTable = "monitor.notification_policies"
 
+// notificationPoliciesProjectColumn is the one string every scoped read of this
+// table binds against. Named once because it appears in two builders and, in
+// spelled-out form, in three hand-written statements below.
+const notificationPoliciesProjectColumn = "monitor.notification_policies.project"
+
 var notificationPolicyColumns = []string{
 	"monitor.notification_policies.id",
+	"monitor.notification_policies.project",
 	"monitor.notification_policies.name",
 	"monitor.notification_policies.description",
 	"monitor.notification_policies.position",
@@ -29,7 +35,7 @@ var notificationPolicyColumns = []string{
 }
 
 var notificationPolicyInsertColumns = []string{
-	"id", "name", "description", "position", "matchers", "channel_ids",
+	"id", "project", "name", "description", "position", "matchers", "channel_ids",
 	"continue_matching", "repeat_interval_seconds", "enabled", "is_default",
 	"created_at", "updated_at",
 }
@@ -48,7 +54,7 @@ type notificationPolicyScanner interface {
 func scanNotificationPolicy(row notificationPolicyScanner) (*structs.NotificationPolicy, error) {
 	var p structs.NotificationPolicy
 	if err := row.Scan(
-		&p.ID, &p.Name, &p.Description, &p.Position, &p.Matchers, &p.ChannelIDs,
+		&p.ID, &p.Project, &p.Name, &p.Description, &p.Position, &p.Matchers, &p.ChannelIDs,
 		&p.ContinueMatching, &p.RepeatIntervalSeconds, &p.Enabled, &p.IsDefault,
 		&p.CreatedAt, &p.UpdatedAt,
 	); err != nil {
@@ -57,16 +63,28 @@ func scanNotificationPolicy(row notificationPolicyScanner) (*structs.Notificatio
 	return &p, nil
 }
 
-// ListNotificationPolicies returns every policy in evaluation order.
+// ListNotificationPolicies returns one project's policies in evaluation order.
 //
 // The ORDER BY is the routing order alerts/router.go depends on, not a display
 // preference: it walks this slice top-down and stops at the first match unless
-// the policy sets continue_matching. `id ASC` is a tiebreaker that migration
-// 121's UNIQUE key now makes unreachable — it stays as the thing that keeps the
-// order deterministic if that key is ever widened to (project, position).
-func ListNotificationPolicies(engine db.Queryable) ([]structs.NotificationPolicy, error) {
+// the policy sets continue_matching. `id ASC` is the tiebreaker, and migration
+// 129 is the change that made it REACHABLE again rather than dead: the unique key
+// is (project, position) now, so two policies in different projects legitimately
+// share a position and only the id keeps this listing deterministic across them.
+// Within one project the key still forbids a tie.
+//
+// Scoping this is the load-bearing half of 129. Unscoped, a project's alert
+// routing was decided by every project's policies interleaved by position — the
+// first match wins and continue_matching is false by default, so another
+// tenant's policy at position 1 silently captured this tenant's alerts.
+func ListNotificationPolicies(engine db.Queryable, project string) ([]structs.NotificationPolicy, error) {
 	q := sq.Select(notificationPolicyColumns...).From(notificationPoliciesTable).
 		OrderBy("monitor.notification_policies.position ASC", "monitor.notification_policies.id ASC")
+
+	q, err := scopeAlerting(q, notificationPoliciesProjectColumn, project)
+	if err != nil {
+		return nil, err
+	}
 
 	qStr, args, err := q.ToSql()
 	if err != nil {
@@ -90,10 +108,17 @@ func ListNotificationPolicies(engine db.Queryable) ([]structs.NotificationPolicy
 	return policies, rows.Err()
 }
 
-// GetNotificationPolicy returns one policy by id, or (nil, nil) when there is none.
-func GetNotificationPolicy(engine db.Queryable, id string) (*structs.NotificationPolicy, error) {
+// GetNotificationPolicy returns one policy by id within a project, or (nil, nil)
+// when there is none. The project is part of the lookup, so another tenant's
+// policy reads as ABSENT rather than as forbidden.
+func GetNotificationPolicy(engine db.Queryable, project, id string) (*structs.NotificationPolicy, error) {
 	q := sq.Select(notificationPolicyColumns...).From(notificationPoliciesTable).
 		Where(sq.Eq{"monitor.notification_policies.id": id}).Limit(1)
+
+	q, err := scopeAlerting(q, notificationPoliciesProjectColumn, project)
+	if err != nil {
+		return nil, err
+	}
 
 	qStr, args, err := q.ToSql()
 	if err != nil {
@@ -143,7 +168,16 @@ type CreateNotificationPolicyRequest struct {
 // will fail on the unique key. That is a loud, retryable failure of a request
 // nobody is making concurrently on a fresh install, and closing it properly
 // needs a sentinel row this table has no other use for.
-func CreateNotificationPolicy(engine db.Queryable, req CreateNotificationPolicyRequest) (*structs.NotificationPolicy, error) {
+// The position is allocated WITHIN THE PROJECT (see nextPolicyPosition), which is
+// what migration 129 bought: before it, creating a policy here took the next slot
+// in a zone-global sequence and every other project's routing order moved.
+func CreateNotificationPolicy(engine db.Queryable, project string, req CreateNotificationPolicyRequest) (*structs.NotificationPolicy, error) {
+	// Checked first because the column is NOT NULL with no default (migration
+	// 129): an empty project reaches MariaDB as errno 1364 naming the column,
+	// where this names the request that had no tenant.
+	if project == "" {
+		return nil, ErrNoAlertingProject
+	}
 	if req.Name == "" {
 		return nil, fmt.Errorf("name is required")
 	}
@@ -151,6 +185,7 @@ func CreateNotificationPolicy(engine db.Queryable, req CreateNotificationPolicyR
 	now := time.Now().UTC()
 	p := structs.NotificationPolicy{
 		ID:                    uuid.New().String(),
+		Project:               project,
 		Name:                  req.Name,
 		Description:           req.Description,
 		Matchers:              req.Matchers,
@@ -199,7 +234,7 @@ func CreateNotificationPolicy(engine db.Queryable, req CreateNotificationPolicyR
 }
 
 func insertNotificationPolicy(engine db.Queryable, p structs.NotificationPolicy) (*structs.NotificationPolicy, error) {
-	pos, err := nextPolicyPosition(engine)
+	pos, err := nextPolicyPosition(engine, p.Project)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +242,7 @@ func insertNotificationPolicy(engine db.Queryable, p structs.NotificationPolicy)
 
 	qStr, args, err := sq.Insert(notificationPoliciesTable).
 		Columns(notificationPolicyInsertColumns...).
-		Values(p.ID, p.Name, p.Description, p.Position, p.Matchers, p.ChannelIDs,
+		Values(p.ID, p.Project, p.Name, p.Description, p.Position, p.Matchers, p.ChannelIDs,
 			p.ContinueMatching, p.RepeatIntervalSeconds, p.Enabled, p.IsDefault,
 			p.CreatedAt, p.UpdatedAt).
 		ToSql()
@@ -228,11 +263,17 @@ func insertNotificationPolicy(engine db.Queryable, p structs.NotificationPolicy)
 // … FOR UPDATE` on purpose: a locking read of one ordinary row is unambiguously
 // permitted, whereas locking clauses combined with aggregation are a corner of
 // the manual that is not worth betting a write path on. Same answer, no doubt.
-func nextPolicyPosition(engine db.Queryable) (int, error) {
-	const q = "SELECT position FROM monitor.notification_policies ORDER BY position DESC LIMIT 1 FOR UPDATE"
+// THE LOCK IS NOW PER PROJECT, which is both narrower and stronger. Narrower
+// because a create in one project no longer blocks a create in another. Stronger
+// because the number it returns is the next free slot in THIS project's routing
+// order — under the old zone-global read, a project whose highest position was 2
+// got position 9 because some other tenant had nine policies, leaving gaps that
+// made the ordering unreadable.
+func nextPolicyPosition(engine db.Queryable, project string) (int, error) {
+	const q = "SELECT position FROM monitor.notification_policies WHERE project = ? ORDER BY position DESC LIMIT 1 FOR UPDATE"
 
 	var max int
-	err := engine.QueryRow(q).Scan(&max)
+	err := engine.QueryRow(q, project).Scan(&max)
 	if err == sql.ErrNoRows {
 		return 1, nil
 	}
@@ -267,9 +308,10 @@ type UpdateNotificationPolicyRequest struct {
 	Enabled               bool   `json:"enabled"`
 }
 
-// UpdateNotificationPolicy applies the request to one policy and returns it.
-func UpdateNotificationPolicy(engine db.Queryable, id string, req UpdateNotificationPolicyRequest) (*structs.NotificationPolicy, error) {
-	existing, err := GetNotificationPolicy(engine, id)
+// UpdateNotificationPolicy applies the request to one policy within a project
+// and returns it.
+func UpdateNotificationPolicy(engine db.Queryable, project, id string, req UpdateNotificationPolicyRequest) (*structs.NotificationPolicy, error) {
+	existing, err := GetNotificationPolicy(engine, project, id)
 	if err != nil {
 		return nil, err
 	}
@@ -303,7 +345,12 @@ func UpdateNotificationPolicy(engine db.Queryable, id string, req UpdateNotifica
 		u = u.Set("repeat_interval_seconds", req.RepeatIntervalSeconds)
 	}
 
-	qStr, args, err := u.Where(sq.Eq{"id": id}).ToSql()
+	// `project` is in the UPDATE's own WHERE rather than trusted from the read
+	// above. A policy is a ROUTING instruction: retargeting another tenant's
+	// policy at channels you control redirects their alerts to you, which is
+	// worse than reading them. Read-then-write is not atomic and a future caller
+	// may skip the read — the reason DeleteAPIKey records.
+	qStr, args, err := u.Where(sq.Eq{"id": id, "project": project}).ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build sql query: %w", err)
 	}
@@ -311,7 +358,7 @@ func UpdateNotificationPolicy(engine db.Queryable, id string, req UpdateNotifica
 	if _, err := engine.Exec(qStr, args...); err != nil {
 		return nil, fmt.Errorf("failed to update notification policy: %w", err)
 	}
-	return GetNotificationPolicy(engine, id)
+	return GetNotificationPolicy(engine, project, id)
 }
 
 // DeleteNotificationPolicy removes one policy. A default policy is refused.
@@ -319,8 +366,15 @@ func UpdateNotificationPolicy(engine db.Queryable, id string, req UpdateNotifica
 // The vacated position is NOT closed up. Positions are an ORDER, not a rank, so
 // a gap changes nothing about routing — and compacting would mean rewriting
 // every following row under the unique key, i.e. a second reorder, on a delete.
-func DeleteNotificationPolicy(engine db.Queryable, id string) error {
-	existing, err := GetNotificationPolicy(engine, id)
+func DeleteNotificationPolicy(engine db.Queryable, project, id string) error {
+	if project == "" {
+		return ErrNoAlertingProject
+	}
+
+	// The read is for the is_default REFUSAL, not for the tenancy check — the
+	// project is in the DELETE's own WHERE below, so a caller that one day skips
+	// this read still cannot delete across tenants.
+	existing, err := GetNotificationPolicy(engine, project, id)
 	if err != nil {
 		return err
 	}
@@ -331,7 +385,8 @@ func DeleteNotificationPolicy(engine db.Queryable, id string) error {
 		return fmt.Errorf("cannot delete default policy")
 	}
 
-	qStr, args, err := sq.Delete(notificationPoliciesTable).Where(sq.Eq{"id": id}).ToSql()
+	qStr, args, err := sq.Delete(notificationPoliciesTable).
+		Where(sq.Eq{"id": id, "project": project}).ToSql()
 	if err != nil {
 		return fmt.Errorf("failed to build sql query: %w", err)
 	}
@@ -341,9 +396,9 @@ func DeleteNotificationPolicy(engine db.Queryable, id string) error {
 	return nil
 }
 
-// vacatePositionsSQL moves every policy's position into the negative half of the
-// range in ONE statement, so the positive 1..N range is free for the assignment
-// that follows.
+// vacatePositionsSQL moves every policy OF ONE PROJECT into the negative half of
+// the range in ONE statement, so that project's positive 1..N range is free for
+// the assignment that follows.
 //
 // THIS IS THE WHOLE TRICK, and it is why structs.NotificationPolicy.Position is
 // a signed int and migration 121 puts no CHECK on the column. InnoDB validates a
@@ -353,7 +408,20 @@ func DeleteNotificationPolicy(engine db.Queryable, id string) error {
 // image is disjoint from its domain (every stored position is >= 1), so this
 // statement can never violate the key, and afterwards no positive position
 // exists for the second phase to collide with.
-const vacatePositionsSQL = "UPDATE monitor.notification_policies SET position = -position"
+//
+// THE `WHERE project = ?` IS MANDATORY, and it is the one place in this file
+// where omitting the predicate does not merely widen a read — it CORRUPTS other
+// tenants. Without it, reordering project A negates every project's positions and
+// phase two only reassigns A's, leaving every other project's policies sitting at
+// negative positions forever: still ordered relative to each other, but ahead of
+// A's in any `ORDER BY position`, and unfixable except by a manual rewrite.
+//
+// Negation stays injective under the narrower key (project, position) that
+// migration 129 installs, because it never changes the project half of the pair.
+// A negated row can therefore collide with nothing — not with its own project's
+// remaining rows, which are all negative too by the time this statement returns,
+// and not with another project's, which are a different key.
+const vacatePositionsSQL = "UPDATE monitor.notification_policies SET position = -position WHERE project = ?"
 
 // ReorderNotificationPolicies rewrites the routing order.
 //
@@ -373,7 +441,10 @@ const vacatePositionsSQL = "UPDATE monitor.notification_policies SET position = 
 // sequential loop the way bootstrap.EnsureAdminUser does. The fallback there
 // degrades to two writes that might leave an orphan; the fallback here would be
 // the exact defect this function exists to remove.
-func ReorderNotificationPolicies(engine db.Queryable, orderedIDs []string) error {
+func ReorderNotificationPolicies(engine db.Queryable, project string, orderedIDs []string) error {
+	if project == "" {
+		return ErrNoAlertingProject
+	}
 	if len(orderedIDs) == 0 {
 		return fmt.Errorf("ids are required")
 	}
@@ -387,7 +458,7 @@ func ReorderNotificationPolicies(engine db.Queryable, orderedIDs []string) error
 	if err != nil {
 		return fmt.Errorf("failed to begin notification policy reorder: %w", err)
 	}
-	if err := reorderNotificationPoliciesTx(tx, orderedIDs); err != nil {
+	if err := reorderNotificationPoliciesTx(tx, project, orderedIDs); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -397,12 +468,17 @@ func ReorderNotificationPolicies(engine db.Queryable, orderedIDs []string) error
 	return nil
 }
 
-func reorderNotificationPoliciesTx(tx *sql.Tx, orderedIDs []string) error {
-	// Phase 0 — take the whole list under lock, in its current order. This is
-	// what keeps a concurrent create (which allocates max+1) or a second reorder
-	// from interleaving with the two rewrites below.
-	const lockAll = "SELECT id FROM monitor.notification_policies ORDER BY position ASC, id ASC FOR UPDATE"
-	rows, err := tx.Query(lockAll)
+func reorderNotificationPoliciesTx(tx *sql.Tx, project string, orderedIDs []string) error {
+	// Phase 0 — take THIS PROJECT's list under lock, in its current order. This
+	// is what keeps a concurrent create (which allocates max+1 within the same
+	// project) or a second reorder from interleaving with the two rewrites below.
+	//
+	// The project predicate also decides what `final` contains, and that is the
+	// tenancy check for the whole function: an id belonging to another tenant is
+	// simply not in `known`, so the validation below rejects it as "not found"
+	// rather than as forbidden — and it can never reach a statement.
+	const lockAll = "SELECT id FROM monitor.notification_policies WHERE project = ? ORDER BY position ASC, id ASC FOR UPDATE"
+	rows, err := tx.Query(lockAll, project)
 	if err != nil {
 		return fmt.Errorf("failed to read notification policy order: %w", err)
 	}
@@ -447,15 +523,20 @@ func reorderNotificationPoliciesTx(tx *sql.Tx, orderedIDs []string) error {
 		}
 	}
 
-	// Phase 1 — vacate the positive range (see vacatePositionsSQL).
-	if _, err := tx.Exec(vacatePositionsSQL); err != nil {
+	// Phase 1 — vacate this project's positive range (see vacatePositionsSQL).
+	if _, err := tx.Exec(vacatePositionsSQL, project); err != nil {
 		return fmt.Errorf("failed to stage notification policy positions: %w", err)
 	}
 
 	// Phase 2 — assign the new order. Every target is free.
+	//
+	// `AND project = ?` is redundant given `final` was built from the scoped
+	// lock above, and it is here anyway: this is a mutation, and the rule the
+	// rest of this file follows is that a mutation carries its own predicate
+	// rather than inheriting one from a read that a later edit may move.
 	for i, id := range final {
 		if _, err := tx.Exec(
-			"UPDATE monitor.notification_policies SET position = ? WHERE id = ?", i+1, id,
+			"UPDATE monitor.notification_policies SET position = ? WHERE id = ? AND project = ?", i+1, id, project,
 		); err != nil {
 			return fmt.Errorf("failed to reorder policy %s: %w", id, err)
 		}
@@ -463,36 +544,68 @@ func reorderNotificationPoliciesTx(tx *sql.Tx, orderedIDs []string) error {
 	return nil
 }
 
-// SeedDefaultNotificationPolicies inserts the four priority-routing defaults on a
-// fresh install.
+// SeedDefaultNotificationPolicies inserts the four priority-routing defaults for
+// ONE PROJECT on a fresh install.
 //
-// THE GATE IS "THE TABLE IS EMPTY", not "no default exists", and the change is
-// deliberate. The old condition was a proxy for "this is a fresh install", and it
-// holds only for as long as whatever populated the table happens to have carried
-// is_default = 1. cutover.BackfillConfig copies the four existing ClickHouse
-// defaults across with their own ids, so a backfilled install must never seed on
-// top of them; emptiness says that directly.
+// THE GATE IS "THIS PROJECT HAS NO POLICIES", not "the table is empty" and not
+// "no default exists". Both earlier gates were proxies for "this is a fresh
+// install", and under migration 129 the table holds every project's routing
+// order at once — so a table-wide count would mean the FIRST project to be set
+// up permanently blocks every later one from getting its defaults, and the later
+// project would boot with an empty routing table and no sign that anything was
+// skipped. cutover.BackfillConfig still copies the existing ClickHouse defaults
+// across with their own ids, and a project that already holds those must not be
+// seeded on top of — emptiness within the project says that directly.
 //
-// It does NOT make the cutover deploy order safe, and pretending otherwise would
-// be worse than saying so: if the new binary serves before the backfill runs, this
-// seeds four defaults into an empty table and the backfill then appends the four
-// ClickHouse originals after them — nothing collides, because the backfill
-// renumbers positions from MAX+1 — leaving eight policies, four of which match
-// every alert by priority and route it nowhere. AGENTS.md §8 carries the order
-// that avoids it and the two-line recovery if it happens anyway.
+// ⚠️ THE SEEDED POLICIES ARE WRITTEN `enabled = 0`, AND THAT IS THE POINT OF
+// THIS FUNCTION'S EXISTENCE RATHER THAN A DETAIL OF IT.
+//
+// They ship with EMPTY channel_ids — they always have — and alerts/router.go
+// treats "a policy matched" as reason enough to skip the rule's own
+// notification_channel_ids fallback. Enabled, these four match EVERY alert by
+// priority (P0/P1/P2/P3 covers the whole enum), carry continue_matching = false,
+// and route to nowhere. So a project that was seeded and never edited does not
+// merely lack routing — it actively SUPPRESSES the per-rule channels an operator
+// did configure, and nothing errors or logs. That is exactly the shape of the
+// live defect this change was written against: six enabled alert rules on the
+// deployed instance, every one with `notification_channel_ids: []`, alerting
+// evaluating correctly and notifying nobody.
+//
+// Two ways out were available and only one keeps the templates:
+//
+//   - DO NOT SEED non-default projects. Cheap, but it leaves the DEFAULT
+//     project — the one every existing install actually runs — with the
+//     suppressing set intact, and it makes the per-project gate above dead code
+//     for every project it excludes. It fixes the tenancy question and none of
+//     the routing one.
+//   - SEED THEM DISABLED. A disabled policy is skipped by the router's
+//     `if !policy.Enabled` continue, so policyMatched stays false and the rule's
+//     own channel list is honoured — which is the behaviour an operator who has
+//     configured channels and no policies expects. The four rows survive as a
+//     visible, fillable template: set the channel ids, flip enabled, and the
+//     routing table is what it always meant to be.
+//
+// The second is taken. It is the only one that also repairs the default project,
+// and the endpoints it changes are ones where the previous behaviour was silent
+// non-delivery rather than anything a caller could be depending on.
+//
+// EXISTING ROWS ARE NOT TOUCHED. The gate means this only ever runs for a
+// project with no policies at all, so an install that already seeded four
+// ENABLED defaults keeps them, along with whatever an operator has since put in
+// their channel_ids.
 //
 // The four rows go in as ONE statement so the set is all-or-nothing, and so two
 // processes booting together cannot interleave into a half-seeded list — the
-// loser fails on the unique key with nothing written.
-//
-// The seeded policies carry EMPTY channel_ids, which is how they have always
-// shipped and is load-bearing in a way that is easy to miss: alerts/router.go
-// treats "a policy matched" as reason enough to skip the rule's own
-// notification_channel_ids fallback, so these four match every alert by priority
-// and route it nowhere until an operator fills them in.
-func SeedDefaultNotificationPolicies(engine db.Queryable) error {
+// loser fails on the (project, position) unique key with nothing written.
+func SeedDefaultNotificationPolicies(engine db.Queryable, project string) error {
+	if project == "" {
+		return ErrNoAlertingProject
+	}
+
 	var count int
-	if err := engine.QueryRow("SELECT COUNT(*) FROM monitor.notification_policies").Scan(&count); err != nil {
+	if err := engine.QueryRow(
+		"SELECT COUNT(*) FROM monitor.notification_policies WHERE project = ?", project,
+	).Scan(&count); err != nil {
 		return fmt.Errorf("failed to count notification policies: %w", err)
 	}
 	if count > 0 {
@@ -513,8 +626,10 @@ func SeedDefaultNotificationPolicies(engine db.Queryable) error {
 
 	insert := sq.Insert(notificationPoliciesTable).Columns(notificationPolicyInsertColumns...)
 	for _, d := range defaults {
-		insert = insert.Values(uuid.New().String(), d.name, "", d.position, d.matchers,
-			"[]", false, uint32(0), true, true, now, now)
+		// enabled = false, is_default = true. The `false` in the enabled slot is
+		// the whole decision documented above — a template, not a live route.
+		insert = insert.Values(uuid.New().String(), project, d.name, "", d.position, d.matchers,
+			"[]", false, uint32(0), false, true, now, now)
 	}
 
 	qStr, args, err := insert.ToSql()

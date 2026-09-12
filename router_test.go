@@ -96,6 +96,7 @@ var deployedSurface = []string{
 	"GET /auth/sso/{slug}/login",
 	"GET /health",
 	"GET /ready",
+	"GET /version",
 	"GET /v1/alert-history",
 	"GET /v1/alert-rules",
 	"GET /v1/alert-rules/{id}",
@@ -317,7 +318,7 @@ func TestAppRegistersNothingItCannotServe(t *testing.T) {
 			t.Errorf("MON_ROLE=app does not register %q; the control plane owns identity", route)
 		}
 	}
-	for _, route := range []string{"GET /health", "GET /ready"} {
+	for _, route := range []string{"GET /health", "GET /ready", "GET /version"} {
 		if !app[route] {
 			t.Errorf("MON_ROLE=app does not register %q; probes must exist in every role", route)
 		}
@@ -341,7 +342,7 @@ func TestZoneRegistersNoIdentitySurface(t *testing.T) {
 			t.Errorf("MON_ROLE=zone does not register %q; the zone owns events, alerts and issues", route)
 		}
 	}
-	for _, route := range []string{"GET /health", "GET /ready"} {
+	for _, route := range []string{"GET /health", "GET /ready", "GET /version"} {
 		if !zone[route] {
 			t.Errorf("MON_ROLE=zone does not register %q; probes must exist in every role", route)
 		}

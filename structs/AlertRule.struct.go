@@ -23,7 +23,18 @@ import "time"
 // naming the field instead of errno 1265; the database is now the backstop
 // underneath them. Do the typed-enum pass on its own.
 type AlertRule struct {
-	ID          string `json:"id"`
+	ID string `json:"id"`
+	// Project is the tenant this rule belongs to (migration 127), and it is the
+	// field that CLOSED the evaluator's zone-wide gap: alerts/evaluator.go now
+	// stamps it onto the context before every aggregate, so a rule's threshold
+	// counts its own project's events rather than the whole zone's. Without a
+	// column here the timer had nothing to scope against and could only count
+	// everything — see the closed note at the top of alerts/evaluator.go.
+	//
+	// It is exposed on the wire so the alerting page can say whose rule it is.
+	// It is NOT settable through Create/Update: those take it from the request's
+	// credential, so a caller cannot file a rule into another tenant.
+	Project     string `json:"project"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Type        string `json:"type"`

@@ -2,6 +2,7 @@ package alerts
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -188,25 +189,81 @@ func TestAggQueryScopesWhenContextCarriesAProject(t *testing.T) {
 	}
 }
 
-// TestAggQueryStaysZoneWideForTheTimer pins the OTHER half, which is a decision
-// rather than an oversight: Evaluator.Run has a background context, no
-// credential and no project, and a rule's threshold is deliberately a count of
-// the whole zone. If this ever starts failing because the predicate went
-// unconditional, alert_rules needs a project column in the same change — see the
-// KNOWN GAP header.
-func TestAggQueryStaysZoneWideForTheTimer(t *testing.T) {
+// TestTimerAndTestEndpointBuildTheSameStatement IS THE REGRESSION TEST FOR THE
+// CLOSED GAP, and it is the most valuable assertion in this file.
+//
+// The two paths reach buildAggQuery differently and must not be allowed to
+// differ again. Evaluator.evaluateAll has a background context and stamps the
+// RULE's own project onto it (scope.WithProject); routes.HandleTestAlertRule
+// passes the request's context, which QueryAuthMiddleware already stamped with
+// the CREDENTIAL's project, and loads the rule through a project-scoped lookup
+// so the two are the same value.
+//
+// While they disagreed, POST /v1/alert-rules/{id}/test reported a number the
+// rule would never fire on — the endpoint an operator uses to check a threshold
+// answered a different question from the timer that enforces it. Asserting
+// STATEMENT EQUALITY rather than "both contain a predicate" is deliberate: a
+// future change that scopes one path with a different predicate shape, or binds
+// the project in a different position, passes a containment check and fails
+// this.
+func TestTimerAndTestEndpointBuildTheSameStatement(t *testing.T) {
 	withDefaultProject(t, "default")
 
-	sql, args, err := buildAggQuery(context.Background(), &structs.AlertRule{}, "toFloat64(count())", time.Unix(0, 0), time.Unix(60, 0))
+	rule := &structs.AlertRule{
+		Project:      "atlas",
+		QueryFilters: `[{"field":"service","operator":"eq","value":"atlas-api"}]`,
+	}
+	from, to := time.Unix(0, 0), time.Unix(60, 0)
+
+	// The timer: a background context carrying nothing, plus the rule's project.
+	timerSQL, timerArgs, err := buildAggQuery(
+		scope.WithProject(context.Background(), rule.Project), rule, "toFloat64(count())", from, to)
 	if err != nil {
-		t.Fatalf("buildAggQuery: %v", err)
+		t.Fatalf("timer buildAggQuery: %v", err)
 	}
 
-	if strings.Contains(sql, "project") {
-		t.Errorf("timer path acquired a project predicate with no project to scope to:\n\t%s", sql)
+	// The test endpoint: a request context the middleware stamped.
+	httpSQL, httpArgs, err := buildAggQuery(
+		scope.WithProject(context.Background(), "atlas"), rule, "toFloat64(count())", from, to)
+	if err != nil {
+		t.Fatalf("test-endpoint buildAggQuery: %v", err)
 	}
-	if len(args) != 2 {
-		t.Errorf("args = %v, want just the time range", args)
+
+	if timerSQL != httpSQL {
+		t.Errorf("the timer and the test endpoint build different statements for one rule:\n\ttimer: %s\n\thttp:  %s", timerSQL, httpSQL)
+	}
+	if !reflect.DeepEqual(timerArgs, httpArgs) {
+		t.Errorf("bound args differ: timer %v, http %v", timerArgs, httpArgs)
+	}
+	if !strings.Contains(timerSQL, "project = ?") {
+		t.Errorf("the timer path built an unscoped aggregate — the zone-wide gap is back:\n\t%s", timerSQL)
+	}
+	want := []interface{}{from, to, "atlas", "atlas-api"}
+	if !reflect.DeepEqual(timerArgs, want) {
+		t.Errorf("args = %v, want %v", timerArgs, want)
+	}
+}
+
+// TestAggQueryRefusesWithoutAProject pins that an unscoped aggregate is
+// UNCONSTRUCTABLE, not merely unusual.
+//
+// buildAggQuery used to carry an `errors.Is(err, scope.ErrNoProject)` arm that
+// swallowed the sentinel and continued zone-wide, because the timer genuinely
+// had no project to offer. It has one now, so the arm's only surviving effect
+// would be to let a future caller reach every tenant's numbers by forgetting to
+// supply a project — silently, since the result is a plausible float64 either
+// way. The predecessor of this test asserted the OPPOSITE and said so: "if this
+// ever starts failing because the predicate went unconditional, alert_rules
+// needs a project column in the same change". It got one.
+func TestAggQueryRefusesWithoutAProject(t *testing.T) {
+	withDefaultProject(t, "default")
+
+	_, _, err := buildAggQuery(context.Background(), &structs.AlertRule{}, "toFloat64(count())", time.Unix(0, 0), time.Unix(60, 0))
+	if err == nil {
+		t.Fatal("buildAggQuery with no project succeeded — an unscoped aggregate is constructable again")
+	}
+	if !errors.Is(err, scope.ErrNoProject) {
+		t.Errorf("err = %v, want scope.ErrNoProject so the caller can tell a wiring fault from bad input", err)
 	}
 }
 

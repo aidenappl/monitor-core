@@ -43,22 +43,23 @@ func TestReorderVacatesPositionsBeforeAssigning(t *testing.T) {
 	defer mockDB.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery("SELECT id FROM monitor.notification_policies ORDER BY position ASC, id ASC FOR UPDATE").
+	mock.ExpectQuery("SELECT id FROM monitor.notification_policies WHERE project = \\? ORDER BY position ASC, id ASC FOR UPDATE").
+		WithArgs("atlas").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("a").AddRow("b").AddRow("c"))
-	mock.ExpectExec("^UPDATE monitor.notification_policies SET position = -position$").
-		WillReturnResult(sqlmock.NewResult(0, 3))
-	mock.ExpectExec("UPDATE monitor.notification_policies SET position = \\? WHERE id = \\?").
-		WithArgs(int64(1), "c").WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("UPDATE monitor.notification_policies SET position = \\? WHERE id = \\?").
-		WithArgs(int64(2), "a").WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("UPDATE monitor.notification_policies SET position = \\? WHERE id = \\?").
-		WithArgs(int64(3), "b").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("^UPDATE monitor.notification_policies SET position = -position WHERE project = \\?$").
+		WithArgs("atlas").WillReturnResult(sqlmock.NewResult(0, 3))
+	mock.ExpectExec("UPDATE monitor.notification_policies SET position = \\? WHERE id = \\? AND project = \\?").
+		WithArgs(int64(1), "c", "atlas").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE monitor.notification_policies SET position = \\? WHERE id = \\? AND project = \\?").
+		WithArgs(int64(2), "a", "atlas").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE monitor.notification_policies SET position = \\? WHERE id = \\? AND project = \\?").
+		WithArgs(int64(3), "b", "atlas").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	// "b" is deliberately not named: a partial list is well-defined — the named
 	// ids lead, everything else keeps its relative order and follows — so the
 	// expectations above also pin that rule.
-	if err := ReorderNotificationPolicies(mockDB, []string{"c", "a"}); err != nil {
+	if err := ReorderNotificationPolicies(mockDB, "atlas", []string{"c", "a"}); err != nil {
 		t.Fatalf("ReorderNotificationPolicies: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -70,12 +71,30 @@ func TestReorderVacatesPositionsBeforeAssigning(t *testing.T) {
 // SQL itself: the staging pass must move positions into a range no live position
 // occupies. A rewrite to `position = position + 1000` would look equivalent and
 // is not — it collides with any policy already at a position 1000 higher.
+//
+// ITS WHERE CLAUSE MUST BE THE PROJECT AND NOTHING ELSE, and both halves of that
+// are load-bearing in opposite directions.
+//
+// Too NARROW — any further filter — and the pass leaves live positive positions
+// inside the project for phase two to collide with, which is the original
+// argument for having had no WHERE at all.
+//
+// Too WIDE — no project predicate, which is what this statement carried before
+// migration 129 — and reordering one project negates EVERY project's positions
+// while phase two only reassigns this one's. Every other tenant's policies are
+// then left at negative positions permanently: still ordered among themselves,
+// but ahead of this project's under any `ORDER BY position`, and unrecoverable
+// without a manual rewrite. That is corruption of rows the request never named,
+// which is worse than the cross-tenant reads the rest of this change is about.
 func TestVacateStatementCannotCollide(t *testing.T) {
 	if !strings.Contains(vacatePositionsSQL, "position = -position") {
 		t.Errorf("the staging pass must negate: %q", vacatePositionsSQL)
 	}
-	if strings.Contains(vacatePositionsSQL, "WHERE") {
-		t.Error("the staging pass must cover EVERY row — a WHERE clause leaves live positive positions for phase two to collide with")
+	if !strings.HasSuffix(vacatePositionsSQL, "WHERE project = ?") {
+		t.Errorf("the staging pass must be scoped to exactly one project and nothing else: %q", vacatePositionsSQL)
+	}
+	if strings.Count(vacatePositionsSQL, "?") != 1 {
+		t.Errorf("the staging pass binds one argument, the project: %q", vacatePositionsSQL)
 	}
 	if strings.Contains(vacatePositionsSQL, ";") {
 		t.Error("the staging pass must be a single statement")
@@ -94,14 +113,16 @@ func TestReorderRollsBackOnFailure(t *testing.T) {
 	defer mockDB.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery("SELECT id FROM monitor.notification_policies").
+	mock.ExpectQuery("SELECT id FROM monitor.notification_policies WHERE project = \\?").
+		WithArgs("atlas").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("a").AddRow("b"))
-	mock.ExpectExec("SET position = -position").WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectExec("SET position = \\? WHERE id = \\?").
-		WithArgs(int64(1), "b").WillReturnError(errSimulated)
+	mock.ExpectExec("SET position = -position WHERE project = \\?").
+		WithArgs("atlas").WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec("SET position = \\? WHERE id = \\? AND project = \\?").
+		WithArgs(int64(1), "b", "atlas").WillReturnError(errSimulated)
 	mock.ExpectRollback()
 
-	if err := ReorderNotificationPolicies(mockDB, []string{"b", "a"}); err == nil {
+	if err := ReorderNotificationPolicies(mockDB, "atlas", []string{"b", "a"}); err == nil {
 		t.Fatal("expected the reorder to fail")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -131,11 +152,12 @@ func TestReorderRejectsBadIDs(t *testing.T) {
 			defer mockDB.Close()
 
 			mock.ExpectBegin()
-			mock.ExpectQuery("SELECT id FROM monitor.notification_policies").
+			mock.ExpectQuery("SELECT id FROM monitor.notification_policies WHERE project = \\?").
+				WithArgs("atlas").
 				WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("a").AddRow("b"))
 			mock.ExpectRollback()
 
-			err = ReorderNotificationPolicies(mockDB, tt.ids)
+			err = ReorderNotificationPolicies(mockDB, "atlas", tt.ids)
 			if err == nil {
 				t.Fatal("expected an error")
 			}
@@ -169,7 +191,7 @@ func TestReorderRefusesWithoutATransaction(t *testing.T) {
 	}
 	defer tx.Rollback()
 
-	if err := ReorderNotificationPolicies(tx, []string{"a"}); err == nil {
+	if err := ReorderNotificationPolicies(tx, "atlas", []string{"a"}); err == nil {
 		t.Fatal("expected a refusal when the handle cannot start a transaction")
 	} else if !strings.Contains(err.Error(), "transaction") {
 		t.Errorf("error = %q, want it to say a transaction is required", err)
@@ -189,13 +211,14 @@ func TestCreateAllocatesPositionUnderLock(t *testing.T) {
 	defer mockDB.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery("SELECT position FROM monitor.notification_policies ORDER BY position DESC LIMIT 1 FOR UPDATE").
+	mock.ExpectQuery("SELECT position FROM monitor.notification_policies WHERE project = \\? ORDER BY position DESC LIMIT 1 FOR UPDATE").
+		WithArgs("atlas").
 		WillReturnRows(sqlmock.NewRows([]string{"position"}).AddRow(int64(4)))
 	mock.ExpectExec("INSERT INTO monitor.notification_policies").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
-	created, err := CreateNotificationPolicy(mockDB, CreateNotificationPolicyRequest{Name: "Payments"})
+	created, err := CreateNotificationPolicy(mockDB, "atlas", CreateNotificationPolicyRequest{Name: "Payments"})
 	if err != nil {
 		t.Fatalf("CreateNotificationPolicy: %v", err)
 	}
@@ -218,13 +241,14 @@ func TestCreateDefaultsJSONFields(t *testing.T) {
 	defer mockDB.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery("SELECT position FROM monitor.notification_policies").
+	mock.ExpectQuery("SELECT position FROM monitor.notification_policies WHERE project = \\?").
+		WithArgs("atlas").
 		WillReturnRows(sqlmock.NewRows([]string{"position"}))
 	mock.ExpectExec("INSERT INTO monitor.notification_policies").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
-	created, err := CreateNotificationPolicy(mockDB, CreateNotificationPolicyRequest{Name: "Payments"})
+	created, err := CreateNotificationPolicy(mockDB, "atlas", CreateNotificationPolicyRequest{Name: "Payments"})
 	if err != nil {
 		t.Fatalf("CreateNotificationPolicy: %v", err)
 	}
@@ -254,14 +278,15 @@ func TestSeedDefaultsOnlyWhenTableIsEmpty(t *testing.T) {
 		}
 		defer mockDB.Close()
 
-		mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM monitor.notification_policies").
+		mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM monitor.notification_policies WHERE project = \\?").
+			WithArgs("atlas").
 			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(int64(0)))
 		// One statement, four rows: the set is all-or-nothing, so two processes
 		// booting together cannot interleave into a half-seeded list.
 		mock.ExpectExec("^INSERT INTO monitor.notification_policies .* VALUES \\(.*\\),\\(.*\\),\\(.*\\),\\(.*\\)$").
 			WillReturnResult(sqlmock.NewResult(0, 4))
 
-		if err := SeedDefaultNotificationPolicies(mockDB); err != nil {
+		if err := SeedDefaultNotificationPolicies(mockDB, "atlas"); err != nil {
 			t.Fatalf("SeedDefaultNotificationPolicies: %v", err)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
@@ -278,10 +303,11 @@ func TestSeedDefaultsOnlyWhenTableIsEmpty(t *testing.T) {
 
 		// A table holding rows that are NOT defaults still blocks the seed. Under
 		// the old is_default gate this case would have seeded on top of them.
-		mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM monitor.notification_policies").
+		mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM monitor.notification_policies WHERE project = \\?").
+			WithArgs("atlas").
 			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(int64(3)))
 
-		if err := SeedDefaultNotificationPolicies(mockDB); err != nil {
+		if err := SeedDefaultNotificationPolicies(mockDB, "atlas"); err != nil {
 			t.Fatalf("SeedDefaultNotificationPolicies: %v", err)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
@@ -300,14 +326,15 @@ func TestPolicySelectIsOrderedByPosition(t *testing.T) {
 	}
 	defer mockDB.Close()
 
-	mock.ExpectQuery("ORDER BY monitor.notification_policies.position ASC").
+	mock.ExpectQuery("WHERE monitor.notification_policies.project = \\? ORDER BY monitor.notification_policies.position ASC").
+		WithArgs("atlas").
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "name", "description", "position", "matchers", "channel_ids",
+			"id", "project", "name", "description", "position", "matchers", "channel_ids",
 			"continue_matching", "repeat_interval_seconds", "enabled", "is_default",
 			"created_at", "updated_at",
 		}))
 
-	if _, err := ListNotificationPolicies(mockDB); err != nil {
+	if _, err := ListNotificationPolicies(mockDB, "atlas"); err != nil {
 		t.Fatalf("ListNotificationPolicies: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -328,19 +355,19 @@ func TestPolicyUpdateNeverTouchesPosition(t *testing.T) {
 
 	rows := func() *sqlmock.Rows {
 		return sqlmock.NewRows([]string{
-			"id", "name", "description", "position", "matchers", "channel_ids",
+			"id", "project", "name", "description", "position", "matchers", "channel_ids",
 			"continue_matching", "repeat_interval_seconds", "enabled", "is_default",
 			"created_at", "updated_at",
-		}).AddRow("p-1", "Payments", "", int64(2), "{}", "[]", false, int64(0), true, false, testTime, testTime)
+		}).AddRow("p-1", "atlas", "Payments", "", int64(2), "{}", "[]", false, int64(0), true, false, testTime, testTime)
 	}
 
 	mock.ExpectQuery("SELECT .* FROM monitor.notification_policies WHERE").WillReturnRows(rows())
-	mock.ExpectExec("^UPDATE monitor.notification_policies SET continue_matching = \\?, enabled = \\?, name = \\? WHERE id = \\?$").
-		WithArgs(false, true, "Payments EU", "p-1").
+	mock.ExpectExec("^UPDATE monitor.notification_policies SET continue_matching = \\?, enabled = \\?, name = \\? WHERE id = \\? AND project = \\?$").
+		WithArgs(false, true, "Payments EU", "p-1", "atlas").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT .* FROM monitor.notification_policies WHERE").WillReturnRows(rows())
 
-	if _, err := UpdateNotificationPolicy(mockDB, "p-1", UpdateNotificationPolicyRequest{
+	if _, err := UpdateNotificationPolicy(mockDB, "atlas", "p-1", UpdateNotificationPolicyRequest{
 		Name: "Payments EU", Enabled: true,
 	}); err != nil {
 		t.Fatalf("UpdateNotificationPolicy: %v", err)
@@ -392,10 +419,11 @@ func TestSeedDefaultPoliciesIsNoOpWhenRowsExist(t *testing.T) {
 	}
 	defer mockDB.Close()
 
-	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM monitor.notification_policies").
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM monitor.notification_policies WHERE project = \\?").
+		WithArgs("atlas").
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(4))
 
-	if err := SeedDefaultNotificationPolicies(mockDB); err != nil {
+	if err := SeedDefaultNotificationPolicies(mockDB, "atlas"); err != nil {
 		t.Fatalf("SeedDefaultNotificationPolicies: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -412,12 +440,13 @@ func TestSeedDefaultPoliciesSeedsWhenEmpty(t *testing.T) {
 	}
 	defer mockDB.Close()
 
-	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM monitor.notification_policies").
+	mock.ExpectQuery("SELECT COUNT\\(\\*\\) FROM monitor.notification_policies WHERE project = \\?").
+		WithArgs("atlas").
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectExec("INSERT INTO monitor.notification_policies").
 		WillReturnResult(sqlmock.NewResult(0, 4))
 
-	if err := SeedDefaultNotificationPolicies(mockDB); err != nil {
+	if err := SeedDefaultNotificationPolicies(mockDB, "atlas"); err != nil {
 		t.Fatalf("SeedDefaultNotificationPolicies: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

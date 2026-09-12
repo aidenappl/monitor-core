@@ -27,12 +27,29 @@ import (
 // So: if a handler here calls `alerts.`, the operation spans two databases. If it
 // calls `query.`, it is one MariaDB statement. Nothing in this file forwards
 // through a package for the sake of symmetry.
+//
+// EVERY HANDLER BELOW RESOLVES A PROJECT FIRST, through requireProject — the
+// package-level helper defined in routes/issues.go, deliberately not a second
+// copy. Migrations 127-130 gave all four alerting tables a `project` column, and
+// until then every one of these endpoints read and wrote across every tenant in
+// the zone: the rule list, the channel list (with its credentials), the routing
+// policies, the alert history, and the SSE stream.
+//
+// The refusal is a 500, not a 401 or 403, for the reason requireProject's own
+// header gives: every /v1 route sits behind QueryAuthMiddleware, which injects a
+// project on all three of its branches, so reaching that line means a route was
+// registered outside it — a wiring fault in this server, not a bad credential.
 
 // AlertNotifHub is the global alert notification hub (set from main.go)
 var AlertNotifHub *alerts.AlertHub
 
 func HandleListAlertRules(w http.ResponseWriter, r *http.Request) {
-	rules, err := alerts.ListRules(r.Context())
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	rules, err := alerts.ListRules(r.Context(), project)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to list alert rules", err)
 		return
@@ -44,13 +61,21 @@ func HandleListAlertRules(w http.ResponseWriter, r *http.Request) {
 }
 
 func HandleCreateAlertRule(w http.ResponseWriter, r *http.Request) {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
 	var req query.CreateAlertRuleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	created, err := query.CreateAlertRule(db.SQL, req)
+	// The project comes from the credential and is passed alongside the body,
+	// never read out of it — CreateAlertRuleRequest has no project field, so a
+	// caller cannot file a rule into another tenant.
+	created, err := query.CreateAlertRule(db.SQL, project, req)
 	if err != nil {
 		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
@@ -65,8 +90,14 @@ func HandleGetAlertRule(w http.ResponseWriter, r *http.Request) {
 		responder.Error(w, http.StatusBadRequest, "id is required")
 		return
 	}
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
 
-	rule, err := alerts.GetRule(r.Context(), id)
+	// A rule in another project reads as ABSENT and therefore 404s here, rather
+	// than 403ing — the caller cannot learn that the id exists.
+	rule, err := alerts.GetRule(r.Context(), project, id)
 	if err != nil {
 		responder.Error(w, http.StatusNotFound, "alert rule not found")
 		return
@@ -82,13 +113,18 @@ func HandleUpdateAlertRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
 	var req query.UpdateAlertRuleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	updated, err := query.UpdateAlertRule(db.SQL, id, req)
+	updated, err := query.UpdateAlertRule(db.SQL, project, id, req)
 	if err != nil {
 		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
@@ -104,7 +140,12 @@ func HandleDeleteAlertRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := alerts.DeleteRule(r.Context(), id); err != nil {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	if err := alerts.DeleteRule(r.Context(), project, id); err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to delete alert rule", err)
 		return
 	}
@@ -119,7 +160,16 @@ func HandleTestAlertRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ruleWithState, err := alerts.GetRule(r.Context(), id)
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	// Scoped load, then evaluate on the REQUEST's context. That pairing is what
+	// makes the test endpoint report the same number the timer fires on: the
+	// rule can only be one this project owns, so its own project and the
+	// caller's are the same, and both paths reach the same scoped aggregate.
+	ruleWithState, err := alerts.GetRule(r.Context(), project, id)
 	if err != nil {
 		responder.Error(w, http.StatusNotFound, "alert rule not found")
 		return
@@ -156,7 +206,12 @@ func HandleListAlertHistory(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	history, err := alerts.ListHistory(r.Context(), ruleID, limit, offset)
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	history, err := alerts.ListHistory(r.Context(), project, ruleID, limit, offset)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to list alert history", err)
 		return
@@ -168,7 +223,12 @@ func HandleListAlertHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func HandleListNotificationChannels(w http.ResponseWriter, r *http.Request) {
-	channels, err := query.ListNotificationChannels(db.SQL)
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	channels, err := query.ListNotificationChannels(db.SQL, project)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to list notification channels", err)
 		return
@@ -177,13 +237,18 @@ func HandleListNotificationChannels(w http.ResponseWriter, r *http.Request) {
 }
 
 func HandleCreateNotificationChannel(w http.ResponseWriter, r *http.Request) {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
 	var req query.CreateNotificationChannelRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	created, err := query.CreateNotificationChannel(db.SQL, req)
+	created, err := query.CreateNotificationChannel(db.SQL, project, req)
 	if err != nil {
 		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
@@ -199,7 +264,12 @@ func HandleDeleteNotificationChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := query.DeleteNotificationChannel(db.SQL, id); err != nil {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	if _, err := query.DeleteNotificationChannel(db.SQL, project, id); err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to delete notification channel", err)
 		return
 	}
@@ -214,7 +284,15 @@ func HandleTestNotificationChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ch, err := query.GetNotificationChannel(db.SQL, id)
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	// Scoped, and this is the endpoint where it matters most: it SENDS through
+	// the channel's stored credentials. Unscoped, one tenant could fire test
+	// pages into another tenant's PagerDuty service by id alone.
+	ch, err := query.GetNotificationChannel(db.SQL, project, id)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to fetch notification channel", err)
 		return
@@ -246,7 +324,20 @@ func HandleStreamAlerts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sub := AlertNotifHub.Subscribe()
+	// Resolved BEFORE the SSE headers go out, so the refusal is still an
+	// ordinary JSON error response rather than a half-opened event stream.
+	//
+	// The project is SERVER-DERIVED and there is no query parameter that reaches
+	// it, the rule routes/stream.go states for the event tail. Before this,
+	// Subscribe took no filter and every subscriber received every rule's state
+	// changes — rule names and the messages built from them, live, with no
+	// stored query left behind to notice it by.
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	sub := AlertNotifHub.Subscribe(project)
 	if sub == nil {
 		http.Error(w, "too many concurrent subscribers", http.StatusServiceUnavailable)
 		return
@@ -266,7 +357,7 @@ func HandleStreamAlerts(w http.ResponseWriter, r *http.Request) {
 
 	flusher.Flush()
 
-	log.Printf("alert SSE subscriber connected: %s", sub.ID)
+	log.Printf("alert SSE subscriber connected: %s (project: %s)", sub.ID, project)
 
 	keepalive := time.NewTicker(15 * time.Second)
 	defer keepalive.Stop()
@@ -299,7 +390,12 @@ func HandleStreamAlerts(w http.ResponseWriter, r *http.Request) {
 // ─── Service Groups ───
 
 func HandleListServiceGroups(w http.ResponseWriter, r *http.Request) {
-	groups, err := query.ListServiceGroups(db.SQL)
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	groups, err := query.ListServiceGroups(db.SQL, project)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to list service groups", err)
 		return
@@ -308,12 +404,17 @@ func HandleListServiceGroups(w http.ResponseWriter, r *http.Request) {
 }
 
 func HandleCreateServiceGroup(w http.ResponseWriter, r *http.Request) {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
 	var req query.CreateServiceGroupRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	created, err := query.CreateServiceGroup(db.SQL, req)
+	created, err := query.CreateServiceGroup(db.SQL, project, req)
 	if err != nil {
 		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
@@ -327,12 +428,17 @@ func HandleUpdateServiceGroup(w http.ResponseWriter, r *http.Request) {
 		responder.Error(w, http.StatusBadRequest, "id is required")
 		return
 	}
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
 	var req query.UpdateServiceGroupRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	updated, err := query.UpdateServiceGroup(db.SQL, id, req)
+	updated, err := query.UpdateServiceGroup(db.SQL, project, id, req)
 	if err != nil {
 		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
@@ -346,7 +452,12 @@ func HandleDeleteServiceGroup(w http.ResponseWriter, r *http.Request) {
 		responder.Error(w, http.StatusBadRequest, "id is required")
 		return
 	}
-	if _, err := query.DeleteServiceGroup(db.SQL, id); err != nil {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	if _, err := query.DeleteServiceGroup(db.SQL, project, id); err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to delete service group", err)
 		return
 	}
@@ -356,7 +467,12 @@ func HandleDeleteServiceGroup(w http.ResponseWriter, r *http.Request) {
 // ─── Notification Policies ───
 
 func HandleListPolicies(w http.ResponseWriter, r *http.Request) {
-	policies, err := query.ListNotificationPolicies(db.SQL)
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	policies, err := query.ListNotificationPolicies(db.SQL, project)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to list notification policies", err)
 		return
@@ -365,12 +481,17 @@ func HandleListPolicies(w http.ResponseWriter, r *http.Request) {
 }
 
 func HandleCreatePolicy(w http.ResponseWriter, r *http.Request) {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
 	var req query.CreateNotificationPolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	created, err := query.CreateNotificationPolicy(db.SQL, req)
+	created, err := query.CreateNotificationPolicy(db.SQL, project, req)
 	if err != nil {
 		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
@@ -384,7 +505,12 @@ func HandleGetPolicy(w http.ResponseWriter, r *http.Request) {
 		responder.Error(w, http.StatusBadRequest, "id is required")
 		return
 	}
-	policy, err := query.GetNotificationPolicy(db.SQL, id)
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	policy, err := query.GetNotificationPolicy(db.SQL, project, id)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to fetch notification policy", err)
 		return
@@ -402,12 +528,17 @@ func HandleUpdatePolicy(w http.ResponseWriter, r *http.Request) {
 		responder.Error(w, http.StatusBadRequest, "id is required")
 		return
 	}
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
 	var req query.UpdateNotificationPolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	updated, err := query.UpdateNotificationPolicy(db.SQL, id, req)
+	updated, err := query.UpdateNotificationPolicy(db.SQL, project, id, req)
 	if err != nil {
 		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
@@ -421,7 +552,12 @@ func HandleDeletePolicy(w http.ResponseWriter, r *http.Request) {
 		responder.Error(w, http.StatusBadRequest, "id is required")
 		return
 	}
-	if err := query.DeleteNotificationPolicy(db.SQL, id); err != nil {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	if err := query.DeleteNotificationPolicy(db.SQL, project, id); err != nil {
 		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -429,6 +565,11 @@ func HandleDeletePolicy(w http.ResponseWriter, r *http.Request) {
 }
 
 func HandleReorderPolicies(w http.ResponseWriter, r *http.Request) {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
 	var body struct {
 		IDs []string `json:"ids"`
 	}
@@ -440,7 +581,10 @@ func HandleReorderPolicies(w http.ResponseWriter, r *http.Request) {
 		responder.Error(w, http.StatusBadRequest, "ids are required")
 		return
 	}
-	if err := query.ReorderNotificationPolicies(db.SQL, body.IDs); err != nil {
+	// An id naming another tenant's policy is rejected as "not found" inside the
+	// transaction rather than reordered — the reorder's locking read is itself
+	// project-scoped, so a foreign id is never in the candidate set.
+	if err := query.ReorderNotificationPolicies(db.SQL, project, body.IDs); err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to reorder policies", err)
 		return
 	}

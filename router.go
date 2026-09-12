@@ -59,6 +59,13 @@ func buildRouter(role env.Role) *mux.Router {
 	r.HandleFunc("/health", routes.HealthHandler).Methods(http.MethodGet)
 	r.HandleFunc("/ready", routes.ReadyHandler).Methods(http.MethodGet)
 
+	// /version rides beside them, in every role and unauthenticated, for the
+	// same reason: it is what makes fleet drift answerable. CI redeploys one
+	// container, so a zone can sit any number of commits and migrations behind
+	// the control plane — and before this endpoint nothing, anywhere, reported a
+	// build sha or a schema count.
+	r.HandleFunc("/version", routes.VersionHandler).Methods(http.MethodGet)
+
 	// ---- Control plane (MON_ROLE=app or both) --------------------------------
 	//
 	// Identity. Every route here either mints a Monitor session or is reached

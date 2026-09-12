@@ -16,8 +16,13 @@ import "time"
 // There is no UpdatedAt because there is no update path — a view is created and
 // deleted, never edited. QueryParams is an opaque, client-owned blob for the same
 // reason Dashboard.Config is.
+// Project is the tenant the view belongs to (migration 132). The wire contract
+// GAINS this field rather than changing one: monitor-web still sees every key it
+// read before, so an older bundle keeps working while a newer one can show which
+// project a view came from.
 type SavedView struct {
 	ID          string    `json:"id"`
+	Project     string    `json:"project"`
 	Name        string    `json:"name"`
 	QueryParams string    `json:"query_params"`
 	Page        string    `json:"page"`

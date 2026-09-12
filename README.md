@@ -22,7 +22,8 @@ written by machines, appended at volume and expired by a TTL: `events`,
 `issue_occurrences_daily`, `alert_states`, `alert_history`. MariaDB holds rows a human
 edits and whose correctness depends on constraints: users, api keys, zones/projects,
 issues, service→repo mappings, and — since migrations 119-124 — alert rules, notification
-channels, notification policies, service groups, dashboards and saved views. See
+channels, notification policies, service groups, dashboards and saved views, all seven
+project-scoped since 127-133. See
 [AGENTS.md](AGENTS.md) §6 *Stores — configuration vs facts* for the argument and for the
 two production defects that produced it.
 
@@ -628,10 +629,10 @@ verified. Full details in [AGENTS.md](./AGENTS.md) §6.
 | `MON_CRYPTO_KEY`      | *(dev default)*  | **Exactly 32 bytes** — AES-256-GCM key for SSO secrets/tokens; **prod must override** |
 | `MON_COOKIE_DOMAIN`   | ``               | Domain set on the `mon-*` cookies             |
 | `MON_COOKIE_INSECURE` | `false`          | `true` for local dev: drops `Secure`, allows dev-default secrets |
-| `MON_PUBLIC_URL`      | `https://monitor.appleby.cloud` | Origin used to build each SSO `redirect_uri`; must match the IdP registration |
+| `MON_PUBLIC_URL`      | *(none — required)* | This process's own public origin. Builds each SSO `redirect_uri` (must match the IdP registration) **and** seeds a fresh zone's `ingest_url`/`query_url`. Previously defaulted to the control plane's URL, which let a zone register a row pointing at the wrong box |
 | `MON_ADMIN_EMAIL` / `MON_ADMIN_PASSWORD` | `` | Seed the first admin on a fresh DB; empty = no seed |
 | `MON_ALLOW_REGISTRATION` | `false`       | Gates `POST /auth/register` (self-registration) |
-| `MON_ZONE_SLUG`       | `trailblaze`     | Slug of the single zone seeded at boot. Slugs are immutable — changing it later seeds a second zone, it does not rename the first |
+| `MON_ZONE_SLUG`       | `trailblaze`     | The zone this process **is**. Required on `MON_ROLE=zone`: a data plane that inherits the fallback seeds a second zone under the control plane's name and reports it on `/health`. Slugs are immutable — changing it later seeds a new zone, it does not rename the first |
 | `MON_DEFAULT_PROJECT` | `default`        | Slug of the project seeded inside that zone; every API key binds to it, the env master key stamps events with it, and it is the project the master key and dashboard sessions **read**. Also the only project whose reads still match pre-006 events (see Tenancy). **Not boot-only — do not change it on a running install:** it is read on every request, query, streamed event and error fingerprint, and repointing it hides every event the manual backfill has not stamped |
 
 ### Roles — the two planes
@@ -653,8 +654,13 @@ process is running.
 - **A typo stops the boot.** `MON_ROLE=zonr` is refused by name rather than quietly
   defaulting — a silent fallback would run the control plane on a host meant to be a zone.
 - The resolved role is logged once at startup and reported by `GET /health`.
-- Splitting the planes across hosts needs more than this switch (config distribution and
-  per-zone credentials are not built); today `both` is the supported topology.
+- **Two zones run today.** `trailblaze` is `MON_ROLE=both` (it is the control plane *and*
+  its own zone); `appleby` is `MON_ROLE=zone`. What is still not built is cross-zone
+  *federation* — the control plane can probe a zone's `/health` and nothing else, so a
+  zone's projects, keys, alert rules and dashboards are managed by talking to that zone
+  directly. Standing up a zone additionally requires: `MON_ZONE_SLUG` and `MON_PUBLIC_URL`
+  set explicitly, a `MON_JWT_SIGNING_KEY` byte-identical to the control plane's, its own
+  `MONITOR_API_KEY`, and a manual `GRANT ALL PRIVILEGES ON monitor.*` before the first boot.
 
 Full per-subsystem breakdown in [AGENTS.md](AGENTS.md) §6 *Roles — the two planes*.
 
@@ -740,11 +746,35 @@ every id-addressed read and the update's own `WHERE` all carry the caller's proj
 issue row is not metadata — it holds the error `message` taken off the event — so the
 listing is scoped for the same reason the events behind it are.
 
-**Known gap, deliberate:** **timer-driven** alert evaluation is zone-wide — `Evaluator.Run`
-has no request and therefore no project, so a rule's threshold counts the whole instance
-(a rule can opt in with a `project` filter). The HTTP test endpoint
-(`POST /v1/alert-rules/{id}/test`) *does* have a request context and **is** scoped, so the
-two can report different numbers once a second project exists. Details in `AGENTS.md` §6.
+The alerting configuration is scoped the same way again. Migrations 127-130 gave
+`alert_rules`, `notification_channels`, `notification_policies` and `service_groups` a
+`project`, and `migrations/007_alert_tables.sql` gave the two ClickHouse alerting tables one
+— so the rule list, the channel list (which holds credentials), the routing policies, the
+alert history and the alert SSE stream are all per project. The one deliberate exception is
+`query.ListEnabledAlertRules`, which the evaluator uses and which must span every project.
+
+**Closed gap:** timer-driven alert evaluation used to be zone-wide — `Evaluator.Run` has no
+request and therefore no project, so a rule's threshold counted the whole instance while the
+HTTP test endpoint (`POST /v1/alert-rules/{id}/test`) reported the caller's project alone.
+With `alert_rules.project` the evaluator stamps each rule's own project per evaluation, and
+the unscoped fall-through is deleted, so the two paths now build an identical statement.
+Details in `AGENTS.md` §6.
+
+## Runbooks
+
+Procedures that touch live data or the registry — each irreversible or hard to
+unpick, and each written because doing it from memory went badly at least once:
+
+| Runbook | |
+|---|---|
+| [Register a zone's project](docs/RUNBOOKS.md#1-register-a-zones-project-in-the-control-plane-registry) | ⚠️ has a hard precondition — read it first |
+| [Backfill `events.project`](docs/RUNBOOKS.md#2-backfill-eventsproject) | 1.69M rows; verification is not a row count |
+| [Trailblaze's empty registry row](docs/RUNBOOKS.md#3-trailblazes-empty-registry-row) | currently blocked, and why |
+| [Standing up a new zone](docs/RUNBOOKS.md#4-standing-up-a-new-zone) | the eleven steps, with the undocumented ones marked |
+
+Before any of them, `monitor-core check-env` runs the same preflight checks the
+boot enforces — from the same code path, so the two cannot disagree — and works
+against a stack that does not exist yet.
 
 ## Limits
 
@@ -787,7 +817,7 @@ monitor-core/
   db/
     clickhouse.go             # ClickHouse connection and batch writer (events)
     sql.go                    # MariaDB connection (db.SQL), db.Queryable, db.RunMigrations
-    migrations/               # MariaDB DDL: identity + tenancy + issues + alert/dashboard config (100_users … 124_saved_views)
+    migrations/               # MariaDB DDL: identity + tenancy + issues + alert/dashboard config (100_users … 133_service_repos_project)
   env/env.go                  # Environment configuration + RequireProductionSecrets guard
   env/role.go                 # MON_ROLE: the Role type (app/zone/both) and the fail-fast RequireValidRole guard
   jwt/jwt.go                  # Monitor-owned HS512 access/refresh JWTs (alg-pinned)

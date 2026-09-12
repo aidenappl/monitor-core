@@ -17,11 +17,25 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Copy source code
 COPY . .
 
+# Build identity, stamped into the binary and reported by GET /version.
+#
+# Optional and additive: unset, the build still succeeds and buildinfo falls back
+# to the VCS data the Go toolchain embeds. CI passes them so a deployed image can
+# be matched to a commit — which nothing could do before, and which is what makes
+# "is zone X behind?" answerable when CI redeploys only one container.
+ARG GIT_SHA=""
+ARG GIT_REF=""
+ARG BUILD_TIME=""
+
 # Build the binary with cache
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -ldflags="-w -s" -o /app/monitor-core .
+    go build -ldflags="-w -s \
+      -X github.com/aidenappl/monitor-core/buildinfo.Commit=${GIT_SHA} \
+      -X github.com/aidenappl/monitor-core/buildinfo.Version=${GIT_REF} \
+      -X github.com/aidenappl/monitor-core/buildinfo.BuildTime=${BUILD_TIME}" \
+    -o /app/monitor-core .
 
 # ---- Runtime Stage ----
 FROM alpine:3.19 AS runner

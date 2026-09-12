@@ -13,8 +13,13 @@ import (
 
 const serviceGroupsTable = "monitor.service_groups"
 
+// serviceGroupsProjectColumn is the one string every scoped read of this table
+// binds against. Named once because it appears in three builders.
+const serviceGroupsProjectColumn = "monitor.service_groups.project"
+
 var serviceGroupColumns = []string{
 	"monitor.service_groups.id",
+	"monitor.service_groups.project",
 	"monitor.service_groups.name",
 	"monitor.service_groups.description",
 	"monitor.service_groups.services",
@@ -28,7 +33,7 @@ type serviceGroupScanner interface {
 
 func scanServiceGroup(row serviceGroupScanner) (*structs.ServiceGroup, error) {
 	var sg structs.ServiceGroup
-	if err := row.Scan(&sg.ID, &sg.Name, &sg.Description, &sg.Services, &sg.CreatedAt, &sg.UpdatedAt); err != nil {
+	if err := row.Scan(&sg.ID, &sg.Project, &sg.Name, &sg.Description, &sg.Services, &sg.CreatedAt, &sg.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &sg, nil
@@ -41,8 +46,20 @@ type CreateServiceGroupRequest struct {
 	Services    string `json:"services"`
 }
 
-// CreateServiceGroup inserts one named set of services.
-func CreateServiceGroup(engine db.Queryable, req CreateServiceGroupRequest) (*structs.ServiceGroup, error) {
+// CreateServiceGroup inserts one named set of services into a project.
+//
+// The project is a leading parameter rather than a request field, for the reason
+// CreateAlertRule gives — and it matters more here than it looks: the group's
+// MEMBERS are service names, which are unique only within one project's event
+// stream, so a group filed into the wrong tenant would resolve its members
+// against the wrong traffic.
+func CreateServiceGroup(engine db.Queryable, project string, req CreateServiceGroupRequest) (*structs.ServiceGroup, error) {
+	// Checked first because the column is NOT NULL with no default (migration
+	// 130): an empty project reaches MariaDB as errno 1364 naming the column,
+	// where this names the request that had no tenant.
+	if project == "" {
+		return nil, ErrNoAlertingProject
+	}
 	if req.Name == "" {
 		return nil, fmt.Errorf("name is required")
 	}
@@ -50,6 +67,7 @@ func CreateServiceGroup(engine db.Queryable, req CreateServiceGroupRequest) (*st
 	now := time.Now().UTC()
 	sg := structs.ServiceGroup{
 		ID:          uuid.New().String(),
+		Project:     project,
 		Name:        req.Name,
 		Description: req.Description,
 		Services:    req.Services,
@@ -64,8 +82,8 @@ func CreateServiceGroup(engine db.Queryable, req CreateServiceGroupRequest) (*st
 	}
 
 	qStr, args, err := sq.Insert(serviceGroupsTable).
-		Columns("id", "name", "description", "services", "created_at", "updated_at").
-		Values(sg.ID, sg.Name, sg.Description, sg.Services, sg.CreatedAt, sg.UpdatedAt).
+		Columns("id", "project", "name", "description", "services", "created_at", "updated_at").
+		Values(sg.ID, sg.Project, sg.Name, sg.Description, sg.Services, sg.CreatedAt, sg.UpdatedAt).
 		ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build sql query: %w", err)
@@ -77,7 +95,7 @@ func CreateServiceGroup(engine db.Queryable, req CreateServiceGroupRequest) (*st
 	return &sg, nil
 }
 
-// ListServiceGroups returns every group, by name.
+// ListServiceGroups returns one project's groups, by name.
 //
 // alerts.ResolveServiceGroups calls this on EVERY routed alert and then filters
 // in Go, because the membership test is "does this JSON array contain this
@@ -86,9 +104,14 @@ func CreateServiceGroup(engine db.Queryable, req CreateServiceGroupRequest) (*st
 // indexes on JSON array elements — so it would trade a readable Go loop over a
 // handful of rows for a full scan expressed in SQL. Left as it is; revisit if
 // groups ever number in the thousands.
-func ListServiceGroups(engine db.Queryable) ([]structs.ServiceGroup, error) {
+func ListServiceGroups(engine db.Queryable, project string) ([]structs.ServiceGroup, error) {
 	q := sq.Select(serviceGroupColumns...).From(serviceGroupsTable).
 		OrderBy("monitor.service_groups.name ASC")
+
+	q, err := scopeAlerting(q, serviceGroupsProjectColumn, project)
+	if err != nil {
+		return nil, err
+	}
 
 	qStr, args, err := q.ToSql()
 	if err != nil {
@@ -112,10 +135,17 @@ func ListServiceGroups(engine db.Queryable) ([]structs.ServiceGroup, error) {
 	return groups, rows.Err()
 }
 
-// GetServiceGroup returns one group by id, or (nil, nil) when there is none.
-func GetServiceGroup(engine db.Queryable, id string) (*structs.ServiceGroup, error) {
+// GetServiceGroup returns one group by id within a project, or (nil, nil) when
+// there is none. The project is part of the lookup, so a group belonging to
+// another tenant reads as ABSENT rather than as forbidden.
+func GetServiceGroup(engine db.Queryable, project, id string) (*structs.ServiceGroup, error) {
 	q := sq.Select(serviceGroupColumns...).From(serviceGroupsTable).
 		Where(sq.Eq{"monitor.service_groups.id": id}).Limit(1)
+
+	q, err := scopeAlerting(q, serviceGroupsProjectColumn, project)
+	if err != nil {
+		return nil, err
+	}
 
 	qStr, args, err := q.ToSql()
 	if err != nil {
@@ -145,9 +175,10 @@ type UpdateServiceGroupRequest struct {
 	Services    string `json:"services"`
 }
 
-// UpdateServiceGroup applies the request to one group and returns it.
-func UpdateServiceGroup(engine db.Queryable, id string, req UpdateServiceGroupRequest) (*structs.ServiceGroup, error) {
-	existing, err := GetServiceGroup(engine, id)
+// UpdateServiceGroup applies the request to one group within a project and
+// returns it.
+func UpdateServiceGroup(engine db.Queryable, project, id string, req UpdateServiceGroupRequest) (*structs.ServiceGroup, error) {
+	existing, err := GetServiceGroup(engine, project, id)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +210,10 @@ func UpdateServiceGroup(engine db.Queryable, id string, req UpdateServiceGroupRe
 		return existing, nil
 	}
 
-	qStr, args, err := u.Where(sq.Eq{"id": id}).ToSql()
+	// `project` is in the UPDATE's own WHERE rather than trusted from the read
+	// above, for the reason DeleteAPIKey records: read-then-write is not atomic
+	// and a future caller may skip the read.
+	qStr, args, err := u.Where(sq.Eq{"id": id, "project": project}).ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build sql query: %w", err)
 	}
@@ -187,7 +221,7 @@ func UpdateServiceGroup(engine db.Queryable, id string, req UpdateServiceGroupRe
 	if _, err := engine.Exec(qStr, args...); err != nil {
 		return nil, fmt.Errorf("failed to update service group: %w", err)
 	}
-	return GetServiceGroup(engine, id)
+	return GetServiceGroup(engine, project, id)
 }
 
 // DeleteServiceGroup removes one group and reports whether it existed.
@@ -196,8 +230,14 @@ func UpdateServiceGroup(engine db.Queryable, id string, req UpdateServiceGroupRe
 // matchPolicy then simply never matches it — the same dangling-reference
 // situation DeleteNotificationChannel describes, for the same reason: the
 // reference lives inside a JSON blob, so there is no foreign key to enforce.
-func DeleteServiceGroup(engine db.Queryable, id string) (bool, error) {
-	qStr, args, err := sq.Delete(serviceGroupsTable).Where(sq.Eq{"id": id}).ToSql()
+// The project is in the DELETE's own WHERE, with no read in front of it.
+func DeleteServiceGroup(engine db.Queryable, project, id string) (bool, error) {
+	if project == "" {
+		return false, ErrNoAlertingProject
+	}
+
+	qStr, args, err := sq.Delete(serviceGroupsTable).
+		Where(sq.Eq{"id": id, "project": project}).ToSql()
 	if err != nil {
 		return false, fmt.Errorf("failed to build sql query: %w", err)
 	}

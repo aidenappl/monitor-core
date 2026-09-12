@@ -49,6 +49,13 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Stamps the commit into the binary so GET /version can report which
+          # build a container is running. Nothing could answer that before, and
+          # because the deploy step below targets ONE container, a zone can sit
+          # arbitrarily far behind with no way to detect it.
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            GIT_REF=${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

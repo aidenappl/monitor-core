@@ -20,7 +20,15 @@ import "time"
 // negatives exist only inside that transaction and no other session can see
 // them.
 type NotificationPolicy struct {
-	ID          string `json:"id"`
+	ID string `json:"id"`
+	// Project is the tenant this routing rule belongs to (migration 129), and of
+	// the seven tables that gained a project it is the one where its absence did
+	// active harm rather than merely leaking a list: `position` carried a
+	// ZONE-GLOBAL unique key, so the routing table was one ordered list shared by
+	// every project and creating a policy in one renumbered another's routing
+	// order. The key is (project, position) now, so each project's ordering is
+	// its own.
+	Project     string `json:"project"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Position    int    `json:"position"`

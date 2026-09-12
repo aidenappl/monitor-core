@@ -8,6 +8,7 @@ import (
 	sq "github.com/Masterminds/squirrel"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/tools"
 	"github.com/google/uuid"
 )
 
@@ -17,11 +18,17 @@ var validNotificationChannelTypes = map[string]bool{
 
 const notificationChannelsTable = "monitor.notification_channels"
 
+// notificationChannelsProjectColumn is the one string every scoped read of this
+// table binds against. Named once because it appears in three builders.
+const notificationChannelsProjectColumn = "monitor.notification_channels.project"
+
 var notificationChannelColumns = []string{
 	"monitor.notification_channels.id",
+	"monitor.notification_channels.project",
 	"monitor.notification_channels.name",
 	"monitor.notification_channels.type",
 	"monitor.notification_channels.config",
+	"monitor.notification_channels.config_enc",
 	"monitor.notification_channels.created_at",
 }
 
@@ -29,11 +36,41 @@ type notificationChannelScanner interface {
 	Scan(dest ...interface{}) error
 }
 
+// scanNotificationChannel reads one row and resolves its config.
+//
+// BOTH columns are read because a row can legitimately carry either. Since
+// migration 126 every write goes to config_enc (AES-256-GCM, base64); `config`
+// is the legacy plaintext column, kept NULLable so it can stay empty. Preferring
+// the ciphertext and falling back to the plaintext means this works during the
+// window where the migration has run and an older binary is still writing — the
+// deploy-ordering hazard that exists whenever a zone lags the control plane.
+//
+// A DECRYPT FAILURE IS AN ERROR, NOT AN EMPTY CONFIG. Returning "" would produce
+// a channel that looks saved, renders in the list, and silently never delivers —
+// which is precisely the failure mode 120's header describes for an unparseable
+// config. The likeliest cause is the wrong MON_CRYPTO_KEY, and that is worth a
+// loud failure on read rather than a mystery at send time.
 func scanNotificationChannel(row notificationChannelScanner) (*structs.NotificationChannel, error) {
 	var c structs.NotificationChannel
-	if err := row.Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.CreatedAt); err != nil {
+	var legacy sql.NullString
+	var encrypted sql.NullString
+
+	if err := row.Scan(&c.ID, &c.Project, &c.Name, &c.Type, &legacy, &encrypted, &c.CreatedAt); err != nil {
 		return nil, err
 	}
+
+	switch {
+	case encrypted.Valid && encrypted.String != "":
+		plain, err := tools.Decrypt(encrypted.String)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt config for notification channel %s (is MON_CRYPTO_KEY the key it was written with?): %w", c.ID, err)
+		}
+		c.Config = plain
+	case legacy.Valid:
+		c.Config = legacy.String
+	}
+
+	c.ConfigSummary = structs.SummariseChannelConfig(c.Type, c.Config)
 	return &c, nil
 }
 
@@ -52,7 +89,18 @@ type CreateNotificationChannelRequest struct {
 // so the channel looked saved and silently never delivered. Migration 120's JSON
 // column would reject "" outright; defaulting keeps the create working while
 // making the stored value one the notifier can actually parse.
-func CreateNotificationChannel(engine db.Queryable, req CreateNotificationChannelRequest) (*structs.NotificationChannel, error) {
+//
+// The project is a leading parameter rather than a request field, for the reason
+// CreateAlertRule gives: which tenant owns a destination is decided by the
+// credential, never by the body. A caller that could choose it could file a
+// PagerDuty routing key into another tenant's channel list.
+func CreateNotificationChannel(engine db.Queryable, project string, req CreateNotificationChannelRequest) (*structs.NotificationChannel, error) {
+	// Checked first because the column is NOT NULL with no default (migration
+	// 128): an empty project reaches MariaDB as errno 1364 naming the column,
+	// where this names the request that had no tenant.
+	if project == "" {
+		return nil, ErrNoAlertingProject
+	}
 	if req.Name == "" {
 		return nil, fmt.Errorf("name is required")
 	}
@@ -62,6 +110,7 @@ func CreateNotificationChannel(engine db.Queryable, req CreateNotificationChanne
 
 	ch := structs.NotificationChannel{
 		ID:        uuid.New().String(),
+		Project:   project,
 		Name:      req.Name,
 		Type:      req.Type,
 		Config:    req.Config,
@@ -74,9 +123,18 @@ func CreateNotificationChannel(engine db.Queryable, req CreateNotificationChanne
 		return nil, err
 	}
 
+	// Encrypted BEFORE the insert and written to config_enc; `config` is left
+	// NULL. The plaintext exists only in ch.Config, which is json:"-" and
+	// therefore cannot be serialised back to the caller that just sent it.
+	encrypted, err := tools.Encrypt(ch.Config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt notification channel config: %w", err)
+	}
+	ch.ConfigSummary = structs.SummariseChannelConfig(ch.Type, ch.Config)
+
 	qStr, args, err := sq.Insert(notificationChannelsTable).
-		Columns("id", "name", "type", "config", "created_at").
-		Values(ch.ID, ch.Name, ch.Type, ch.Config, ch.CreatedAt).
+		Columns("id", "project", "name", "type", "config", "config_enc", "created_at").
+		Values(ch.ID, ch.Project, ch.Name, ch.Type, nil, encrypted, ch.CreatedAt).
 		ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build sql query: %w", err)
@@ -88,11 +146,21 @@ func CreateNotificationChannel(engine db.Queryable, req CreateNotificationChanne
 	return &ch, nil
 }
 
-// ListNotificationChannels returns every channel, newest first. Unpaginated for
-// the reason ListAlertRules gives.
-func ListNotificationChannels(engine db.Queryable) ([]structs.NotificationChannel, error) {
+// ListNotificationChannels returns one project's channels, newest first.
+// Unpaginated for the reason ListAlertRules gives.
+//
+// There is deliberately NO unscoped variant. Nothing in this service needs every
+// tenant's destinations at once — the router loads channels one id at a time,
+// within a rule's project — and an unscoped list here would put every zone
+// tenant's PagerDuty and Slack destinations behind one endpoint.
+func ListNotificationChannels(engine db.Queryable, project string) ([]structs.NotificationChannel, error) {
 	q := sq.Select(notificationChannelColumns...).From(notificationChannelsTable).
 		OrderBy("monitor.notification_channels.created_at DESC", "monitor.notification_channels.id ASC")
+
+	q, err := scopeAlerting(q, notificationChannelsProjectColumn, project)
+	if err != nil {
+		return nil, err
+	}
 
 	qStr, args, err := q.ToSql()
 	if err != nil {
@@ -116,11 +184,23 @@ func ListNotificationChannels(engine db.Queryable) ([]structs.NotificationChanne
 	return channels, rows.Err()
 }
 
-// GetNotificationChannel returns one channel by id, or (nil, nil) when there is
-// none. alerts/router.go calls this per matched channel on every routed alert.
-func GetNotificationChannel(engine db.Queryable, id string) (*structs.NotificationChannel, error) {
+// GetNotificationChannel returns one channel by id within a project, or
+// (nil, nil) when there is none. alerts/router.go calls this per matched channel
+// on every routed alert, with the RULE's project.
+//
+// The project is part of the lookup, and here that is not only a read boundary:
+// this row carries decrypted credentials (structs.NotificationChannel.Config),
+// and it is what POST /v1/notification-channels/{id}/test sends through. An
+// unscoped lookup would let one tenant fire a test notification into another
+// tenant's PagerDuty service by id alone.
+func GetNotificationChannel(engine db.Queryable, project, id string) (*structs.NotificationChannel, error) {
 	q := sq.Select(notificationChannelColumns...).From(notificationChannelsTable).
 		Where(sq.Eq{"monitor.notification_channels.id": id}).Limit(1)
+
+	q, err := scopeAlerting(q, notificationChannelsProjectColumn, project)
+	if err != nil {
+		return nil, err
+	}
 
 	qStr, args, err := q.ToSql()
 	if err != nil {
@@ -147,8 +227,16 @@ func GetNotificationChannel(engine db.Queryable, id string) (*structs.Notificati
 // cannot load is logged and skipped — so the failure is a silently undelivered
 // notification. A real FK is not available while those remain JSON arrays; the
 // fix is a join table, which is its own change.
-func DeleteNotificationChannel(engine db.Queryable, id string) (bool, error) {
-	qStr, args, err := sq.Delete(notificationChannelsTable).Where(sq.Eq{"id": id}).ToSql()
+// The project is in the DELETE's own WHERE, with no read in front of it — the
+// reason DeleteAPIKey records: read-then-write is not atomic and a future caller
+// may skip the read.
+func DeleteNotificationChannel(engine db.Queryable, project, id string) (bool, error) {
+	if project == "" {
+		return false, ErrNoAlertingProject
+	}
+
+	qStr, args, err := sq.Delete(notificationChannelsTable).
+		Where(sq.Eq{"id": id, "project": project}).ToSql()
 	if err != nil {
 		return false, fmt.Errorf("failed to build sql query: %w", err)
 	}

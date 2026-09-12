@@ -3,7 +3,6 @@ package alerts
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -14,55 +13,53 @@ import (
 	"github.com/aidenappl/monitor-core/structs"
 )
 
-// KNOWN GAP — TIMER-DRIVEN alert evaluation is ZONE-WIDE. Recorded 2026-09-06,
-// alongside the change that made every event READ project-scoped; narrowed the
-// same day, when the HTTP half of it turned out to be a live leak rather than a
-// gap.
+// CLOSED — TIMER-DRIVEN alert evaluation used to be ZONE-WIDE. Recorded
+// 2026-09-06 as a known gap, narrowed the same day when its HTTP half turned out
+// to be a live leak, and closed here by migration 127.
 //
-// TWO CALLERS, TWO ANSWERS. evaluateRuleState is reached from exactly two
-// places, and they differ in the only thing that matters here — whether a
-// request is on the other end of it:
+// WHAT IT WAS. evaluateRuleState is reached from two places, and they differed
+// in the only thing that mattered — whether a request was on the other end:
 //
-//   - Evaluator.Run, on a 15-second timer, with a background context. There is
-//     no request, no credential and therefore no project to scope against, and
-//     nothing is returned to a caller: the value becomes a firing decision and a
-//     notification. This is the gap, and it stays.
-//   - EvaluateRuleNow, from routes.HandleTestAlertRule (POST
-//     /v1/alert-rules/{id}/test), which passes r.Context() — an ordinary /v1
-//     request context that HAS been through QueryAuthMiddleware and DOES carry a
-//     project. Its aggregate is returned to the caller as JSON.
+//   - Evaluator.Run, on a 15-second timer, with a BACKGROUND context. There was
+//     no request, no credential and therefore no project, so the aggregate ran
+//     over the whole zone. A rule reading "more than 50 errors in a minute"
+//     counted every tenant's errors, and fired for a project whose own traffic
+//     was quiet.
+//   - EvaluateRuleNow, from routes.HandleTestAlertRule, which passes the
+//     request's context and IS scoped. That half was never a gap, it was an
+//     ORACLE: a rule carries a caller-chosen aggregation, field and filter set,
+//     so an admin key bound to project A could POST a rule and read back
+//     max(data.amount) or a contains-filtered count over EVERY project's events,
+//     one number at a time, with no row crossing the boundary to notice. It was
+//     closed first, on its own.
 //
-// The second was NOT a gap, it was an oracle. A rule carries a caller-chosen
-// aggregation, field and filter set, so an admin key bound to project A could
-// POST a rule and read back max(data.amount), count() or a contains-filtered
-// count over EVERY project's events — one number at a time, but a number of
-// someone else's data on demand, with no row ever crossing the boundary to
-// notice. The reasoning that used to sit here ("no rule can be made to read a
-// project its author cannot already read, because rule authorship is itself an
-// admin-scoped action") was true when admin meant global and became false the
-// moment middleware/query_auth.go decided that admin is a scope over VERBS and
-// never over tenants. It is restated here because that inversion is the exact
-// shape of the next mistake: a pre-tenancy safety argument that nobody
-// re-derived after tenancy landed.
+// The consequence the old note recorded — that a rule's TEST value and its
+// FIRING value legitimately disagreed, one scoped and one not — was a genuinely
+// bad property to ship: the endpoint an operator uses to check a rule reported
+// something other than what the rule does.
 //
-// So queryAggForRange now applies scope.ProjectPredicate WHENEVER the context
-// carries a project, and only falls through to zone-wide on the sentinel that
-// means "no request was involved". The timer keeps the documented behaviour; the
-// endpoint stops answering questions about other tenants.
+// WHAT CLOSED IT. alert_rules has a `project` column (migration 127), so the
+// timer now has a project without needing a request: evaluateAll stamps each
+// rule's OWN project onto the context before evaluating it, and every aggregate
+// underneath is scoped by scope.ProjectPredicate exactly as the HTTP path
+// already was. The two paths now build the same statement for the same rule,
+// which alerts/evaluator_test.go pins directly.
 //
-// CONSEQUENCE, ON PURPOSE: a rule's test result and the value that fires it can
-// now disagree once a second project exists — the test reports the caller's
-// project, the timer counts the zone. They agree today, because every credential
-// resolves to env.DefaultProjectSlug (migration 117 bound all existing keys to
-// it). A test that under-reports is a confusing false negative; a test that
-// reports another tenant's traffic is a disclosure, and only one of those is
-// worth keeping.
+// THE FALL-THROUGH IS GONE, and that is the part worth defending. buildAggQuery
+// used to swallow scope.ErrNoProject and continue unscoped, which meant an
+// unscoped aggregate was reachable by simply not having a project. It now
+// propagates, so an unscoped aggregate is UNCONSTRUCTABLE — a future caller that
+// forgets the project gets an error on the first evaluation instead of every
+// tenant's numbers, which is the same property scope.ProjectPredicate's own
+// header claims for the event reads.
 //
-// "project" also remains in structs.FilterColumns so a TIMER rule can opt in
-// with a query_filters entry of {"field":"project","value":"..."}. Close the
-// remaining half by giving alert_rules a project column, resolving it in
-// listEnabledRules, and passing it into queryAggForRange as the same predicate —
-// at which point the ctx-conditional below collapses into an unconditional one.
+// listEnabledRules stays UNSCOPED on purpose and is not a hole in this: the
+// evaluator must run every project's rules, and the tenancy is applied per rule
+// one layer down. query.ListEnabledAlertRules carries that argument in full.
+//
+// "project" also remains in structs.FilterColumns, so a rule can still narrow
+// itself further with a query_filters entry — it can no longer WIDEN itself,
+// because the predicate is ANDed on top.
 
 // Evaluator periodically evaluates alert rules
 type Evaluator struct {
@@ -107,12 +104,26 @@ func (e *Evaluator) evaluateAll(ctx context.Context) {
 	}
 
 	now := time.Now()
-	for _, rule := range rules {
+	for i := range rules {
+		rule := rules[i]
 		interval := time.Duration(rule.EvaluationIntervalSecs) * time.Second
 		if last, ok := e.lastEvaluated[rule.ID]; ok && interval > 0 && now.Sub(last) < interval {
 			continue
 		}
-		e.evaluateRule(ctx, &rule)
+
+		// THE ONE LINE THAT CLOSES THE ZONE-WIDE GAP. Run's context is a
+		// background one with no project, so without this every aggregate below
+		// counted the whole zone. The rule's own column is the authority here —
+		// there is no credential on this path to derive anything else from — and
+		// it is NOT NULL (migration 127), so a rule that reached this loop always
+		// carries one. Should it ever be empty, ProjectPredicate refuses and the
+		// rule fails loudly rather than quietly counting every tenant.
+		//
+		// Stamped PER RULE, not once for the loop: two rules in one pass
+		// routinely belong to different projects.
+		ruleCtx := scope.WithProject(ctx, rule.Project)
+
+		e.evaluateRule(ruleCtx, &rule)
 		e.lastEvaluated[rule.ID] = now
 	}
 }
@@ -120,6 +131,15 @@ func (e *Evaluator) evaluateAll(ctx context.Context) {
 // EvaluateRuleNow evaluates a single rule and returns the current value and
 // whether it is firing (for the test endpoint). It branches on rule.Type just
 // like the live evaluator.
+//
+// The context's project is used AS IT ARRIVES, and is deliberately not
+// overwritten with rule.Project the way the timer does it. The two look
+// interchangeable and are not: this is an HTTP path, and on an HTTP path the
+// CREDENTIAL decides what may be read, never a field of the row being read. They
+// agree today because routes.HandleTestAlertRule loads the rule through a
+// project-scoped GetRule, so rule.Project is the caller's project by
+// construction — and if a future caller ever loads a rule some other way, the
+// credential still wins here rather than the row handing itself a wider scope.
 func EvaluateRuleNow(ctx context.Context, rule *structs.AlertRule) (value float64, isFiring bool, err error) {
 	return evaluateRuleState(ctx, rule)
 }
@@ -131,18 +151,26 @@ func (e *Evaluator) evaluateRule(ctx context.Context, rule *structs.AlertRule) {
 		return
 	}
 
-	state, _ := GetState(ctx, rule.ID)
+	state, _ := GetState(ctx, rule.Project, rule.ID)
 
 	now := time.Now().UTC()
 
 	if state == nil {
 		state = &State{
 			RuleID:    rule.ID,
+			Project:   rule.Project,
 			Status:    "ok",
 			Value:     value,
 			UpdatedAt: now,
 		}
 	}
+
+	// Re-stamped on the read path too, not only when the state is new. A row
+	// written before migration 007 comes back with an empty project, and writing
+	// it straight back would keep it invisible to every non-default project
+	// forever — one evaluation is all it takes to repair, and this is where it
+	// happens.
+	state.Project = rule.Project
 
 	previousStatus := state.Status
 
@@ -212,6 +240,7 @@ func (e *Evaluator) onFiring(ctx context.Context, rule *structs.AlertRule, state
 	msg := fmt.Sprintf("Alert '%s' is firing: value %.2f %s threshold %.2f", rule.Name, state.Value, rule.Condition, rule.Threshold)
 
 	_ = RecordHistory(ctx, HistoryEntry{
+		Project:  rule.Project,
 		RuleID:   rule.ID,
 		RuleName: rule.Name,
 		Status:   "firing",
@@ -220,11 +249,13 @@ func (e *Evaluator) onFiring(ctx context.Context, rule *structs.AlertRule, state
 	})
 
 	if e.alertHub != nil {
-		e.alertHub.PublishStateChange(rule.ID, rule.Name, "firing", msg, state.Value)
+		e.alertHub.PublishStateChange(rule.Project, rule.ID, rule.Name, "firing", msg, state.Value)
 	}
 
 	alertCtx := BuildAlertContext(ctx, rule, "firing", state.Value, msg)
-	if err := e.router.Route(ctx, alertCtx, rule); err != nil {
+	// The destination count is Route's own business to log — it emits the WARN
+	// when it is zero, where it knows which channels resolved and which did not.
+	if _, err := e.router.Route(ctx, alertCtx, rule); err != nil {
 		log.Printf("alert evaluator: routing failed for rule %s: %v", rule.ID, err)
 	}
 }
@@ -236,6 +267,7 @@ func (e *Evaluator) onResolved(ctx context.Context, rule *structs.AlertRule, sta
 	msg := fmt.Sprintf("Alert '%s' has resolved: value %.2f", rule.Name, state.Value)
 
 	_ = RecordHistory(ctx, HistoryEntry{
+		Project:  rule.Project,
 		RuleID:   rule.ID,
 		RuleName: rule.Name,
 		Status:   "resolved",
@@ -244,11 +276,11 @@ func (e *Evaluator) onResolved(ctx context.Context, rule *structs.AlertRule, sta
 	})
 
 	if e.alertHub != nil {
-		e.alertHub.PublishStateChange(rule.ID, rule.Name, "resolved", msg, state.Value)
+		e.alertHub.PublishStateChange(rule.Project, rule.ID, rule.Name, "resolved", msg, state.Value)
 	}
 
 	alertCtx := BuildAlertContext(ctx, rule, "resolved", state.Value, msg)
-	if err := e.router.Route(ctx, alertCtx, rule); err != nil {
+	if _, err := e.router.Route(ctx, alertCtx, rule); err != nil {
 		log.Printf("alert evaluator: routing failed for rule %s: %v", rule.ID, err)
 	}
 }
@@ -314,9 +346,10 @@ func parseRuleFilters(rule *structs.AlertRule) ([]structs.QueryFilter, error) {
 // buildAggQuery assembles the statement queryAggForRange runs, and is split out
 // of it for the same reason routes.subscriptionFilters is split out of its
 // handler: the thing worth asserting on is the text, and it is unreachable
-// through a function whose next act is to hit ClickHouse. A test can call this
-// twice — once with a project on the context, once without — and read the
-// difference, which no assertion about a returned float64 could show.
+// through a function whose next act is to hit ClickHouse. A test can call it
+// once as the timer reaches it and once as the test endpoint does, and compare
+// the two statements — which is the regression guard on the closed gap above,
+// and which no assertion about a returned float64 could express.
 //
 // aggExpr is a trusted, code-built expression; the rule's filters are bound.
 func buildAggQuery(ctx context.Context, rule *structs.AlertRule, aggExpr string, from, to time.Time) (string, []interface{}, error) {
@@ -328,26 +361,25 @@ func buildAggQuery(ctx context.Context, rule *structs.AlertRule, aggExpr string,
 	sql := fmt.Sprintf("SELECT %s AS value FROM %s.events WHERE timestamp >= ? AND timestamp <= ?", aggExpr, db.Database)
 	args := []interface{}{from, to}
 
+	// UNCONDITIONAL. There used to be an `errors.Is(err, scope.ErrNoProject)`
+	// arm here that swallowed the error and continued zone-wide, because the
+	// timer had no project to offer. It has one now (evaluateAll stamps
+	// rule.Project), so the arm's only remaining effect would be to make an
+	// unscoped aggregate reachable by forgetting to supply a project — which is
+	// precisely the failure the sentinel exists to prevent. Propagating it makes
+	// the unscoped read UNCONSTRUCTABLE rather than merely unusual.
+	//
 	// Attached BEFORE the rule's own filters, not after: these are positional
 	// `?` placeholders, so the args have to be appended in the order their
 	// placeholders appear in the text. Splicing this in below the loop would
 	// slide every filter's binding one position along — valid SQL, no error,
 	// wrong rows.
 	predicate, scopeArgs, err := scope.ProjectPredicate(ctx)
-	switch {
-	case err == nil:
-		sql += " AND " + predicate
-		args = append(args, scopeArgs...)
-	case errors.Is(err, scope.ErrNoProject):
-		// The timer path. Deliberately zone-wide — the documented half of the
-		// gap above — and reached only when no request context exists.
-	default:
-		// ErrNoProject is the only error ProjectPredicate returns today. Any
-		// other one means the scoping rule changed under this call, and the safe
-		// reading of "I could not work out whose data this is" is to refuse
-		// rather than to fall back to every tenant's.
+	if err != nil {
 		return "", nil, err
 	}
+	sql += " AND " + predicate
+	args = append(args, scopeArgs...)
 
 	for _, f := range filters {
 		cond, condArgs, err := buildFilterCondition(f)
@@ -364,11 +396,9 @@ func buildAggQuery(ctx context.Context, rule *structs.AlertRule, aggExpr string,
 // queryAggForRange runs an arbitrary aggregation expression over [from,to],
 // applying the rule's query_filters.
 //
-// The tenancy predicate is attached when — and only when — the context carries a
-// project. See the KNOWN GAP header for why that is conditional rather than
-// mandatory: the timer has no request to derive one from, the HTTP test endpoint
-// does, and the aggregate this returns is handed straight back to that endpoint's
-// caller.
+// The tenancy predicate is ALWAYS attached — see the closed note at the top of
+// this file. A context with no project produces an error here rather than a
+// zone-wide read, on both the timer and the HTTP paths.
 func queryAggForRange(ctx context.Context, rule *structs.AlertRule, aggExpr string, from, to time.Time) (float64, error) {
 	sql, args, err := buildAggQuery(ctx, rule, aggExpr, from, to)
 	if err != nil {
@@ -511,8 +541,11 @@ func CheckCondition(value float64, condition string, threshold float64) bool {
 // It is a MariaDB read now (migration 119), so it no longer takes a context: the
 // query layer's signature is db.Queryable-first and carries none, matching every
 // other relational read in the repo. The wrapper is kept rather than inlined at
-// the one call site because it is the seam a future project-scoped evaluator
-// changes — see the KNOWN GAP header above.
+// the one call site because it is the seam that decides whether the evaluator
+// sees every project's rules. It reads ALL of them, across every project, and
+// evaluateAll scopes each one individually before it is evaluated — see the
+// closed note above and query.ListEnabledAlertRules for why the LISTING itself
+// must stay unscoped while the EVALUATION must not.
 //
 // The `FINAL` that used to be on this statement is gone with the engine that
 // needed it. It was there because a ReplacingMergeTree can hold several versions
