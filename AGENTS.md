@@ -1401,6 +1401,29 @@ migrations 119-124 — every alerting and dashboard setting.
 | `monitor.dashboards`, `monitor.saved_views` | MariaDB | saved UI state (123-124), project-scoped (131-132); `saved_views`' page index became `(project, page)` |
 | `monitor_auth.*` | MariaDB | identity + tenancy (100-109, 116-117) |
 
+**CI deploys every target in `.github/deploy-targets.json`, zones first.** It used to be a
+single curl with `?container=monitor-core`, which redeployed the control plane's container
+and nothing else — so zone `appleby` was never redeployed by CI and reached a full release
+and eight migrations behind, in code *and* schema, with a green CI history above it.
+
+- A **Lattice deploy token is bound to ONE STACK**; `?container=` only narrows within that
+  stack. Reaching a second zone is therefore a second credential, not a longer URL — which
+  is why this is a matrix over a committed list.
+- Adding a zone = one entry in `.github/deploy-targets.json` (`zone`, `role`, `container`,
+  `secret`, `health`) plus a repository secret holding that stack's deploy URL.
+- **`deploy-control-plane` `needs: deploy-zones`.** The control plane probes each zone's
+  `/health` and interprets what it reports, so a zone should already speak any new dialect.
+  The ordering is a job dependency rather than a convention someone has to remember.
+- A target with **no secret set** is skipped with a `::warning::` annotation and a run-summary
+  line — never silently. That state *is* the drift, so it is reported rather than tidied away.
+  The control-plane job treats a missing credential as an error instead, because there is no
+  configuration in which it should be absent.
+- **Every deploy is verified**: the job polls `{health}/version` until `commit` equals
+  `github.sha` and **fails if it never converges**. Without this a deploy that silently did
+  nothing is indistinguishable from one that worked, which is exactly how the drift above
+  shipped unnoticed. It depends on `/version`, which depends on the Dockerfile's `GIT_SHA`
+  build arg — the three are one mechanism.
+
 **Notification-channel config is encrypted and never returned** (migration 126). `config`
 held Slack webhooks, SMTP passwords and PagerDuty routing keys in plaintext AND was served:
 it was in `notificationChannelColumns`, scanned into a `json:"config"` field, and

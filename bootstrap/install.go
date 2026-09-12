@@ -1,6 +1,8 @@
 package bootstrap
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -38,8 +40,15 @@ const InstallIDSetting = "install_id"
 // ⚠️ NOT A SECRET. It is reported on /health so a prober can read it, exactly
 // like `zone` and `role`. It identifies a database; it authorises nothing.
 func EnsureInstallID(engine db.Queryable) (string, error) {
+	// ⚠️ sql.ErrNoRows IS THE FIRST-BOOT CASE, NOT A FAILURE. query.GetSetting
+	// returns it for any absent key — its own doc comment says so — and treating
+	// it as an error is how the first version of this function failed: on the one
+	// boot that was supposed to MINT the id, it reported "failed to read
+	// install_id: sql: no rows in result set", logged a warning, and left
+	// /version reporting an empty install_id forever after, because every later
+	// boot took the same branch.
 	existing, err := query.GetSetting(engine, InstallIDSetting)
-	if err != nil {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", fmt.Errorf("failed to read %s: %w", InstallIDSetting, err)
 	}
 	if id := strings.TrimSpace(existing); id != "" {

@@ -1,5 +1,26 @@
 name: Build and Deploy to Registry
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ONE IMAGE, N ZONES.
+#
+# This used to be a single curl to one LATTICE_DEPLOY_URL with
+# `?container=monitor-core`, which redeployed exactly one container — the
+# control plane's. Zone `appleby` was therefore never redeployed by CI at all.
+# On 2026-09-12 it ended up a full release and eight migrations behind, in both
+# code and schema, and nothing anywhere reported it: the endpoint that would
+# have said so (/version) was in the release the zone had not received.
+#
+# A Lattice deploy token is bound to ONE STACK, and `?container=` only narrows
+# within that stack — so reaching a second zone is a second credential, not a
+# second query parameter. That is why this is a matrix over a committed target
+# list rather than a longer URL.
+#
+# ⚠️ ZONES DEPLOY BEFORE THE CONTROL PLANE. The control plane probes each zone's
+# /health and reads what it reports, so a zone should already speak any new
+# dialect before the plane that interprets it rolls. That ordering is the
+# `needs:` on deploy-control-plane, not a convention anyone has to remember.
+# ─────────────────────────────────────────────────────────────────────────────
+
 on:
   push:
     branches: [main]
@@ -8,6 +29,9 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    outputs:
+      zones: ${{ steps.targets.outputs.zones }}
+      control_plane: ${{ steps.targets.outputs.control_plane }}
 
     steps:
       - name: Checkout code
@@ -50,21 +74,117 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Stamps the commit into the binary so GET /version can report which
-          # build a container is running. Nothing could answer that before, and
-          # because the deploy step below targets ONE container, a zone can sit
-          # arbitrarily far behind with no way to detect it.
+          # build a container is running. This is what makes the drift above
+          # detectable rather than merely regrettable.
           build-args: |
             GIT_SHA=${{ github.sha }}
             GIT_REF=${{ github.ref_name }}
+            BUILD_TIME=${{ github.event.head_commit.timestamp }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Deploy to Lattice
-        if: github.ref == 'refs/heads/main'
+      # Split into zones vs control plane so the ordering rule above can be a
+      # job dependency. Reading the list from a committed file means adding a
+      # zone is a one-line reviewable change, not workflow surgery.
+      - name: Read deploy targets
+        id: targets
         run: |
-          echo "Triggering Lattice deployment..."
-          curl -sf -X POST "${{ secrets.LATTICE_DEPLOY_URL }}?container=${{ github.event.repository.name }}&commit=${{ github.sha }}" \
-            --max-time 30 \
-            -o /dev/null -w "HTTP %{http_code}"
-          echo ""
-          echo "Container redeployed successfully!"
+          ZONES=$(jq -c '[.[] | select(.role != "both" and .role != "app")]' .github/deploy-targets.json)
+          PLANE=$(jq -c '[.[] | select(.role == "both" or .role == "app")]' .github/deploy-targets.json)
+          echo "zones=$ZONES"         >> "$GITHUB_OUTPUT"
+          echo "control_plane=$PLANE" >> "$GITHUB_OUTPUT"
+          echo "zones: $ZONES"
+          echo "control plane: $PLANE"
+
+  deploy-zones:
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      # One unreachable zone must not cancel the others. A half-deployed fleet
+      # is the state this whole workflow exists to make visible, so the run has
+      # to reach the verification step for every target it can.
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.build-and-push.outputs.zones) }}
+    steps:
+      - name: Deploy ${{ matrix.target.zone }}
+        id: deploy
+        env:
+          DEPLOY_URL: ${{ secrets[matrix.target.secret] }}
+        run: |
+          if [ -z "$DEPLOY_URL" ]; then
+            # NOT a silent skip. A zone that is in the target list but has no
+            # credential is precisely the drift this workflow was written to
+            # end, so it gets a warning annotation in the Actions UI and a line
+            # in the run summary. It is not a failure, because the fix is to
+            # mint a Lattice deploy token for that stack and add its URL as a
+            # repository secret — a setup step, not a broken build.
+            echo "::warning title=${{ matrix.target.zone }} not deployed::No ${{ matrix.target.secret }} secret is set, so this zone was skipped and is now behind ${{ github.sha }}. Create a Lattice deploy token for its stack and add the URL as that secret."
+            echo "- ⚠️ **${{ matrix.target.zone }}** skipped — \`${{ matrix.target.secret }}\` is not set" >> "$GITHUB_STEP_SUMMARY"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl -sf -X POST "$DEPLOY_URL?container=${{ matrix.target.container }}&commit=${{ github.sha }}" \
+            --max-time 30 -o /dev/null -w "HTTP %{http_code}\n"
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+
+      # THE STEP THAT MAKES DRIFT IMPOSSIBLE TO SHIP UNNOTICED. Without it a
+      # deploy that silently did nothing looks identical to one that worked —
+      # which is exactly how a zone ended up eight migrations behind with a
+      # green CI history above it.
+      - name: Verify ${{ matrix.target.zone }} is running this commit
+        if: steps.deploy.outputs.skipped == 'false'
+        run: |
+          for i in $(seq 1 20); do
+            RUNNING=$(curl -sf --max-time 10 "${{ matrix.target.health }}/version" | jq -r '.commit // ""' || true)
+            if [ "$RUNNING" = "${{ github.sha }}" ]; then
+              echo "${{ matrix.target.zone }} is running ${{ github.sha }}"
+              echo "- ✅ **${{ matrix.target.zone }}** on \`${GITHUB_SHA:0:7}\`" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "[$i/20] ${{ matrix.target.zone }} reports '${RUNNING:-no /version}', waiting…"
+            sleep 15
+          done
+          echo "::error title=${{ matrix.target.zone }} did not converge::It never reported ${{ github.sha }} on /version."
+          exit 1
+
+  deploy-control-plane:
+    # Zones first — see the header. If a zone's deploy fails this still runs:
+    # leaving the control plane on an older build than its zones is the safer
+    # half of a bad situation, and `always()` keeps the failure attributed to
+    # the zone that actually failed rather than cascading.
+    needs: [build-and-push, deploy-zones]
+    if: always() && github.ref == 'refs/heads/main' && needs.build-and-push.result == 'success'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.build-and-push.outputs.control_plane) }}
+    steps:
+      - name: Deploy ${{ matrix.target.zone }}
+        id: deploy
+        env:
+          DEPLOY_URL: ${{ secrets[matrix.target.secret] }}
+        run: |
+          if [ -z "$DEPLOY_URL" ]; then
+            echo "::error title=${{ matrix.target.zone }} has no deploy credential::${{ matrix.target.secret }} is not set."
+            exit 1
+          fi
+          curl -sf -X POST "$DEPLOY_URL?container=${{ matrix.target.container }}&commit=${{ github.sha }}" \
+            --max-time 30 -o /dev/null -w "HTTP %{http_code}\n"
+
+      - name: Verify ${{ matrix.target.zone }} is running this commit
+        run: |
+          for i in $(seq 1 20); do
+            RUNNING=$(curl -sf --max-time 10 "${{ matrix.target.health }}/version" | jq -r '.commit // ""' || true)
+            if [ "$RUNNING" = "${{ github.sha }}" ]; then
+              echo "${{ matrix.target.zone }} is running ${{ github.sha }}"
+              echo "- ✅ **${{ matrix.target.zone }}** on \`${GITHUB_SHA:0:7}\`" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "[$i/20] ${{ matrix.target.zone }} reports '${RUNNING:-no /version}', waiting…"
+            sleep 15
+          done
+          echo "::error title=${{ matrix.target.zone }} did not converge::It never reported ${{ github.sha }} on /version."
+          exit 1
