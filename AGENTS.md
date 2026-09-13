@@ -1401,28 +1401,30 @@ migrations 119-124 — every alerting and dashboard setting.
 | `monitor.dashboards`, `monitor.saved_views` | MariaDB | saved UI state (123-124), project-scoped (131-132); `saved_views`' page index became `(project, page)` |
 | `monitor_auth.*` | MariaDB | identity + tenancy (100-109, 116-117) |
 
-**CI deploys every target in `.github/deploy-targets.json`, zones first.** It used to be a
-single curl with `?container=monitor-core`, which redeployed the control plane's container
-and nothing else — so zone `appleby` was never redeployed by CI and reached a full release
-and eight migrations behind, in code *and* schema, with a green CI history above it.
+**CI redeploys every zone by firing one Lattice automation.** It began as a single curl with
+`?container=monitor-core`, which redeployed the control plane's container and nothing else —
+so zone `appleby` was never redeployed by CI and reached a full release and eight migrations
+behind, in code *and* schema, with a green CI history above it.
 
-- A **Lattice deploy token is bound to ONE STACK**; `?container=` only narrows within that
-  stack. Reaching a second zone is therefore a second credential, not a longer URL — which
-  is why this is a matrix over a committed list.
-- Adding a zone = one entry in `.github/deploy-targets.json` (`zone`, `role`, `container`,
-  `secret`, `health`) plus a repository secret holding that stack's deploy URL.
-- **`deploy-control-plane` `needs: deploy-zones`.** The control plane probes each zone's
-  `/health` and interprets what it reports, so a zone should already speak any new dialect.
-  The ordering is a job dependency rather than a convention someone has to remember.
-- A target with **no secret set** is skipped with a `::warning::` annotation and a run-summary
-  line — never silently. That state *is* the drift, so it is reported rather than tidied away.
-  The control-plane job treats a missing credential as an error instead, because there is no
-  configuration in which it should be absent.
-- **Every deploy is verified**: the job polls `{health}/version` until `commit` equals
-  `github.sha` and **fails if it never converges**. Without this a deploy that silently did
-  nothing is indistinguishable from one that worked, which is exactly how the drift above
-  shipped unnoticed. It depends on `/version`, which depends on the Dockerfile's `GIT_SHA`
-  build arg — the three are one mechanism.
+- A **Lattice deploy token is bound to ONE STACK**, and `?container=` only narrows within it.
+  A Lattice **automation** is one webhook whose ordered steps can span stacks: *Redeploy
+  Monitor Core* (automation id 1) redeploys `appleby-core` (stack 32) and then `monitor-core`
+  (stack 30). Its webhook URL is the `LATTICE_DEPLOY_URL` repository secret — the workflow
+  holds no hosts or URLs of its own — and `?commit=<sha>` is recorded on the run.
+- **The automation is the zone list.** Adding a zone is a new step on the automation; nothing
+  in this repo changes.
+- **HTTP 200 is not success.** The webhook is synchronous (a 50s run budget under Lattice's 60s
+  write timeout), and a *disabled* automation answers **200** with `result: "disabled"` having
+  run nothing. The `deploy` job therefore requires `data.result == "succeeded"` and prints each
+  step's summary either way. Skipped (409 — e.g. the previous run still holds the run guard)
+  and failed (424) carry their reason in the message. The job has a `concurrency` group because
+  the automation refuses an overlapping firing instead of queueing it.
+- **A green run means Lattice accepted the redeploys, not that they landed.** A redeploy step
+  succeeds when the worker accepts the command, and CI does not poll the zones afterwards. Check
+  each zone's `GET /version` (it reports the running `commit`, stamped from the Dockerfile's
+  `GIT_SHA` build arg) or the automation's run history. Zones roll first by step order, but no
+  step waits for its container, so every zone and the control plane restart within seconds of
+  each other.
 
 **Notification-channel config is encrypted and never returned** (migration 126). `config`
 held Slack webhooks, SMTP passwords and PagerDuty routing keys in plaintext AND was served:
@@ -1666,14 +1668,14 @@ deviating.
 ## 8. Operations
 
 - **Deploy:** on a push to `main`, `build-and-deploy.yml` builds the image to
-  `registry.appleby.cloud/monitor-core` and then **triggers the redeploy itself** — a
-  `POST` to `LATTICE_DEPLOY_URL?container=monitor-core&commit=<sha>`. This is the same
-  step every other service in the ecosystem uses; keep it identical.
-  Two prerequisites, both outside this repo: the `LATTICE_DEPLOY_URL` repo secret, and an
-  active deploy token on the Lattice stack. `monitor-core` and `monitor-web` are
-  containers in the **same stack** ("Trailblaze Monitor"), so they share one token and one
-  URL — `?container=` is what separates them. A green CI run with no visible change means
-  checking the token's `last_used_at`: if it's `null`, CI never reached Lattice.
+  `registry.appleby.cloud/monitor-core` and fires the Lattice automation behind the
+  `LATTICE_DEPLOY_URL` secret, which redeploys every zone's container — see the CI notes under
+  §6 *Stores*. Unlike the rest of the ecosystem this is **not** a stack deploy token, because
+  monitor-core spans two stacks and a token reaches one. `monitor-web` still deploys with the
+  stack-30 deploy token from its own repo secret (`?container=monitor-web`), so that token
+  stays active. When a run looks green but nothing changed, compare each zone's `/version` with
+  the pushed commit and read the automation's run history (`lattice_list_automation_runs`,
+  automation 1): every firing is a row, skipped ones included, with the failing step named.
 - Do **not** deploy by hand from here (repo guardrails).
 
 - **⚠️ CUTOVER DEPLOY — migrations 119-124 (one-time, THE ORDER MATTERS).**

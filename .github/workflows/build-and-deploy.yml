@@ -1,24 +1,28 @@
 name: Build and Deploy to Registry
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ONE IMAGE, N ZONES.
+# ONE IMAGE, ONE TRIGGER, EVERY ZONE.
 #
-# This used to be a single curl to one LATTICE_DEPLOY_URL with
-# `?container=monitor-core`, which redeployed exactly one container — the
-# control plane's. Zone `appleby` was therefore never redeployed by CI at all.
-# On 2026-09-12 it ended up a full release and eight migrations behind, in both
-# code and schema, and nothing anywhere reported it: the endpoint that would
-# have said so (/version) was in the release the zone had not received.
+# This began as a single curl to a Lattice deploy URL with
+# `?container=monitor-core`. A deploy token is bound to ONE STACK, so zone
+# `appleby` (another stack) was never redeployed by CI — on 2026-09-12 it was
+# found a full release and eight migrations behind, with a green CI history.
 #
-# A Lattice deploy token is bound to ONE STACK, and `?container=` only narrows
-# within that stack — so reaching a second zone is a second credential, not a
-# second query parameter. That is why this is a matrix over a committed target
-# list rather than a longer URL.
+# Now CI fires ONE Lattice automation ("Redeploy Monitor Core"), whose ordered
+# steps redeploy every zone's container across stacks. Which zones exist, and
+# in what order they roll, is the automation's business — adding a zone is a
+# new step there, not a change here. Its webhook URL is the LATTICE_DEPLOY_URL
+# secret, and nothing else in this file knows where Lattice lives.
 #
-# ⚠️ ZONES DEPLOY BEFORE THE CONTROL PLANE. The control plane probes each zone's
-# /health and reads what it reports, so a zone should already speak any new
-# dialect before the plane that interprets it rolls. That ordering is the
-# `needs:` on deploy-control-plane, not a convention anyone has to remember.
+# ⚠️ A GREEN RUN MEANS LATTICE ACCEPTED THE REDEPLOYS, NOT THAT THEY LANDED. A
+# redeploy step succeeds when the worker accepts the command, and CI does not
+# poll the zones afterwards. Each zone's GET /version reports the commit it is
+# running, and the automation's run history records every firing — that is
+# where to look when a deploy seems not to have taken.
+#
+# ⚠️ ZONES ROLL WITHIN SECONDS OF THE CONTROL PLANE. The steps run in order
+# (zones first) and stop at the first one a worker refuses, but none waits for
+# its container to come up.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -27,55 +31,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ⚠️ THIS IS ITS OWN JOB, AND MUST NOT GAIN A KEYRING STEP. It exists only to
-  # turn a committed JSON file into two matrix expressions, which looks like it
-  # belongs in build-and-push — where the first version of it lived, and failed.
-  #
-  # keyring-actions injects ~20 secrets and registers EVERY value with
-  # ::add-mask::, including public ones (NEXT_PUBLIC_MONITOR_API_URL,
-  # NEXT_PUBLIC_COOKIE_DOMAIN). One of those values appears verbatim inside a
-  # `health` URL in deploy-targets.json — so GitHub saw a masked value in the
-  # job output and refused to emit it:
-  #
-  #     ! Skip output 'zones' since it may contain secret.
-  #
-  # That is a WARNING, not an error. build-and-push went green, both matrices
-  # resolved to nothing, neither deploy job was created, and the run failed with
-  # no failing step to look at. The image shipped; nothing deployed.
-  #
-  # Masking is registered per-job, so the whole fix is this separation. Keep it.
-  targets:
-    runs-on: ubuntu-latest
-    outputs:
-      zones: ${{ steps.read.outputs.zones }}
-      control_plane: ${{ steps.read.outputs.control_plane }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4.2.2
-
-      - name: Read deploy targets
-        id: read
-        run: |
-          ZONES=$(jq -c '[.[] | select(.role != "both" and .role != "app")]' .github/deploy-targets.json)
-          PLANE=$(jq -c '[.[] | select(.role == "both" or .role == "app")]' .github/deploy-targets.json)
-
-          # An empty matrix SKIPS its job silently, which is indistinguishable in
-          # the Actions UI from a deploy that worked — the exact failure this
-          # workflow was written to end. Fail loudly instead.
-          if [ "$ZONES" = "[]" ] || [ -z "$ZONES" ]; then
-            echo "::error title=No zone targets::deploy-targets.json produced no zone entries. An empty matrix would skip every zone deploy silently."
-            exit 1
-          fi
-          if [ "$PLANE" = "[]" ] || [ -z "$PLANE" ]; then
-            echo "::error title=No control-plane target::deploy-targets.json produced no entry with role 'both' or 'app'."
-            exit 1
-          fi
-
-          echo "zones=$ZONES"         >> "$GITHUB_OUTPUT"
-          echo "control_plane=$PLANE" >> "$GITHUB_OUTPUT"
-          echo "zones: $ZONES"
-          echo "control plane: $PLANE"
-
   build-and-push:
     runs-on: ubuntu-latest
 
@@ -120,8 +75,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Stamps the commit into the binary so GET /version can report which
-          # build a container is running. This is what makes the drift above
-          # detectable rather than merely regrettable.
+          # build a container is running — the way to confirm a deploy landed.
           build-args: |
             GIT_SHA=${{ github.sha }}
             GIT_REF=${{ github.ref_name }}
@@ -129,95 +83,56 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  deploy-zones:
-    needs: [targets, build-and-push]
+  deploy:
+    needs: build-and-push
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    strategy:
-      # One unreachable zone must not cancel the others. A half-deployed fleet
-      # is the state this whole workflow exists to make visible, so the run has
-      # to reach the verification step for every target it can.
-      fail-fast: false
-      matrix:
-        target: ${{ fromJSON(needs.targets.outputs.zones) }}
+    # The automation REFUSES a firing while its previous run still holds the run
+    # guard (409, recorded as skipped) rather than queueing it. Two quick pushes
+    # would race; this queues the second workflow's deploy behind the first.
+    concurrency:
+      group: monitor-core-deploy
+      cancel-in-progress: false
     steps:
-      - name: Deploy ${{ matrix.target.zone }}
-        id: deploy
+      - name: Fire the Lattice automation
         env:
-          DEPLOY_URL: ${{ secrets[matrix.target.secret] }}
+          DEPLOY_URL: ${{ secrets.LATTICE_DEPLOY_URL }}
         run: |
           if [ -z "$DEPLOY_URL" ]; then
-            # NOT a silent skip. A zone that is in the target list but has no
-            # credential is precisely the drift this workflow was written to
-            # end, so it gets a warning annotation in the Actions UI and a line
-            # in the run summary. It is not a failure, because the fix is to
-            # mint a Lattice deploy token for that stack and add its URL as a
-            # repository secret — a setup step, not a broken build.
-            echo "::warning title=${{ matrix.target.zone }} not deployed::No ${{ matrix.target.secret }} secret is set, so this zone was skipped and is now behind ${{ github.sha }}. Create a Lattice deploy token for its stack and add the URL as that secret."
-            echo "- ⚠️ **${{ matrix.target.zone }}** skipped — \`${{ matrix.target.secret }}\` is not set" >> "$GITHUB_STEP_SUMMARY"
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          curl -sf -X POST "$DEPLOY_URL?container=${{ matrix.target.container }}&commit=${{ github.sha }}" \
-            --max-time 30 -o /dev/null -w "HTTP %{http_code}\n"
-          echo "skipped=false" >> "$GITHUB_OUTPUT"
-
-      # THE STEP THAT MAKES DRIFT IMPOSSIBLE TO SHIP UNNOTICED. Without it a
-      # deploy that silently did nothing looks identical to one that worked —
-      # which is exactly how a zone ended up eight migrations behind with a
-      # green CI history above it.
-      - name: Verify ${{ matrix.target.zone }} is running this commit
-        if: steps.deploy.outputs.skipped == 'false'
-        run: |
-          for i in $(seq 1 20); do
-            RUNNING=$(curl -sf --max-time 10 "${{ matrix.target.health }}/version" | jq -r '.commit // ""' || true)
-            if [ "$RUNNING" = "${{ github.sha }}" ]; then
-              echo "${{ matrix.target.zone }} is running ${{ github.sha }}"
-              echo "- ✅ **${{ matrix.target.zone }}** on \`${GITHUB_SHA:0:7}\`" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "[$i/20] ${{ matrix.target.zone }} reports '${RUNNING:-no /version}', waiting…"
-            sleep 15
-          done
-          echo "::error title=${{ matrix.target.zone }} did not converge::It never reported ${{ github.sha }} on /version."
-          exit 1
-
-  deploy-control-plane:
-    # Zones first — see the header. If a zone's deploy fails this still runs:
-    # leaving the control plane on an older build than its zones is the safer
-    # half of a bad situation, and `always()` keeps the failure attributed to
-    # the zone that actually failed rather than cascading.
-    needs: [targets, build-and-push, deploy-zones]
-    if: always() && github.ref == 'refs/heads/main' && needs.targets.result == 'success' && needs.build-and-push.result == 'success'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target: ${{ fromJSON(needs.targets.outputs.control_plane) }}
-    steps:
-      - name: Deploy ${{ matrix.target.zone }}
-        id: deploy
-        env:
-          DEPLOY_URL: ${{ secrets[matrix.target.secret] }}
-        run: |
-          if [ -z "$DEPLOY_URL" ]; then
-            echo "::error title=${{ matrix.target.zone }} has no deploy credential::${{ matrix.target.secret }} is not set."
+            echo "::error title=No deploy credential::LATTICE_DEPLOY_URL is not set. It must hold the webhook URL of the Lattice automation that redeploys every zone."
             exit 1
           fi
-          curl -sf -X POST "$DEPLOY_URL?container=${{ matrix.target.container }}&commit=${{ github.sha }}" \
-            --max-time 30 -o /dev/null -w "HTTP %{http_code}\n"
 
-      - name: Verify ${{ matrix.target.zone }} is running this commit
-        run: |
-          for i in $(seq 1 20); do
-            RUNNING=$(curl -sf --max-time 10 "${{ matrix.target.health }}/version" | jq -r '.commit // ""' || true)
+          # Synchronous: Lattice runs every step before it answers, inside a 50s
+          # run budget that sits under its own 60s write timeout. 75s leaves
+          # room for the connection itself.
+          HTTP=$(curl -sS -X POST "$DEPLOY_URL?commit=${{ github.sha }}" \
+            --max-time 75 -o response.json -w '%{http_code}') || {
+            echo "::error title=Lattice unreachable::The automation webhook did not answer (curl exit $?)."
+            exit 1
+          }
+
+          RESULT=$(jq -r '.data.result // empty' response.json 2>/dev/null || true)
+          MESSAGE=$(jq -r '[.message, .error, .error_message] | map(select(. != null and . != "")) | unique | join(" — ")' response.json 2>/dev/null || true)
+
+          # Which step did what is the first question when a deploy looks wrong,
+          # so it is printed on success too.
+          jq -r '.data.run.steps[]? | "  \(.type) → \(.status): \(.summary)\(if .error then " (\(.error))" else "" end)"' response.json 2>/dev/null || true
+
+          # ⚠️ HTTP 200 IS NOT SUCCESS. A DISABLED automation answers 200 with
+          # result "disabled" and runs nothing — so this checks the verdict, not
+          # the status code. Skipped (409) and failed (424) carry their reason in
+          # the message.
+          if [ "$HTTP" = "200" ] && [ "$RESULT" = "succeeded" ]; then
+            echo "Lattice: $MESSAGE"
+            echo "- 🚀 Lattice: $MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
             if [ "$RUNNING" = "${{ github.sha }}" ]; then
-              echo "${{ matrix.target.zone }} is running ${{ github.sha }}"
-              echo "- ✅ **${{ matrix.target.zone }}** on \`${GITHUB_SHA:0:7}\`" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "[$i/20] ${{ matrix.target.zone }} reports '${RUNNING:-no /version}', waiting…"
-            sleep 15
-          done
-          echo "::error title=${{ matrix.target.zone }} did not converge::It never reported ${{ github.sha }} on /version."
+          # A non-JSON body is almost always the wrong URL — the automation's
+          # dashboard page rather than its webhook.
+          DETAIL=${MESSAGE:-"no JSON body. Check that LATTICE_DEPLOY_URL is the automation's webhook URL rather than its dashboard page."}
+          echo "::error title=Automation did not succeed::HTTP $HTTP, result '${RESULT:-none}': $DETAIL"
+          echo "- ❌ Lattice: HTTP $HTTP, result \`${RESULT:-none}\` — $DETAIL" >> "$GITHUB_STEP_SUMMARY"
           exit 1
