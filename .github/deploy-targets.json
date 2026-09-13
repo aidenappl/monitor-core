@@ -11,6 +11,6 @@
     "role": "both",
     "container": "monitor-core",
     "secret": "LATTICE_DEPLOY_URL",
-    "health": "https://api.monitor.appleby.cloud"
+    "health": "https://monitor-api.appleby.cloud"
   }
 ]
