@@ -129,7 +129,6 @@ jobs:
             exit 0
           fi
 
-            if [ "$RUNNING" = "${{ github.sha }}" ]; then
           # A non-JSON body is almost always the wrong URL — the automation's
           # dashboard page rather than its webhook.
           DETAIL=${MESSAGE:-"no JSON body. Check that LATTICE_DEPLOY_URL is the automation's webhook URL rather than its dashboard page."}
