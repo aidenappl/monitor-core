@@ -31,7 +31,7 @@ func withRole(t *testing.T, role env.Role) {
 func TestZoneBuildsUserFromAccessTokenClaims(t *testing.T) {
 	withRole(t, env.RoleZone)
 
-	token, _, err := jwt.NewAccessToken(42, "editor")
+	token, _, err := jwt.NewAccessToken(42, "editor", "")
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestZoneRoleAbsentFailsClosed(t *testing.T) {
 	// A token minted before Claims.Role existed. It must still authenticate —
 	// otherwise deploying this change logs every live session out — but it must
 	// not carry privilege it never asserted.
-	token, _, err := jwt.NewAccessToken(7, "")
+	token, _, err := jwt.NewAccessToken(7, "", "")
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}

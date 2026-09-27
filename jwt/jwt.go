@@ -1,6 +1,8 @@
 package jwt
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -46,31 +48,66 @@ type Claims struct {
 	// the role in it, so an existing session heals within one access lifetime
 	// without anyone logging out.
 	Role string `json:"role,omitempty"`
+
+	// FamilyID is the hex refresh-token family this access token was minted
+	// alongside, so logout can revoke THIS session rather than every session.
+	//
+	// It has to ride in the access token because the refresh cookie cannot reach
+	// logout: mon-refresh-token is path-scoped to the refresh endpoint (and
+	// monitor-web's proxy rewrites that path again), so POST /auth/logout never
+	// sees it. Without this claim HandleLogout can only RevokeAllForUser, and
+	// logging out on one device logs out every device.
+	//
+	// Set on ACCESS tokens only. A refresh token is resolved to its family by the
+	// stored row, which is authoritative — a claim there would be a second copy.
+	//
+	// It is an identifier, not a credential: knowing a family id lets a caller do
+	// nothing but name a session they already hold a valid access token for.
+	//
+	// `omitempty` keeps tokens minted before this field existed valid: they carry
+	// no family, and logout falls back to RevokeAllForUser — the pre-fid
+	// behaviour — for at most one access lifetime.
+	FamilyID string `json:"fid,omitempty"`
 }
 
 // NewAccessToken mints a 15-minute HS512 access token for userID, carrying the
-// role so a zone can authorise without a users table. See Claims.Role.
-func NewAccessToken(userID int64, role string) (string, time.Time, error) {
-	return newToken(userID, role, "access", accessTokenExpiry)
+// role so a zone can authorise without a users table (see Claims.Role) and the
+// hex refresh-token family so logout can be scoped to this session (see
+// Claims.FamilyID). familyID may be empty.
+func NewAccessToken(userID int64, role string, familyID string) (string, time.Time, error) {
+	return newToken(userID, role, familyID, "access", accessTokenExpiry)
 }
 
 // NewRefreshToken mints a 7-day HS512 refresh token for userID. No role: it is
 // redeemed at the control plane, which reads the live row.
 func NewRefreshToken(userID int64) (string, time.Time, error) {
-	return newToken(userID, "", "refresh", refreshTokenExpiry)
+	return newToken(userID, "", "", "refresh", refreshTokenExpiry)
 }
 
-func newToken(userID int64, role string, typ string, ttl time.Duration) (string, time.Time, error) {
+func newToken(userID int64, role string, familyID string, typ string, ttl time.Duration) (string, time.Time, error) {
+	// ⚠️ A random jti makes every minted token unique. Without it the claims are
+	// (issuer, user, type, second-granularity iat/exp), so two refresh tokens for
+	// the same user minted in the same second are BYTE-IDENTICAL — same SHA-256,
+	// and the second insert hits uq_refresh_tokens_hash. That is exactly the
+	// concurrent-tab case the refresh grace window (routes/refresh_grace.go)
+	// answers with a sibling token, so without this the grace path would 500.
+	var jti [16]byte
+	if _, err := rand.Read(jti[:]); err != nil {
+		return "", time.Time{}, fmt.Errorf("failed to generate %s token id: %w", typ, err)
+	}
+
 	expiresAt := time.Now().Add(ttl)
 	claims := Claims{
 		RegisteredClaims: jwtlib.RegisteredClaims{
+			ID:        hex.EncodeToString(jti[:]),
 			Issuer:    issuer,
 			ExpiresAt: jwtlib.NewNumericDate(expiresAt),
 			IssuedAt:  jwtlib.NewNumericDate(time.Now()),
 		},
-		UserID: userID,
-		Type:   typ,
-		Role:   role,
+		UserID:   userID,
+		Type:     typ,
+		Role:     role,
+		FamilyID: familyID,
 	}
 
 	token := jwtlib.NewWithClaims(jwtlib.SigningMethodHS512, claims)
@@ -120,14 +157,24 @@ func ValidateToken(tokenStr string) (*Claims, error) {
 
 // ValidateAccessToken validates the token and requires Type == "access".
 func ValidateAccessToken(tokenStr string) (int64, string, error) {
-	claims, err := ValidateToken(tokenStr)
+	claims, err := ValidateAccessTokenClaims(tokenStr)
 	if err != nil {
 		return 0, "", err
 	}
-	if claims.Type != "access" {
-		return 0, "", fmt.Errorf("expected access token, got %q", claims.Type)
-	}
 	return claims.UserID, claims.Role, nil
+}
+
+// ValidateAccessTokenClaims is ValidateAccessToken returning the full claim set,
+// for callers that need more than the user and role (logout reads FamilyID).
+func ValidateAccessTokenClaims(tokenStr string) (*Claims, error) {
+	claims, err := ValidateToken(tokenStr)
+	if err != nil {
+		return nil, err
+	}
+	if claims.Type != "access" {
+		return nil, fmt.Errorf("expected access token, got %q", claims.Type)
+	}
+	return claims, nil
 }
 
 // ValidateRefreshToken validates the token and requires Type == "refresh".

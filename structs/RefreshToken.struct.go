@@ -7,7 +7,9 @@ import "time"
 // the client cookie. Tokens minted from the same login share a FamilyID; on
 // rotation the old row's ReplacedBy is set to the new row's id. Presenting an
 // already-rotated (ReplacedBy set) or revoked token is treated as reuse and
-// revokes the whole family. Lives in MariaDB (refresh_tokens).
+// revokes the whole family — except that a rotated token re-presented within
+// the grace window of UsedAt (routes/refresh_grace.go) is answered with a
+// sibling instead. Lives in MariaDB (refresh_tokens).
 type RefreshToken struct {
 	ID         int64      `json:"id"`
 	UserID     int64      `json:"user_id"`
@@ -18,5 +20,6 @@ type RefreshToken struct {
 	IP         []byte     `json:"-"`
 	ExpiresAt  time.Time  `json:"expires_at"`
 	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+	UsedAt     *time.Time `json:"used_at,omitempty"`
 	InsertedAt time.Time  `json:"inserted_at"`
 }

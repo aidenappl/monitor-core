@@ -13,7 +13,7 @@ import (
 
 var refreshTokenColumns = []string{
 	"id", "user_id", "token_hash", "family_id", "replaced_by",
-	"user_agent", "ip", "expires_at", "revoked_at", "inserted_at",
+	"user_agent", "ip", "expires_at", "revoked_at", "inserted_at", "used_at",
 }
 
 type refreshTokenScanner interface {
@@ -24,7 +24,7 @@ func scanRefreshToken(row refreshTokenScanner) (*structs.RefreshToken, error) {
 	var rt structs.RefreshToken
 	err := row.Scan(
 		&rt.ID, &rt.UserID, &rt.TokenHash, &rt.FamilyID, &rt.ReplacedBy,
-		&rt.UserAgent, &rt.IP, &rt.ExpiresAt, &rt.RevokedAt, &rt.InsertedAt,
+		&rt.UserAgent, &rt.IP, &rt.ExpiresAt, &rt.RevokedAt, &rt.InsertedAt, &rt.UsedAt,
 	)
 	return &rt, err
 }
@@ -85,23 +85,30 @@ func GetRefreshTokenByHash(engine db.Queryable, hash []byte) (*structs.RefreshTo
 }
 
 // ErrTokenAlreadyRotated is returned by RotateRefreshToken when the old row was
-// already stamped (replaced_by set) by a concurrent rotation. The caller MUST
-// treat this as reuse: revoke the whole family and reject. This closes the race
-// where two concurrent refreshes of the same token both read replaced_by IS NULL
-// and each mint a distinct (distinct-hash) successor — the conditional UPDATE
-// below lets exactly one win.
+// already stamped (replaced_by set) by a concurrent rotation, or revoked
+// concurrently. The caller MUST re-read the row and re-classify it: inside the
+// grace window it is a benign concurrent refresh, outside it is reuse, and a
+// revoked row is rejected. This closes the race where two concurrent refreshes
+// of the same token both read replaced_by IS NULL and each mint a distinct
+// (distinct-hash) successor — the conditional UPDATE below lets exactly one win.
 var ErrTokenAlreadyRotated = errors.New("refresh token already rotated")
 
 // RotateRefreshToken performs the rotation half of the OAuth 2.0 Security BCP
 // refresh flow: it inserts the successor token in the SAME family and stamps the
-// old row's replaced_by with the new id, marking it spent. Both statements must
-// run in one transaction — pass a *sql.Tx as engine.
+// old row's replaced_by with the new id and used_at with usedAt, marking it
+// spent. Both statements must run in one transaction — pass a *sql.Tx as engine.
 //
-// The stamp is a CONDITIONAL update (WHERE replaced_by IS NULL): if a concurrent
-// rotation already claimed this token, RowsAffected is 0 and we return
-// ErrTokenAlreadyRotated so the caller can revoke the family. The successor we
+// usedAt is supplied by the caller (time.Now().UTC()) rather than NOW() in SQL so
+// the grace-window comparison in routes/refresh_grace.go is made against a clock
+// the app controls, and so tests can pin it.
+//
+// The stamp is a CONDITIONAL update (WHERE replaced_by IS NULL AND revoked_at IS
+// NULL): if a concurrent rotation already claimed this token — or a concurrent
+// RevokeFamily (logout, reuse detection) killed it between the caller's read and
+// this UPDATE — RowsAffected is 0 and we return
+// ErrTokenAlreadyRotated so the caller can re-classify the row. The successor we
 // just inserted is rolled back with the surrounding transaction.
-func RotateRefreshToken(engine db.Queryable, oldTokenID int64, req CreateRefreshTokenRequest) (int64, error) {
+func RotateRefreshToken(engine db.Queryable, oldTokenID int64, usedAt time.Time, req CreateRefreshTokenRequest) (int64, error) {
 	newID, err := CreateRefreshToken(engine, req)
 	if err != nil {
 		return 0, err
@@ -109,7 +116,8 @@ func RotateRefreshToken(engine db.Queryable, oldTokenID int64, req CreateRefresh
 
 	query, args, err := sq.Update("refresh_tokens").
 		Set("replaced_by", newID).
-		Where(sq.Eq{"id": oldTokenID, "replaced_by": nil}).
+		Set("used_at", usedAt).
+		Where(sq.Eq{"id": oldTokenID, "replaced_by": nil, "revoked_at": nil}).
 		ToSql()
 	if err != nil {
 		return 0, fmt.Errorf("build query: %w", err)

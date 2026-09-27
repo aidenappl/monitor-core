@@ -499,7 +499,7 @@ into `access_logs` was RESTRICT and a secret that had ever been read could never
 |---|---|
 | `users` | The account: `email` (`UNIQUE`), `email_verified`, `name`, `display_name`, `role` (`admin`\|`editor`\|`viewer`\|`pending`), `active`. |
 | `identities` | One sign-in method per row, `UNIQUE(provider, provider_user_id)`. `provider="password"` stores a bcrypt hash in `password_hash`; SSO rows store the claim envelope in `identity_data`. **`(provider, provider_user_id)` is the ONLY identity key — never email.** `FK → users ON DELETE CASCADE`. |
-| `refresh_tokens` | Rotating-refresh store. Only the SHA-256 `token_hash` (`BINARY(32)`) is persisted; tokens minted from one login share a `family_id`; rotation stamps `replaced_by`. |
+| `refresh_tokens` | Rotating-refresh store. Only the SHA-256 `token_hash` (`BINARY(32)`) is persisted; tokens minted from one login share a `family_id`; rotation stamps `replaced_by` and `used_at` (migration 134 — the clock for the 30s reuse grace window). |
 | `sso_providers` | One configured IdP per row (see below). |
 | `sso_sessions` | One row per SSO-backed user (`user_id` PK) caching the AES-256-GCM-encrypted IdP tokens so the checkpoint can re-introspect the upstream grant. Also carries `subject` and `sid` (migration 109) — the two things a back-channel logout token can name. **Neither can be backfilled**: `sid` exists only in the id_token of the login that created the row, so a session written without one is unreachable by a session-scoped logout for its whole life. |
 | `settings` | Key/value app settings. |
@@ -622,8 +622,16 @@ Native flows: `HandleLogin` returns a neutral 401 on every failure (no email
 enumeration; missing accounts still pay a dummy bcrypt cost). `HandleRefresh` implements
 rotating refresh with **reuse detection** — presenting a spent (rotated) or revoked
 token revokes the entire `family_id` and clears cookies (OAuth 2.0 Security BCP §4.14).
-`HandleLogout` revokes the family (or all of the user's tokens when the path-scoped
-refresh cookie isn't sent). `HandleUpdateSelf` can create a `password` identity for an
+⚠️ **Except within `refreshGraceWindow` (30s) of rotation** (`routes/refresh_grace.go`, ported
+from forta-api): a spent token re-presented inside the window gets a fresh sibling in the same
+family and nothing is revoked (log line `MON_REFRESH_GRACE`). Concurrent tabs and lost
+responses produce honest double-presentations; zero tolerance logged users out constantly.
+Revoked tokens never get grace, and pre-migration-134 spent rows (`used_at` NULL) are reuse.
+Every JWT carries a random `jti` — without it two tokens minted for one user in the same second
+were byte-identical and collided on `uq_refresh_tokens_hash` (a 500 → client logout).
+`HandleLogout` revokes only the caller's family: from the refresh cookie if sent, else from
+the access token's `fid` claim (the browser never sends the path-scoped refresh cookie to
+`/auth/logout`), falling back to all of the user's tokens only for pre-`fid` access tokens. `HandleUpdateSelf` can create a `password` identity for an
 SSO-only account.
 
 **Back-channel logout (`POST /auth/sso/forta/backchannel-logout`).** Forta pushes a signed

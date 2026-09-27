@@ -49,7 +49,7 @@ func TestRoundTrip(t *testing.T) {
 	}{
 		{
 			"access",
-			func() (string, time.Time, error) { return NewAccessToken(42, "admin") },
+			func() (string, time.Time, error) { return NewAccessToken(42, "admin", "") },
 			func(tok string) (int64, error) { uid, _, err := ValidateAccessToken(tok); return uid, err },
 		},
 		{"refresh", func() (string, time.Time, error) { return NewRefreshToken(42) }, ValidateRefreshToken},
@@ -83,7 +83,7 @@ func TestExpiredRejected(t *testing.T) {
 
 func TestWrongTypeRejected(t *testing.T) {
 	// An access token must not pass refresh validation and vice-versa.
-	access, _, err := NewAccessToken(42, "admin")
+	access, _, err := NewAccessToken(42, "admin", "")
 	if err != nil {
 		t.Fatalf("mint access: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestAlgConfusionRejected(t *testing.T) {
 }
 
 func TestTamperedSignatureRejected(t *testing.T) {
-	tok, _, err := NewAccessToken(42, "admin")
+	tok, _, err := NewAccessToken(42, "admin", "")
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -152,5 +152,63 @@ func TestWrongIssuerRejected(t *testing.T) {
 	tok := signManual(t, jwtlib.SigningMethodHS512, claims, []byte(env.JWTSigningKey))
 	if _, err := ValidateToken(tok); err == nil {
 		t.Fatal("token with foreign issuer was accepted")
+	}
+}
+
+// TestRefreshTokensUnique pins the jti: two refresh tokens for the same user
+// minted back to back (same second) must differ, or their SHA-256 hashes collide
+// on uq_refresh_tokens_hash and the refresh grace path's sibling insert fails.
+func TestRefreshTokensUnique(t *testing.T) {
+	a, _, err := NewRefreshToken(1)
+	if err != nil {
+		t.Fatalf("NewRefreshToken: %v", err)
+	}
+	b, _, err := NewRefreshToken(1)
+	if err != nil {
+		t.Fatalf("NewRefreshToken: %v", err)
+	}
+	if a == b {
+		t.Fatal("two refresh tokens minted in the same second are identical")
+	}
+}
+
+// TestAccessTokenFamilyID pins the fid claim logout scopes itself by: it must
+// round-trip on access tokens, and a token minted without one (every token issued
+// before the claim existed) must still validate, just with an empty FamilyID.
+func TestAccessTokenFamilyID(t *testing.T) {
+	tests := []struct {
+		name string
+		fid  string
+	}{
+		{name: "with family", fid: "00112233445566778899aabbccddeeff"},
+		{name: "without family (pre-fid token)", fid: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tok, _, err := NewAccessToken(42, "admin", tt.fid)
+			if err != nil {
+				t.Fatalf("NewAccessToken: %v", err)
+			}
+			claims, err := ValidateAccessTokenClaims(tok)
+			if err != nil {
+				t.Fatalf("ValidateAccessTokenClaims: %v", err)
+			}
+			if claims.FamilyID != tt.fid {
+				t.Errorf("FamilyID = %q, want %q", claims.FamilyID, tt.fid)
+			}
+			if claims.UserID != 42 || claims.Role != "admin" {
+				t.Errorf("claims = (%d, %q), want (42, admin)", claims.UserID, claims.Role)
+			}
+		})
+	}
+
+	// A hand-built legacy token (no fid key in the payload at all) still passes.
+	legacy := signManual(t, jwtlib.SigningMethodHS512, baseClaims("access", time.Now().Add(time.Minute)), []byte(env.JWTSigningKey))
+	claims, err := ValidateAccessTokenClaims(legacy)
+	if err != nil {
+		t.Fatalf("legacy token rejected: %v", err)
+	}
+	if claims.FamilyID != "" {
+		t.Errorf("legacy FamilyID = %q, want empty", claims.FamilyID)
 	}
 }

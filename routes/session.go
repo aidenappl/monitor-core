@@ -3,6 +3,7 @@ package routes
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 
 	"github.com/aidenappl/monitor-core/db"
@@ -20,16 +21,19 @@ import (
 // rotating-refresh flow (HandleRefresh) does NOT use this; it mints successors
 // inside its own rotation transaction.
 func issueSession(w http.ResponseWriter, userID int64, role string) error {
-	rawRefresh, refreshExpiry, err := setTokenCookies(w, userID, role)
+	// The family is generated FIRST so the access token can carry it (fid) —
+	// that is what lets logout revoke this session rather than all of them.
+	family := make([]byte, 16)
+	if _, err := rand.Read(family); err != nil {
+		return err
+	}
+
+	rawRefresh, refreshExpiry, err := setTokenCookies(w, userID, role, hex.EncodeToString(family))
 	if err != nil {
 		return err
 	}
 
 	hash := sha256.Sum256([]byte(rawRefresh))
-	family := make([]byte, 16)
-	if _, err := rand.Read(family); err != nil {
-		return err
-	}
 
 	if _, err := query.CreateRefreshToken(db.SQL, query.CreateRefreshTokenRequest{
 		UserID:    userID,

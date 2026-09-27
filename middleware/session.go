@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/hex"
 	"net/http"
 	"strings"
 
@@ -243,6 +244,50 @@ func RequireEditor(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// SessionFamilyID returns the refresh-token family (jwt.Claims.FamilyID,
+// hex-decoded) of the access token that authenticates r for userID, so logout
+// can revoke THIS session instead of every session the user has.
+//
+// It re-parses rather than threading the family through context: logout is the
+// only consumer, and validateSessionToken's two plane paths (control plane and
+// zone) stay untouched. The precedence mirrors SessionMiddleware — Bearer first,
+// then the mon-access-token cookie — and a token only counts if it validates
+// AND belongs to userID, so it is the same token the middleware accepted.
+//
+// ok is false for tokens minted before the fid claim existed, and for a
+// malformed fid; the caller falls back to revoking everything.
+func SessionFamilyID(r *http.Request, userID int64) ([]byte, bool) {
+	candidates := []string{extractBearerToken(r)}
+	if cookie, err := r.Cookie("mon-access-token"); err == nil {
+		candidates = append(candidates, cookie.Value)
+	}
+	for _, tok := range candidates {
+		if tok == "" {
+			continue
+		}
+		claims, err := jwt.ValidateAccessTokenClaims(tok)
+		if err != nil || claims.UserID != userID {
+			continue
+		}
+		return decodeFamilyID(claims.FamilyID)
+	}
+	return nil, false
+}
+
+// decodeFamilyID turns a fid claim back into the 16-byte family_id column value.
+// Anything that is not exactly 16 hex-encoded bytes is rejected rather than
+// passed to RevokeFamily, where it would silently match nothing.
+func decodeFamilyID(fid string) ([]byte, bool) {
+	if fid == "" {
+		return nil, false
+	}
+	b, err := hex.DecodeString(fid)
+	if err != nil || len(b) != 16 {
+		return nil, false
+	}
+	return b, true
 }
 
 func extractBearerToken(r *http.Request) string {

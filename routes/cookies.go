@@ -64,15 +64,16 @@ func writeAuthCookies(w http.ResponseWriter, accessToken, refreshToken string, a
 
 // setTokenCookies mints a fresh access + refresh token for userID (the role is
 // stamped into the access token so a zone can authorise without a users table —
-// see jwt.Claims.Role), writes all
+// see jwt.Claims.Role — and so is familyID, the hex refresh family, so logout
+// can revoke just this session — see jwt.Claims.FamilyID), writes all
 // three session cookies, and returns the RAW refresh token plus its expiry so
 // the caller can persist its SHA-256 hash (the raw token is never stored). This
 // is the convenience entry point for handlers that start a new session
 // (native login/register, SSO callback — Phase 3). The rotating refresh flow in
 // HandleRefresh mints its successor token itself and calls writeAuthCookies
 // directly so it can persist the hash inside its rotation transaction.
-func setTokenCookies(w http.ResponseWriter, userID int64, role string) (rawRefresh string, refreshExpiry time.Time, err error) {
-	access, accessExp, err := jwt.NewAccessToken(userID, role)
+func setTokenCookies(w http.ResponseWriter, userID int64, role string, familyID string) (rawRefresh string, refreshExpiry time.Time, err error) {
+	access, accessExp, err := jwt.NewAccessToken(userID, role, familyID)
 	if err != nil {
 		return "", time.Time{}, err
 	}
