@@ -68,7 +68,7 @@ what is deliberately **not** built yet.
     *Stores — configuration vs facts*.**
 - **CORS:** `github.com/rs/cors`.
 - **Sessions/JWT:** `github.com/golang-jwt/jwt/v5` (Monitor-owned HS512 tokens).
-- **SSO:** `github.com/aidenappl/go-forta/sso` **v1.6.0** — the shared SSO module. It brings
+- **SSO:** `github.com/aidenappl/go-forta/sso` **v1.11.0** — the shared SSO module. It brings
   `coreos/go-oidc/v3` and `golang.org/x/oauth2` transitively; this repo no longer imports
   either directly.
 - **Passwords/crypto:** `golang.org/x/crypto/bcrypt` (cost 12) + AES-256-GCM (`tools/Crypto.go`).
@@ -755,7 +755,7 @@ What remains is everything the library refuses to know:
 | `sso/sessionstore.go` | `ssolib.SessionStore` over `sso_sessions`, with AES-256-GCM at rest. Returns `(nil, nil)` for a native login, which is what stops the checkpoint denying every password user. Also implements `ssolib.BackchannelLogoutTarget` (`DeleteSessionsBySID`/`BySubject`) — the same store the checkpoint uses, so push and poll end sessions through one code path. |
 | `sso/backchannel.go` | Builds the OIDC Back-Channel Logout 1.0 receiver. Mounted at `POST /auth/sso/forta/backchannel-logout`. |
 | `sso/resolve.go` | `ssolib.UserResolver` — the link/provision decision matrix, plus `LinkIdentity`. **The most security-sensitive file here.** |
-| `sso/checkpoint.go` | Installs the library `Checkpointer` into the session middleware. |
+| `sso/checkpoint.go` | Installs the library `Checkpointer` into the session middleware, with `Correlation` (forwards `middleware.RequestIDKey` as `X-Request-ID` on the introspection) and `LogfCtx` (appends `request_id=`). |
 
 - An `sso_providers` row still fully describes an IdP; `kind` selects the library's OIDC or
   OAuth2 adapter. A login normalizes to `ssolib.Identity{Provider, Subject, Email,
@@ -796,6 +796,15 @@ What remains is everything the library refuses to know:
 - **Revocation checkpoint (`sso/checkpoint.go`, wired by `sso.Install()`):** for
   SSO-backed sessions, `SessionMiddleware` periodically (5-min TTL) re-introspects the
   cached IdP token; `active=false` kills the local session, network/DB errors fail **open**.
+- **Checkpoint request correlation (go-forta v1.11.0).** `sso.Install` sets
+  `middleware.SSOCheckpointCtx` (preferred) as well as the legacy `middleware.SSOCheckpoint`
+  (kept, decides identically with `context.Background()`). `SessionMiddleware` passes the
+  request context through `validateSessionTokenCtx` → `passesSSOCheckpoint`, so the
+  introspection call to forta-api carries this request's `X-Request-ID` and each checkpoint log
+  line ends `request_id=…`. Concurrent checks for one user share one introspection, which
+  carries the first caller's id. **Always pass the request ctx into `Checkpointer.Check`** — a
+  `context.Background()` forwards nothing. Pinned by `middleware/session_checkpoint_test.go`
+  (hook precedence + fallback) and `sso/checkpoint_test.go` (the id arrives at an httptest IdP).
 - **Client secrets** are never stored/echoed in the clear: either a Keyring reference
   (`client_secret_ref`, resolved Keyring→env at login) or an AES-256-GCM value
   (`client_secret_enc`). The admin API exposes only a `has_secret` boolean.
