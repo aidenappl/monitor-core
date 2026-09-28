@@ -56,8 +56,10 @@ non-empty and `Init` seeds nothing.
   maps matching alerts (by service group / priority / etc.) to channels.
 - **Service group** — named set of services referenced by policies.
 - **State** (per rule) — `ok`/`firing`, `value`, `fired_at`, `resolved_at`,
-  `last_notified_at`. **ClickHouse**, rewritten every evaluation; read by `GetState`,
-  written by `UpsertState`.
+  `last_notified_at`. **ClickHouse**, rewritten every evaluation. The evaluator reads a
+  project's states once per tick with `ListAllStates` and writes every evaluated rule's
+  state in one multi-row INSERT with `UpsertStates`; `GetState` serves the single-rule
+  API read.
 - **History entry** — append-only firing/resolved log surfaced at `/v1/alert-history`.
   **ClickHouse**, with a 90-day TTL — which is the single strongest reason it stayed there.
 
@@ -73,38 +75,105 @@ returns a 400 naming the field instead of errno 1265.
 
 ```
 main.go starts Evaluator.Run(ctx)  → 15s ticker → evaluateAll
-  evaluateAll: listEnabledRules → query.ListEnabledAlertRules(db.SQL)  [MariaDB, no FINAL]
-    per rule: respect per-rule evaluation_interval_seconds throttle (lastEvaluated map)
-      evaluateRuleState(rule) → (value, isFiring)   [branches on rule.Type — see below]
-      state machine:
-        ok + firing   → if for_seconds>0 stay ok + record pendingSince; else fire now
-        firing+firing → re-notify only if now-last_notified >= cooldown_seconds
-        firing + !firing → resolved
-        pending>=for_seconds while firing → fire
+  evaluateAll: now = clock()  (BEFORE the listing)
+    listEnabledRules → query.ListEnabledAlertRules(db.SQL)  [MariaDB, no FINAL]
+    drop lastEnd/pendingSince/retryAt/inherited/unsaved of rules no longer listed
+    first successful listing only: mark its rules "inherited"
+    per rule: skip while now < retryAt (a failed window retries once per interval)
+      skip unless unscheduled or a complete window [lastEnd, lastEnd+interval) ≤ now-settle
+      first such rule of a project → ListAllStates(project)  [once per project per tick;
+                                    on error skip that project's rules this tick]
+      persisted = unsaved[rule] ?? the project's row for it
+      unscheduled → seed: inherited with a saved row → resume from its updated_at
+                          else floor(now-settle) - interval
+      dueWindows: > 5 behind → log the skipped span, jump to the latest, drop the hold
+      per window, oldest first: evaluateRuleState(rule, from, to) → (value, isFiring)
+        [branches on rule.Type — see below]; on error stop, hold lastEnd, set retryAt
+        applyWindow: !firing → ok (drop hold); ok + firing → for_seconds>0 ? hold from
+          this window's end (set ONLY on ok→pending), fire once to-hold ≥ for_seconds
+          : fire
+        lastEnd = window end
+      saved ok, a window fired, final window ok → publish as firing (value that fired),
+        save firing, log it; the next tick's window resolves it
+      notify ONCE, on the persisted-before-tick status → status after the tick:
+        ok → firing: onFiring   firing → ok: onResolved
+        firing → firing: re-notify only if now-last_notified >= cooldown_seconds
       onFiring/onResolved: RecordHistory + alertHub.PublishStateChange + router.Route
+  UpsertStates(evaluated states + unsaved ones not re-evaluated)  [ONE multi-row
+    INSERT per tick; on error keep the batch in `unsaved` and retry next tick]
 ```
+
+**Windows (ING-9).** Each rule walks contiguous half-open windows `[lastEnd,
+lastEnd+interval)`; a window is evaluated once its end is older than the **settle** delay,
+`FLUSH_INTERVAL + 3 s` (≈ 8 s), so every event is counted exactly once and has been flushed
+before its window is read. The interval is `max(evaluation_interval_seconds, 15 s)` with 0
+read as 60 s. `lastEnd` is in memory and seeded on first sight, after the project's states
+are read. A new or re-enabled rule starts at `floor(now − settle) − interval` (floor on the
+interval grid): its latest complete window. A rule **inherited** from the previous process —
+in the first successful listing, with a saved state — resumes from that state's `updated_at`
+(the old process's tick, read back at whole seconds), so its first window re-reads exactly
+the last window the old process evaluated, however long the restart took. Re-reading that
+one window reproduces the saved status, so the overlap never notifies twice; seeding further
+back would re-send transitions. Seeding from `now` alone gapped whenever the restart
+(including the new process's first 15 s tick) outlasted an interval — almost always for a
+15 s rule. A restart longer than 5 intervals is a logged jump, not a silent gap. `lastEnd`
+advances only past a window whose aggregate succeeded; a ClickHouse error holds it and the
+rule is retried **once per interval** (`retryAt`, half a tick early for ticker jitter), so an
+outage costs one failing aggregate and one log line per rule per interval. More than 5
+windows behind, the rule jumps to the latest complete window, logs the skipped span, and
+restarts its `for_seconds` hold (skipped time never counts toward it). A catch-up of ≤ 5
+windows notifies **at most once**, against the status persisted before the tick; usually
+that is where the final window leaves the rule, but a rule saved ok whose catch-up fired and
+cleared (`[1, 0]`, `[1, 1, 0]`) is published as **firing** with the value that fired, logged,
+and saved firing — the next tick's window resolves it. Read as its net change (ok → ok) it
+was silent: no notification, no history row, no log. Window bounds are whole seconds —
+clickhouse-go binds a `time.Time` at second precision. Events flushed later than the settle
+delay are still missed (known limit).
+
+**State writes.** A failed `UpsertStates` keeps the whole batch in memory (`unsaved`). Those
+states stand in for the stale stored rows on the next tick and are written again with its
+batch (even a tick with nothing due), so a transient INSERT error cannot replay a firing or
+resolve the tick already sent. A rule that stops being listed drops its unsaved state, so a
+deleted rule's row is not written back.
+
+**Known limits.** Only `alert_states` survives a restart. The `for_seconds` hold
+(`pendingSince`) is measured in window time but lives in memory, so every restart restarts
+it — and since every push rolls monitor-core in both zones, a rule whose `for_seconds` is
+longer than the gap between deploys may never fire during a busy run of deploys. Persisting
+it needs a column on `alert_states`; that is the owner's call. A process that dies after
+publishing a tick but before its INSERT replays those transitions on the next start. An
+inherited rule's seed assumes the old process was caught up at its last write: if its last
+tick evaluated only part of a catch-up before a ClickHouse error and it then exited, the
+windows in between are skipped without a log line. `ListAllStates` failures are retried
+every tick (one read per project), not backed off.
 
 The evaluator runs on a **single goroutine**, rules evaluated **sequentially**.
 `router.Route` dispatches each channel notification on its **own goroutine** (with a
-`defer recover()`), so a slow/unreachable channel can't stall evaluation.
+`defer recover()`), so a slow/unreachable channel can't stall evaluation. Every dependency
+(clock, rule listing, state read/write, aggregate, publish, log) is a field on `Evaluator`,
+which `evaluator_schedule_test.go` drives with an injected clock.
 
 ### Type branching (`evaluateRuleState`, evaluator.go)
 
-`evaluateRuleState(ctx, rule) → (value, isFiring, error)` builds range helpers
-(`queryValueForRange`, `queryCountForRange`, both on top of `queryAggForRange`) and
+`evaluateRuleState(ctx, aggregate, rule, from, to) → (value, isFiring, error)` evaluates
+the half-open window `[from, to)` through range helpers (`queryValueForRange`,
+`queryCountForRange`, both calling `aggregate` — `queryAggForRange` in production) and
 branches on `rule.Type`:
 
-- **`threshold`** (and empty/unknown) — `value` = metric agg over `[now-interval, now]`;
+- **`threshold`** (and empty/unknown) — `value` = metric agg over `[from, to)`;
   `isFiring = CheckCondition(value, condition, threshold)`.
-- **`absence`** — `value` = `COUNT` over `[now-interval, now]` (ignores metric/field;
+- **`absence`** — `value` = `COUNT` over `[from, to)` (ignores metric/field;
   still applies `query_filters`); `isFiring = (value == 0)`.
-- **`rate_change`** — `cur` over `[now-interval, now]`, `prev` over
-  `[now-2*interval, now-interval]`; `value` = percent change
+- **`rate_change`** — `cur` over `[from, to)`, `prev` over `[from-interval, from)` (on
+  the timer, exactly the window evaluated before); `value` = percent change
   (`prev==0 ? (cur>0?100:0) : (cur-prev)/prev*100`, div-by-zero guarded);
   `isFiring = CheckCondition(pct, condition, threshold)`.
 
-`EvaluateRuleNow` (test endpoint) returns `(value, isFiring, error)` from this same
-function, so the test result is type-correct.
+The timer passes each scheduled window; `EvaluateRuleNow` (test endpoint) passes
+`[now-interval, now)` with the same effective interval (so 0 → 60 s) and the same
+`queryAggForRange`, so the test result is type-correct and built by the same statement.
+`buildAggQuery` emits `timestamp >= ? AND timestamp < ?` for both paths — an inclusive upper
+bound would count a boundary event in two contiguous windows.
 
 ### UpdateAlertRuleRequest (partial update)
 
@@ -179,6 +248,19 @@ notification dispatch (`router.go`), the partial-update-disables-rule bug and th
 `gofmt -w -s . && go build ./... && go vet ./... && go test ./...` from repo root.
 `evaluator_test.go` covers `CheckCondition`, the rate/absence firing math, the
 `numericFieldExpr`/`buildFilterCondition` injection guards and the project-scoping of
-`buildAggQuery`. The configuration layer is covered from `query/`:
+`buildAggQuery`. `evaluator_schedule_test.go` drives `evaluateAll` with an injected clock:
+every event counted in exactly one window, late-within-settle events counted, `now` taken
+before the listing, interval 0 / 1 s clamping, restarts of 60 s and 15 s rules resuming at
+the old process's last window (never a gap, never more than one window re-read, a logged
+skip past the catch-up cap, re-enabled rules not inherited), ClickHouse errors holding
+`lastEnd`, one retry per interval (and per tick under ticker jitter), the >5-window jump,
+its log and the `for_seconds` hold it restarts, catch-up notifying at most once and never
+silently (a fired-and-cleared catch-up, followed through for a threshold-1 rule after an
+outage and after a slow 15 s pass), `for_seconds`, rate_change/absence across windows,
+re-enable starting fresh, one state read per project and one INSERT per tick, a failed
+state read skipping only its project, a failed INSERT neither replaying a transition nor
+writing back a deleted rule, `ListAllStates` reporting a stream that broke partway, and the
+timer/test-endpoint statement parity through the real `queryAggForRange`. (Do not name a
+test file `*_windows_test.go` — Go reads that suffix as a GOOS build constraint.) The configuration layer is covered from `query/`:
 `alert_rules_query_test.go`, `notification_policies_query_test.go` and
 `config_tables_query_test.go`.

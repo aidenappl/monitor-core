@@ -1420,7 +1420,7 @@ migrations 119-124 — every alerting and dashboard setting.
 | Table | Store | Why |
 |---|---|---|
 | `events`, `issue_occurrences_daily` | ClickHouse | facts, columnar, TTL'd |
-| `alert_states` | ClickHouse | one row per rule, rewritten by a 15s timer; `project` since `migrations/007` |
+| `alert_states` | ClickHouse | one row per rule, rewritten once per evaluation window (all of a tick's states in one multi-row INSERT); `project` since `migrations/007` |
 | `alert_history` | ClickHouse | append-only transitions, **90-day TTL** (no MariaDB equivalent); `project` since `migrations/007` |
 | `monitor.issues`, `issue_timeline`, `issue_links` | MariaDB | triage state, uniqueness, FKs (111-114) |
 | `monitor.service_repos` | MariaDB | explicit mapping (115), keyed `(project, service)` since 133 |
@@ -1642,10 +1642,13 @@ The first two are **data plane only** — they do not start under `MON_ROLE=app`
 API-key refresher starts in every role, because both planes authenticate API keys.
 
 - **Batcher** — drains the queue into ClickHouse.
-- **Alert evaluator** — 15s ticker; evaluates every enabled rule against ClickHouse,
-  tracks firing/resolved state, records history, publishes to the alert SSE hub, routes
-  notifications through policies. Alert types (`threshold`/`absence`/`rate_change`) and the
-  pointer-field `UpdateRuleRequest` contract are documented in `alerts/AGENTS.md`.
+- **Alert evaluator** — 15s ticker; evaluates every enabled rule against ClickHouse over
+  contiguous half-open windows that are evaluated only once they are older than the settle
+  delay (`FLUSH_INTERVAL` + 3 s), tracks firing/resolved state (one `alert_states` read per
+  project and one multi-row INSERT per tick), records history, publishes to the alert SSE
+  hub, routes notifications through policies. The window rules, alert types
+  (`threshold`/`absence`/`rate_change`) and the pointer-field `UpdateRuleRequest` contract
+  are documented in `alerts/AGENTS.md`.
 - **API-key cache refresher** — `CACHE_REFRESH_INTERVAL` (30s) ticker started by
   `apikeys.Init`; re-reads `api_keys` from MariaDB so revocation propagates (§5).
 
@@ -1935,7 +1938,7 @@ deviating.
   | `MON_GITHUB_TOKEN_TRAILBLAZE` | `` | default fine-grained PAT for fetching linked PR state. **Optional** — unset means links store fine but carry no live state |
   | `MON_GITHUB_TOKEN_<OWNER>` | `` | per-org token, name derived from the GitHub owner (`TeamTrailblaze` → `MON_GITHUB_TOKEN_TEAMTRAILBLAZE`). Takes precedence over the default; adding an org needs no code change |
   | `MON_GITHUB_WEBHOOK_SECRET_TRAILBLAZE` | `` | shared secret GitHub signs deliveries with. **Optional, but unset REJECTS every delivery** — it never fails open. Generate with `openssl rand -hex 32` and paste the same value into the repo's webhook config |
-  | `BATCH_SIZE` / `FLUSH_INTERVAL` / `QUEUE_SIZE` / `MAX_SSE_SUBSCRIBERS` | `1000` / `5s` / `100000` / `100` | ingestion/SSE tuning |
+  | `BATCH_SIZE` / `FLUSH_INTERVAL` / `QUEUE_SIZE` / `MAX_SSE_SUBSCRIBERS` | `1000` / `5s` / `100000` / `100` | ingestion/SSE tuning. `FLUSH_INTERVAL` + 3 s is also the alert evaluator's settle delay: a window is evaluated only once its end is that old, so raising it delays alerts by the same amount |
 
 - **Manual reconciliation scripts (`migrations/manual/`) — the operator runbook.**
 

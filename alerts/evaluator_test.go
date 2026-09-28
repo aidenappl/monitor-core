@@ -238,6 +238,11 @@ func TestTimerAndTestEndpointBuildTheSameStatement(t *testing.T) {
 	if !strings.Contains(timerSQL, "project = ?") {
 		t.Errorf("the timer path built an unscoped aggregate — the zone-wide gap is back:\n\t%s", timerSQL)
 	}
+	// Half-open on both paths: the timer's windows are contiguous, so an
+	// inclusive upper bound would count a boundary event twice.
+	if !strings.Contains(timerSQL, "timestamp >= ? AND timestamp < ?") {
+		t.Errorf("the window is not half-open [from, to):\n\t%s", timerSQL)
+	}
 	want := []interface{}{from, to, "atlas", "atlas-api"}
 	if !reflect.DeepEqual(timerArgs, want) {
 		t.Errorf("args = %v, want %v", timerArgs, want)
@@ -402,9 +407,10 @@ func TestTimerAndTestEndpointAgreeOnAGuardedDataRule(t *testing.T) {
 		t.Errorf("timer and test endpoint disagree:\n\ttimer: %s %v\n\thttp:  %s %v", timerSQL, timerArgs, httpSQL, httpArgs)
 	}
 
-	// The table name in between is db.Database, which no test here sets.
+	// The table name in between is db.Database, which no test here sets. The
+	// window is half-open — `timestamp < ?` — on both paths (see buildAggQuery).
 	wantHead := "SELECT toFloat64(avg(" + wantGuardedNumber + ")) AS value FROM "
-	wantTail := ".events WHERE timestamp >= ? AND timestamp <= ? AND project = ? AND " + wantGuardedNumber + " > ?"
+	wantTail := ".events WHERE timestamp >= ? AND timestamp < ? AND project = ? AND " + wantGuardedNumber + " > ?"
 	if !strings.HasPrefix(timerSQL, wantHead) || !strings.HasSuffix(timerSQL, wantTail) {
 		t.Errorf("sql =\n\t%s\nwant\n\t%s<db>%s", timerSQL, wantHead, wantTail)
 	}

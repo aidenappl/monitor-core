@@ -622,7 +622,7 @@ verified. Full details in [AGENTS.md](./AGENTS.md) §6.
 | `CLICKHOUSE_MAX_MEMORY_USAGE` | `2147483648` | Per-**query** memory ceiling in bytes (2 GiB), sent as the `max_memory_usage` setting. Unset, the effective limit is ~90% of host RAM, so one high-cardinality `GROUP BY` can OOM-kill the server and take ingest with it |
 | `MONITOR_API_KEY`     | *(required)*     | Master API key (header `X-Api-Key`); server refuses to start if unset |
 | `BATCH_SIZE`          | `1000`           | Number of events per batch insert             |
-| `FLUSH_INTERVAL`      | `5s`             | Max time to wait before flushing batch        |
+| `FLUSH_INTERVAL`      | `5s`             | Max time to wait before flushing batch; plus 3 s, also the alert evaluator's settle delay |
 | `QUEUE_SIZE`          | `100000`         | Max events in memory queue                    |
 | `MON_DB_DSN`          | `monitor:monitor@tcp(127.0.0.1:3336)/monitor_auth` | MariaDB DSN (auth data layer); from Keyring in prod |
 | `MON_JWT_SIGNING_KEY` | *(dev default)*  | HS512 session-token key; **prod must override** |

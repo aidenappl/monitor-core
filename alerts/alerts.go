@@ -3,6 +3,7 @@ package alerts
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
@@ -20,8 +21,8 @@ import (
 // in query/*.query.go. What remains here is the half that did not move:
 //
 //   * alert_states and alert_history, which stay in ClickHouse. They are
-//     per-evaluation FACTS: a state row is rewritten by a timer every 15 seconds
-//     and a history row is appended on every transition, so they are time-series
+//     per-evaluation FACTS: a state row is rewritten by a timer every evaluation
+//     window and a history row is appended on every transition, so they are time-series
 //     shaped in the way issue occurrences are, and alert_history carries a 90-day
 //     TTL that has no MariaDB equivalent short of a scheduled DELETE. Migration
 //     119's header states the split in full.
@@ -292,10 +293,11 @@ func DeleteRule(ctx context.Context, project, id string) error {
 }
 
 // ListAllStates returns one project's alert states as a map keyed by rule_id.
+// The evaluator reads each project's states through it once per tick.
 //
 // FINAL is required and stays: alert_states is a ReplacingMergeTree rewritten
-// every 15 seconds per rule, so without it a read returns however many versions
-// a background merge has not yet collapsed.
+// once per evaluation window per rule, so without it a read returns however
+// many versions a background merge has not yet collapsed.
 func ListAllStates(ctx context.Context, project string) (map[string]*State, error) {
 	predicate, args, err := projectPredicate(ctx, project)
 	if err != nil {
@@ -319,6 +321,12 @@ func ListAllStates(ctx context.Context, project string) (map[string]*State, erro
 		}
 		stateMap[s.RuleID] = &s
 	}
+	// A stream that broke partway is an error, not a shorter map: the evaluator
+	// would build every rule missing from it as a fresh ok state and fire the
+	// firing ones again.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read alert states: %w", err)
+	}
 	return stateMap, nil
 }
 
@@ -341,18 +349,54 @@ func GetState(ctx context.Context, project, ruleID string) (*State, error) {
 	return &s, nil
 }
 
-// UpsertState inserts or updates alert state (ReplacingMergeTree handles dedup).
+// UpsertState inserts or updates one rule's alert state (ReplacingMergeTree
+// handles dedup).
 //
-// The project comes off the State, which the evaluator copies from the rule. It
-// is written on EVERY evaluation, which is why alert_states needs no manual
-// backfill the way alert_history does: the timer rewrites every row of every
-// enabled rule within one evaluation interval, and the ReplacingMergeTree
-// collapses the unstamped version away.
+// The evaluator no longer calls it — it writes a whole tick's states at once
+// through UpsertStates — but it stays as the single-row form of the same
+// statement.
 func UpsertState(ctx context.Context, s *State) error {
 	return db.Conn.Exec(ctx, fmt.Sprintf(
 		"INSERT INTO %s.alert_states (rule_id, project, status, value, fired_at, resolved_at, last_notified_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 		db.Database,
 	), s.RuleID, s.Project, s.Status, s.Value, s.FiredAt, s.ResolvedAt, s.LastNotifiedAt, s.UpdatedAt)
+}
+
+// UpsertStates writes many rules' states in ONE multi-row INSERT — one
+// statement and one part per evaluator tick, where a single-row INSERT per rule
+// per evaluation made a tiny part each.
+//
+// The project comes off each State, which the evaluator copies from the rule.
+// Every EVALUATED rule's state is in the batch, changed or not, which is why
+// alert_states needs no manual backfill the way alert_history does: the timer
+// rewrites every enabled rule's row within one evaluation interval, and the
+// ReplacingMergeTree collapses the unstamped version away. An empty slice
+// issues nothing.
+func UpsertStates(ctx context.Context, states []*State) error {
+	if len(states) == 0 {
+		return nil
+	}
+	statement, args := buildUpsertStates(states)
+	return db.Conn.Exec(ctx, statement, args...)
+}
+
+// buildUpsertStates is split out of UpsertStates so a test can assert on the
+// statement: one INSERT, one tuple per state, the args in column order.
+func buildUpsertStates(states []*State) (string, []interface{}) {
+	var b strings.Builder
+	fmt.Fprintf(&b,
+		"INSERT INTO %s.alert_states (rule_id, project, status, value, fired_at, resolved_at, last_notified_at, updated_at) VALUES ",
+		db.Database,
+	)
+	args := make([]interface{}, 0, 8*len(states))
+	for i, s := range states {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("(?, ?, ?, ?, ?, ?, ?, ?)")
+		args = append(args, s.RuleID, s.Project, s.Status, s.Value, s.FiredAt, s.ResolvedAt, s.LastNotifiedAt, s.UpdatedAt)
+	}
+	return b.String(), args
 }
 
 // RecordHistory records an alert event in history.
