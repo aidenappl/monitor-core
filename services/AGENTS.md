@@ -134,7 +134,46 @@ project's events in real time, leaving no query, no audit row and no error behin
   asserts on the **generated SQL text** — the only way to prove a chokepoint fires on every
   path, since a builder that stopped applying it still runs and still returns rows. It also
   checks *every* statement a call issues, because `QueryEvents` emits a count plus a page and
-  `QueryCompare` emits two gauges, and a predicate on one of a pair is a real bug.
+  `QueryCompare` emits two gauges, and a predicate on one of a pair is a real bug. Those
+  pairs now run **concurrently** (`runConcurrently`, a minimal errgroup: first error wins
+  and cancels the sibling), so `recordingConn` locks and records a statement with its args
+  as one entry, and its call ORDER is not deterministic — pick a statement by its text
+  (`recorder.find`), never by index. `rendezvousConn` proves the overlap.
+- **Label values use `GROUP BY col`, not `DISTINCT col`** — same rows, but only GROUP BY
+  aggregates a LowCardinality column on its dictionary keys (~3x less CPU on a full scan).
+- **The events page is two-phase when no filter is `data.*`** (`buildEventPageQuery`): an
+  inner timestamp-only read with the same predicate, filters, ORDER/LIMIT/OFFSET finds the
+  page, and the wide read is bounded to `timestamp >= (SELECT min(timestamp) FROM
+  (inner))`. Both phases start at `selectEvents`, so the inner one carries its own project
+  predicate (it decides which rows make the page); args are the outer set then the inner
+  set. With a `data.*` filter both phases would parse `data`, so the page stays one
+  statement.
+- **Every `data.*` extract whose key is written into the SQL text is guarded** — that is,
+  every key interpolated after passing `structs.SafeIdentifierRegex`: `dataStringExpr(key)`
+  is `if(position(data, '"key"') > 0, JSONExtractString(data, 'key'), '')` and
+  `dataNumberExpr(key)` is `toFloat64OrNull(if(position(...) > 0, JSONExtractRaw(data,
+  'key'), ''))`. Exact because `data` is only ever `json.Marshal` output, which writes a
+  `SafeIdentifierRegex` key verbatim. **Guard the inner extract only** on the numeric side:
+  a missing key must stay NULL, or it satisfies `< N` and drags avg/min/quantile toward 0.
+  `alerts/evaluator.go` has its own copy and both test files pin the same literal text.
+  Guarded sites: `query.go` `applyDataFilter`; `analytics.go` `buildFieldExpr`,
+  `buildNumericFieldExpr`, `buildGroupByExprs`, `buildSingleFilter`, `QueryTopN`;
+  `alerts/evaluator.go` `numericFieldExpr`, `buildFilterCondition` (via
+  `guardedDataString` / `guardedDataNumber`).
+  **Deliberate exception — `GetDataValues`** uses a bare `JSONExtractString(data, ?)` with
+  the key as a BOUND parameter. That key is not validated by `SafeIdentifierRegex`, so it
+  must never reach the SQL text: it **MUST stay a bound parameter** — swapping it for
+  `dataStringExpr(key)` would interpolate an unvalidated key and open an injection hole.
+  **Temporary exception** — the legacy unstamped-row scan in `routes/issues.go`
+  (`HandleGetIssueEvents`) uses bare `JSONExtractString(data, 'path'/'uri')` with constant
+  keys; it is bounded by `legacyIssueScanCutoff` and is removed along with that scan.
+  (`GetDataKeys`' `JSONExtractKeys(data)` takes no key and is out of scope.)
+- **String data filters may add a value prefilter** — `position(data, ?) > 0 AND` bound to
+  the value, ahead of the comparison — for eq/contains/startswith/endswith only, in both
+  `applyDataFilter` and analytics' `buildSingleFilter`, and only when `valuePrefilter`
+  says it is exact: a non-empty string that `json.Marshal` writes verbatim (no control
+  chars, `"`, `\`, `<`, `>`, `&`, U+2028/9, invalid UTF-8), and for the LIKE operators no
+  `%`, `_` or `\` either. neq and the numeric comparisons never take it.
 - Both build SQL with squirrel and run it via the ClickHouse driver.
 - **Both `analytics.go` and `query.go` validate `data.*` field names** with
   `structs.SafeIdentifierRegex` and reject unknown columns against

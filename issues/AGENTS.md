@@ -86,8 +86,11 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
   in Go, bounded by `candidateScanLimit` — which truncated and logged when a sparse issue
   was buried among high-volume siblings. That legacy scan survives only as a fallback,
   restricted to `issue_id = ''` so it can return only rows the fast path could not, and
-  **is removable 30 days after the deploy of `004`** once the events TTL has aged out
-  every unstamped row.
+  bounded to `timestamp < routes.legacyIssueScanCutoff` (2026-08-26 03:00 UTC: the `004`
+  deploy finished 2026-08-25 02:13 UTC, plus a day) so partition pruning skips every day
+  after it. It **is removable 30 days after that cutoff** once the events TTL has aged
+  out every unstamped row — the constant's comment has the check to run first. The fast
+  path itself is a two-phase read (routes `AGENTS.md`, *Project-scoped event reads*).
 - **Message/path extraction** pulls `path`/`uri`, `error`/`error_message`/`message`,
   and `method` out of the event's `data` map to build a descriptive title.
 - **Storage: MariaDB `monitor.issues`** (moved off ClickHouse). The table is created by

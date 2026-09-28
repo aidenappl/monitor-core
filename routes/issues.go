@@ -592,16 +592,20 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 	// The scan is restricted to issue_id = '' so it can only ever return rows the
 	// fast path could not have: without that, a stamped event would be returned
 	// twice once both paths run.
+	//
+	// It is also bounded to timestamp < legacyIssueScanCutoff, so partition
+	// pruning skips every day written after stamping began and the scan reads
+	// next to nothing (see the constant for how the cutoff was chosen).
 	var query string
 	var args []interface{}
 	if issue.Path != nil && *issue.Path != "" {
 		query, args, err = selectIssueEvents(r.Context(),
-			"issue_id = '' AND service = ? AND name = ? AND level IN ('error', 'fatal') AND (JSONExtractString(data, 'path') = ? OR JSONExtractString(data, 'uri') = ?) ORDER BY timestamp DESC LIMIT ?",
-			issue.Service, issue.Name, *issue.Path, *issue.Path, candidateScanLimit(limit))
+			"issue_id = '' AND timestamp < ? AND service = ? AND name = ? AND level IN ('error', 'fatal') AND (JSONExtractString(data, 'path') = ? OR JSONExtractString(data, 'uri') = ?) ORDER BY timestamp DESC LIMIT ?",
+			legacyIssueScanCutoff, issue.Service, issue.Name, *issue.Path, *issue.Path, candidateScanLimit(limit))
 	} else {
 		query, args, err = selectIssueEvents(r.Context(),
-			"issue_id = '' AND service = ? AND name = ? AND level IN ('error', 'fatal') ORDER BY timestamp DESC LIMIT ?",
-			issue.Service, issue.Name, candidateScanLimit(limit))
+			"issue_id = '' AND timestamp < ? AND service = ? AND name = ? AND level IN ('error', 'fatal') ORDER BY timestamp DESC LIMIT ?",
+			legacyIssueScanCutoff, issue.Service, issue.Name, candidateScanLimit(limit))
 	}
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to build event query", err)
@@ -655,11 +659,26 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 	responder.New(w, events)
 }
 
+// legacyIssueScanCutoff bounds HandleGetIssueEvents' pre-004 fallback scan.
+// Commit 0cf5e47 (migration 004, issue_id stamped at ingest) was built and
+// deployed by CI run 32800487999, which finished at 2026-08-25 02:13 UTC; one
+// day of margin covers a zone that rolled late. No error/fatal event written
+// after the cutoff is unstamped, so the scan loses nothing, and the day
+// partitions after it are pruned without being read.
+//
+// The fallback block, this constant and candidateScanLimit can all be deleted
+// once 30 days have passed since the cutoff (the events TTL), i.e. from
+// 2026-09-25 on, once a count of error/fatal rows with an empty issue_id
+// returns 0 on every zone — TTL deletes rows at merge time, not at the instant
+// they expire.
+var legacyIssueScanCutoff = time.Date(2026, time.August, 26, 3, 0, 0, 0, time.UTC)
+
 // issueEventColumns is the projection both reads below share, in the order
 // scanEventRow expects.
 const issueEventColumns = "timestamp, service, project, env, job_id, request_id, trace_id, user_id, name, level, data"
 
-// selectIssueEvents is the ONLY way this file builds SQL against monitor.events,
+// selectIssueEvents (with selectIssueEventColumns beneath it, which only lets the
+// projection vary) is the ONLY way this file builds SQL against monitor.events,
 // and the single place the tenancy predicate is applied to it.
 //
 // These reads are the ones most likely to leak, because they are hand-written
@@ -673,13 +692,47 @@ const issueEventColumns = "timestamp, service, project, env, job_id, request_id,
 // conditions plus any ORDER BY / LIMIT tail — and its args are appended after
 // the project's, which is the order the positional `?` placeholders appear in.
 func selectIssueEvents(ctx context.Context, where string, args ...interface{}) (string, []interface{}, error) {
+	return selectIssueEventColumns(ctx, issueEventColumns, where, args...)
+}
+
+// selectIssueEventColumns is selectIssueEvents with a caller-chosen projection,
+// for the timestamp-only inner phase of issueEventsByIDQuery. It is the one
+// function that writes the table name, so the predicate is still attached in
+// exactly one place. columns is code-controlled text, never request input.
+func selectIssueEventColumns(ctx context.Context, columns, where string, args ...interface{}) (string, []interface{}, error) {
 	predicate, scopeArgs, err := scope.ProjectPredicate(ctx)
 	if err != nil {
 		return "", nil, err
 	}
 
-	query := fmt.Sprintf("SELECT %s FROM %s.events WHERE %s AND %s", issueEventColumns, db.Database, predicate, where)
+	query := fmt.Sprintf("SELECT %s FROM %s.events WHERE %s AND %s", columns, db.Database, predicate, where)
 	return query, append(scopeArgs, args...), nil
+}
+
+// issueEventsByIDQuery builds queryEventsByIssueID's statement in two phases,
+// like services' events page: the newest `limit` timestamps for the issue are
+// found from the narrow columns first, and the wide read (data above all) is
+// bounded to `timestamp >= <oldest of them>`, which the sorting key turns into a
+// granule range instead of every block that holds a matching row.
+//
+// Both phases come from selectIssueEventColumns, so each carries its own project
+// predicate — the inner one decides which rows make the page, and an unscoped
+// inner read would let another project's rows under a legacy id set the
+// boundary. The args follow the placeholders: project, issue id, then the inner
+// read's project, issue id and limit, then the outer limit.
+func issueEventsByIDQuery(ctx context.Context, issueID string, limit int) (string, []interface{}, error) {
+	inner, innerArgs, err := selectIssueEventColumns(ctx, "timestamp", "issue_id = ? ORDER BY timestamp DESC LIMIT ?", issueID, limit)
+	if err != nil {
+		return "", nil, err
+	}
+
+	args := make([]interface{}, 0, len(innerArgs)+2)
+	args = append(args, issueID)
+	args = append(args, innerArgs...)
+	args = append(args, limit)
+	return selectIssueEvents(ctx,
+		"issue_id = ? AND timestamp >= (SELECT min(timestamp) FROM ("+inner+")) ORDER BY timestamp DESC LIMIT ?",
+		args...)
 }
 
 // queryEventsByIssueID returns an issue's events by indexed equality on the
@@ -697,7 +750,7 @@ func selectIssueEvents(ctx context.Context, where string, args ...interface{}) (
 // monitor-web URLs, alert payloads and comments, so it is a value a caller can
 // hold without being entitled to what it selects.
 func queryEventsByIssueID(ctx context.Context, issueID string, limit int) ([]*structs.Event, error) {
-	query, args, err := selectIssueEvents(ctx, "issue_id = ? ORDER BY timestamp DESC LIMIT ?", issueID, limit)
+	query, args, err := issueEventsByIDQuery(ctx, issueID, limit)
 	if err != nil {
 		return nil, err
 	}

@@ -3,8 +3,10 @@ package routes
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
@@ -39,8 +41,10 @@ func withDatabaseName(t *testing.T, name string) {
 }
 
 // TestSelectIssueEventsScopesEveryQuery drives selectIssueEvents with the exact
-// WHERE clauses HandleGetIssueEvents and queryEventsByIssueID pass it — the
-// indexed fast path and both arms of the legacy pre-004 scan.
+// WHERE clauses HandleGetIssueEvents passes it for both arms of the legacy
+// pre-004 scan, plus the single-phase shape of the indexed lookup.
+// queryEventsByIssueID's real, two-phase statement is pinned by
+// TestIssueEventsByIDQueryIsTwoPhaseAndScopedTwice.
 func TestSelectIssueEventsScopesEveryQuery(t *testing.T) {
 	withDefaultProject(t, "default")
 	withDatabaseName(t, "monitor")
@@ -57,13 +61,13 @@ func TestSelectIssueEventsScopesEveryQuery(t *testing.T) {
 		},
 		{
 			"legacy scan with a path",
-			"issue_id = '' AND service = ? AND name = ? AND level IN ('error', 'fatal') AND (JSONExtractString(data, 'path') = ? OR JSONExtractString(data, 'uri') = ?) ORDER BY timestamp DESC LIMIT ?",
-			[]interface{}{"monitor-core", "request.failed", "/v1/events", "/v1/events", 1000},
+			"issue_id = '' AND timestamp < ? AND service = ? AND name = ? AND level IN ('error', 'fatal') AND (JSONExtractString(data, 'path') = ? OR JSONExtractString(data, 'uri') = ?) ORDER BY timestamp DESC LIMIT ?",
+			[]interface{}{legacyIssueScanCutoff, "monitor-core", "request.failed", "/v1/events", "/v1/events", 1000},
 		},
 		{
 			"legacy scan without a path",
-			"issue_id = '' AND service = ? AND name = ? AND level IN ('error', 'fatal') ORDER BY timestamp DESC LIMIT ?",
-			[]interface{}{"monitor-core", "request.failed", 1000},
+			"issue_id = '' AND timestamp < ? AND service = ? AND name = ? AND level IN ('error', 'fatal') ORDER BY timestamp DESC LIMIT ?",
+			[]interface{}{legacyIssueScanCutoff, "monitor-core", "request.failed", 1000},
 		},
 	}
 
@@ -148,5 +152,64 @@ func TestSelectIssueEventsSelectsTheScannedColumns(t *testing.T) {
 	want := "SELECT timestamp, service, project, env, job_id, request_id, trace_id, user_id, name, level, data FROM monitor.events"
 	if !strings.HasPrefix(query, want) {
 		t.Errorf("projection changed; the row scans in issues.go read these columns positionally:\n\tgot:  %s\n\twant: %s...", query, want)
+	}
+}
+
+// TestIssueEventsByIDQueryIsTwoPhaseAndScopedTwice pins the statement
+// queryEventsByIssueID runs. The inner read picks the page's timestamps and the
+// outer one is bounded by the oldest of them, so BOTH must carry the project
+// predicate: an unscoped inner read would let another project's rows under a
+// legacy issue id decide where the page starts. The args follow the
+// placeholders — project, issue, then the inner project, issue and limit, then
+// the outer limit.
+func TestIssueEventsByIDQueryIsTwoPhaseAndScopedTwice(t *testing.T) {
+	withDefaultProject(t, "default")
+	withDatabaseName(t, "monitor")
+
+	query, args, err := issueEventsByIDQuery(scope.WithProject(context.Background(), "atlas"), "issue-1", 50)
+	if err != nil {
+		t.Fatalf("issueEventsByIDQuery: %v", err)
+	}
+
+	want := "SELECT timestamp, service, project, env, job_id, request_id, trace_id, user_id, name, level, data FROM monitor.events " +
+		"WHERE project = ? AND issue_id = ? AND timestamp >= (SELECT min(timestamp) FROM (" +
+		"SELECT timestamp FROM monitor.events WHERE project = ? AND issue_id = ? ORDER BY timestamp DESC LIMIT ?" +
+		")) ORDER BY timestamp DESC LIMIT ?"
+	if query != want {
+		t.Errorf("sql =\n\t%s\nwant\n\t%s", query, want)
+	}
+	wantArgs := []interface{}{"atlas", "issue-1", "atlas", "issue-1", 50, 50}
+	if !reflect.DeepEqual(args, wantArgs) {
+		t.Errorf("args = %v, want %v", args, wantArgs)
+	}
+
+	// The default project's transition arm reaches both phases too.
+	query, _, err = issueEventsByIDQuery(scope.WithProject(context.Background(), "default"), "issue-1", 50)
+	if err != nil {
+		t.Fatalf("issueEventsByIDQuery(default): %v", err)
+	}
+	if n := strings.Count(query, "(project = ? OR project = '')"); n != 2 {
+		t.Errorf("default-project predicate appears %d time(s), want 2:\n\t%s", n, query)
+	}
+
+	// And an unscoped context builds nothing.
+	query, args, err = issueEventsByIDQuery(context.Background(), "issue-1", 50)
+	if !errors.Is(err, scope.ErrNoProject) || query != "" || args != nil {
+		t.Errorf("unscoped context: (%q, %v, %v), want ErrNoProject and no query", query, args, err)
+	}
+}
+
+// TestLegacyIssueScanCutoffFollowsTheStampingDeploy pins the bound on the
+// pre-004 fallback scan: after the deploy that began stamping issue_id
+// (2026-08-25 02:13 UTC) and no later than a day's margin past it. Moving it
+// later only makes the scan read more; moving it earlier than the deploy would
+// hide unstamped rows the fast path cannot see.
+func TestLegacyIssueScanCutoffFollowsTheStampingDeploy(t *testing.T) {
+	deployed := time.Date(2026, time.August, 25, 2, 13, 15, 0, time.UTC)
+	if legacyIssueScanCutoff.Before(deployed) || legacyIssueScanCutoff.After(deployed.Add(25*time.Hour)) {
+		t.Errorf("legacyIssueScanCutoff = %s, want within a day after the 004 deploy at %s", legacyIssueScanCutoff, deployed)
+	}
+	if legacyIssueScanCutoff.Location() != time.UTC {
+		t.Errorf("legacyIssueScanCutoff is in %s, want UTC", legacyIssueScanCutoff.Location())
 	}
 }

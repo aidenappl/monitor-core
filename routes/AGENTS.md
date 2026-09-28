@@ -163,6 +163,17 @@ call site. In the legacy fallback scan the project is deliberately **absent** fr
 applied it, and restating it would be a second copy to keep in step, while the recomputed
 fingerprint checks it exactly rather than by policy.
 
+**`queryEventsByIssueID` reads in two phases** (`issueEventsByIDQuery`): an inner
+timestamp-only read finds the page's newest `limit` rows, and the wide read is bounded to
+`timestamp >= (SELECT min(timestamp) FROM (inner))`, so the sorting key turns it into a
+granule range instead of decompressing `data` for every block holding a match. The inner
+read comes from `selectIssueEventColumns` — `selectIssueEvents` with a caller-chosen
+projection, and now the one function that writes the table name — so it carries its own
+predicate; args run project, issue, project, issue, limit, limit.
+`TestIssueEventsByIDQueryIsTwoPhaseAndScopedTwice` pins the text and the arg vector. The
+legacy fallback scan is additionally bounded to `timestamp < legacyIssueScanCutoff`
+(`issues/AGENTS.md`).
+
 Nothing else in the file may build a query against `monitor.events` —
 `scope/chokepoint_test.go` fails the build if something does.
 

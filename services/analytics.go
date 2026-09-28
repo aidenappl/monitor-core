@@ -116,7 +116,7 @@ func buildFieldExpr(field string) (string, error) {
 		if !structs.SafeIdentifierRegex.MatchString(key) {
 			return "", fmt.Errorf("invalid data field name: %s", key)
 		}
-		return fmt.Sprintf("JSONExtractString(data, '%s')", key), nil
+		return dataStringExpr(key), nil
 	}
 	if !structs.GroupByColumns[field] {
 		return "", fmt.Errorf("invalid field: %s", field)
@@ -131,7 +131,7 @@ func buildNumericFieldExpr(field string) (string, error) {
 		if !structs.SafeIdentifierRegex.MatchString(key) {
 			return "", fmt.Errorf("invalid data field name: %s", key)
 		}
-		return fmt.Sprintf("toFloat64OrNull(JSONExtractRaw(data, '%s'))", key), nil
+		return dataNumberExpr(key), nil
 	}
 	return "", fmt.Errorf("numeric aggregation only supported on data.* fields")
 }
@@ -152,7 +152,7 @@ func buildGroupByExprs(groupBy []string) ([]string, []string, error) {
 			if !structs.SafeIdentifierRegex.MatchString(key) {
 				return nil, nil, fmt.Errorf("invalid data field name: %s", key)
 			}
-			exprs = append(exprs, fmt.Sprintf("JSONExtractString(data, '%s') AS %s", key, alias))
+			exprs = append(exprs, fmt.Sprintf("%s AS %s", dataStringExpr(key), alias))
 		} else if structs.GroupByColumns[g] {
 			exprs = append(exprs, fmt.Sprintf("%s AS %s", g, alias))
 		} else {
@@ -196,16 +196,32 @@ func buildSingleFilter(f structs.QueryFilter) (string, []interface{}, error) {
 		// Check if operator suggests numeric comparison
 		switch f.Operator {
 		case "lt", "gt", "lte", "gte":
-			fieldExpr = fmt.Sprintf("toFloat64OrNull(JSONExtractRaw(data, '%s'))", key)
+			fieldExpr = dataNumberExpr(key)
 		default:
-			fieldExpr = fmt.Sprintf("JSONExtractString(data, '%s')", key)
+			fieldExpr = dataStringExpr(key)
 		}
-	} else if structs.QueryableColumns[f.Field] {
-		fieldExpr = f.Field
-	} else {
-		return "", nil, fmt.Errorf("invalid filter field: %s", f.Field)
+
+		cond, args, err := buildComparison(fieldExpr, f)
+		if err != nil {
+			return "", nil, err
+		}
+		// Same substring prefilter as services/query.go's applyDataFilter,
+		// placed first so its placeholder precedes the comparison's.
+		if needle, ok := valuePrefilter(Operator(f.Operator), f.Value); ok {
+			return "position(data, ?) > 0 AND " + cond, append([]interface{}{needle}, args...), nil
+		}
+		return cond, args, nil
 	}
 
+	if !structs.QueryableColumns[f.Field] {
+		return "", nil, fmt.Errorf("invalid filter field: %s", f.Field)
+	}
+	return buildComparison(f.Field, f)
+}
+
+// buildComparison applies f's operator and value to an already-validated field
+// expression.
+func buildComparison(fieldExpr string, f structs.QueryFilter) (string, []interface{}, error) {
 	switch f.Operator {
 	case "eq", "":
 		return fmt.Sprintf("%s = ?", fieldExpr), []interface{}{f.Value}, nil
@@ -688,7 +704,7 @@ func QueryTopN(ctx context.Context, query *structs.TopNQuery) (*structs.TopNResu
 		if !structs.SafeIdentifierRegex.MatchString(key) {
 			return nil, fmt.Errorf("invalid data field name: %s", key)
 		}
-		groupExpr = fmt.Sprintf("JSONExtractString(data, '%s')", key)
+		groupExpr = dataStringExpr(key)
 	} else if structs.GroupByColumns[query.GroupBy] {
 		groupExpr = query.GroupBy
 	} else {
@@ -806,10 +822,6 @@ func QueryCompare(ctx context.Context, query *structs.CompareQuery) (*structs.Co
 		From:        query.From,
 		To:          query.To,
 	}
-	currentResult, err := QueryGauge(ctx, currentQuery)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query current period: %w", err)
-	}
 
 	// Query previous period
 	previousQuery := &structs.GaugeQuery{
@@ -819,9 +831,29 @@ func QueryCompare(ctx context.Context, query *structs.CompareQuery) (*structs.Co
 		From:        compareFrom,
 		To:          compareTo,
 	}
-	previousResult, err := QueryGauge(ctx, previousQuery)
+
+	// The two periods are independent reads, so they run side by side. Each
+	// still goes through QueryGauge with the caller's ctx values, so both stay
+	// scoped by buildEventWhere.
+	var currentResult, previousResult *structs.GaugeResult
+	err := runConcurrently(ctx,
+		func(ctx context.Context) error {
+			var err error
+			if currentResult, err = QueryGauge(ctx, currentQuery); err != nil {
+				return fmt.Errorf("failed to query current period: %w", err)
+			}
+			return nil
+		},
+		func(ctx context.Context) error {
+			var err error
+			if previousResult, err = QueryGauge(ctx, previousQuery); err != nil {
+				return fmt.Errorf("failed to query previous period: %w", err)
+			}
+			return nil
+		},
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query previous period: %w", err)
+		return nil, err
 	}
 
 	// Calculate change

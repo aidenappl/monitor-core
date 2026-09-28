@@ -130,6 +130,11 @@ a store move.
 `data.*` field names in `field` and in `query_filters` are validated with
 `structs.SafeIdentifierRegex` (`^[a-zA-Z_][a-zA-Z0-9_.]*$`) before interpolation into
 `JSONExtractString/JSONExtractRaw` (see `numericFieldExpr`, `buildFilterCondition`).
+Every extract goes through `guardedDataString` / `guardedDataNumber`: the same
+`position(data, '"key"') > 0` guard as `services/` (whose text `evaluator_test.go` pins
+too), with the numeric form guarding only the inner extract so a missing key stays NULL
+and never counts as 0 in a sum/avg/min/max or a `<` condition. The evaluator takes the key
+guard only — no value prefilter.
 Non-`data.*` filter columns are whitelisted via `structs.FilterColumns`. **Preserve this
 validation on any change** — it's the injection guard.
 

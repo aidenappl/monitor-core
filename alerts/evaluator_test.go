@@ -316,3 +316,96 @@ func TestAggQueryMatchesUnstampedRowsOnlyForTheDefaultProject(t *testing.T) {
 		t.Errorf("default project did not pick up the empty-string transition arm:\n\t%s", sql)
 	}
 }
+
+// The same two strings services/query_test.go pins for services.dataStringExpr
+// and services.dataNumberExpr. This package keeps its own copy of the guarded
+// extracts; pinning both copies to one literal is what stops the timer and the
+// query API from reading a data key two different ways.
+const (
+	wantGuardedString = `if(position(data, '"latency_ms"') > 0, JSONExtractString(data, 'latency_ms'), '')`
+	wantGuardedNumber = `toFloat64OrNull(if(position(data, '"latency_ms"') > 0, JSONExtractRaw(data, 'latency_ms'), ''))`
+)
+
+// TestEvaluatorDataExpressionsAreGuarded pins the evaluator's extraction sites
+// to the guarded forms. The numeric one must keep a missing key NULL — a 0
+// would make every rule on data.X < N match rows that never reported X, and
+// drag avg/min rules toward zero. The evaluator gets the key guard only: no
+// value prefilter, so its string conditions are the plain guarded comparison.
+func TestEvaluatorDataExpressionsAreGuarded(t *testing.T) {
+	if got, err := numericFieldExpr("data.latency_ms"); err != nil || got != wantGuardedNumber {
+		t.Errorf("numericFieldExpr = %q, %v; want %s", got, err, wantGuardedNumber)
+	}
+
+	aggregations := map[structs.AggregationType]string{
+		structs.AggSum: "toFloat64(sum(" + wantGuardedNumber + "))",
+		structs.AggAvg: "toFloat64(avg(" + wantGuardedNumber + "))",
+		structs.AggMin: "toFloat64(min(" + wantGuardedNumber + "))",
+		structs.AggMax: "toFloat64(max(" + wantGuardedNumber + "))",
+	}
+	for agg, want := range aggregations {
+		if got, err := buildAggExpr(agg, "data.latency_ms"); err != nil || got != want {
+			t.Errorf("buildAggExpr(%s) = %q, %v; want %s", agg, got, err, want)
+		}
+	}
+
+	conditions := []struct {
+		operator string
+		want     string
+	}{
+		{"lt", wantGuardedNumber + " < ?"},
+		{"lte", wantGuardedNumber + " <= ?"},
+		{"gt", wantGuardedNumber + " > ?"},
+		{"gte", wantGuardedNumber + " >= ?"},
+		{"eq", wantGuardedString + " = ?"},
+		{"neq", wantGuardedString + " != ?"},
+		{"contains", wantGuardedString + " LIKE ?"},
+	}
+	for _, c := range conditions {
+		got, args, err := buildFilterCondition(structs.QueryFilter{Field: "data.latency_ms", Operator: c.operator, Value: "5"})
+		if err != nil {
+			t.Fatalf("buildFilterCondition(%s): %v", c.operator, err)
+		}
+		if got != c.want {
+			t.Errorf("buildFilterCondition(%s) =\n\t%s\nwant\n\t%s", c.operator, got, c.want)
+		}
+		if len(args) != 1 {
+			t.Errorf("buildFilterCondition(%s) bound %d args, want 1 — the evaluator takes no value prefilter", c.operator, len(args))
+		}
+	}
+}
+
+// TestTimerAndTestEndpointAgreeOnAGuardedDataRule runs the parity check above
+// over a rule whose filter and metric both read a data key, so the guarded
+// extracts are inside the statements being compared.
+func TestTimerAndTestEndpointAgreeOnAGuardedDataRule(t *testing.T) {
+	withDefaultProject(t, "default")
+
+	rule := &structs.AlertRule{
+		Project:      "atlas",
+		QueryFilters: `[{"field":"data.latency_ms","operator":"gt","value":250}]`,
+	}
+	aggExpr, err := buildAggExpr(structs.AggAvg, "data.latency_ms")
+	if err != nil {
+		t.Fatalf("buildAggExpr: %v", err)
+	}
+	from, to := time.Unix(0, 0), time.Unix(60, 0)
+
+	timerSQL, timerArgs, err := buildAggQuery(scope.WithProject(context.Background(), rule.Project), rule, aggExpr, from, to)
+	if err != nil {
+		t.Fatalf("timer buildAggQuery: %v", err)
+	}
+	httpSQL, httpArgs, err := buildAggQuery(scope.WithProject(context.Background(), "atlas"), rule, aggExpr, from, to)
+	if err != nil {
+		t.Fatalf("test-endpoint buildAggQuery: %v", err)
+	}
+	if timerSQL != httpSQL || !reflect.DeepEqual(timerArgs, httpArgs) {
+		t.Errorf("timer and test endpoint disagree:\n\ttimer: %s %v\n\thttp:  %s %v", timerSQL, timerArgs, httpSQL, httpArgs)
+	}
+
+	// The table name in between is db.Database, which no test here sets.
+	wantHead := "SELECT toFloat64(avg(" + wantGuardedNumber + ")) AS value FROM "
+	wantTail := ".events WHERE timestamp >= ? AND timestamp <= ? AND project = ? AND " + wantGuardedNumber + " > ?"
+	if !strings.HasPrefix(timerSQL, wantHead) || !strings.HasSuffix(timerSQL, wantTail) {
+		t.Errorf("sql =\n\t%s\nwant\n\t%s<db>%s", timerSQL, wantHead, wantTail)
+	}
+}

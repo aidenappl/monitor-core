@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	sq "github.com/Masterminds/squirrel"
 	"github.com/aidenappl/monitor-core/db"
@@ -154,8 +157,15 @@ func applyDataFilter(builder sq.SelectBuilder, f Filter) (sq.SelectBuilder, erro
 		return builder, fmt.Errorf("invalid data field name: %s", f.Field)
 	}
 
-	extractStr := fmt.Sprintf("JSONExtractString(data, '%s')", f.Field)
-	extractNum := fmt.Sprintf("toFloat64OrNull(JSONExtractRaw(data, '%s'))", f.Field)
+	extractStr := dataStringExpr(f.Field)
+	extractNum := dataNumberExpr(f.Field)
+
+	// A cheap substring test ahead of the JSON parse. It is ANDed on, never
+	// substituted, so it can only remove rows the comparison would reject anyway
+	// — see valuePrefilter for when that holds and when it is skipped.
+	if needle, ok := valuePrefilter(f.Operator, f.Value); ok {
+		builder = builder.Where("position(data, ?) > 0", needle)
+	}
 
 	switch f.Operator {
 	case OpEq, "":
@@ -181,6 +191,183 @@ func applyDataFilter(builder sq.SelectBuilder, f Filter) (sq.SelectBuilder, erro
 	return builder, nil
 }
 
+// dataStringExpr and dataNumberExpr are the JSON extractions for a data key,
+// behind a substring guard that lets ClickHouse skip the JSON parse on rows
+// whose raw text cannot contain the key. The key MUST already have passed
+// structs.SafeIdentifierRegex: it is interpolated as a string literal.
+//
+// The guard changes no result. Every row's data is written by json.Marshal
+// (structs.Event.DataJSON), which emits a key made of SafeIdentifierRegex
+// characters verbatim, so a row whose text lacks `"key"` cannot have that key,
+// and the unguarded extract would have returned the empty string for it too. A
+// match in the wrong place (the same text as a value, or a nested key) just
+// falls through to the real extract.
+//
+// The numeric form guards the INNER extract only. toFloat64OrNull of the empty
+// string is NULL, exactly what a missing key produced before, so such a row
+// still fails every lt/lte/gt/gte comparison and stays out of
+// avg/min/quantile/count(field). Wrapping the whole cast with a 0 default
+// instead would turn "missing" into zero — matching `< 100` and dragging every
+// average toward it. alerts/evaluator.go carries the same two expressions; the
+// tests on both sides pin the text.
+func dataStringExpr(key string) string {
+	return fmt.Sprintf("if(position(data, '\"%s\"') > 0, JSONExtractString(data, '%s'), '')", key, key)
+}
+
+func dataNumberExpr(key string) string {
+	return fmt.Sprintf("toFloat64OrNull(if(position(data, '\"%s\"') > 0, JSONExtractRaw(data, '%s'), ''))", key, key)
+}
+
+// valuePrefilter returns the text a string data filter's value must appear as,
+// verbatim, somewhere in the raw data column for the comparison to be true, and
+// whether that text is safe to require. Callers AND `position(data, needle) > 0`
+// in front of the JSON comparison.
+//
+// It holds only when json.Marshal writes the value byte-for-byte, so any value
+// holding a character it escapes is skipped (see jsonVerbatim). For the LIKE
+// operators the value must also carry no `%`, `_` or `\`: those are wildcards or
+// the escape character, so the literal text need not appear in a matching row.
+// An empty or non-string value is skipped too — equality with the empty string
+// matches rows WITHOUT the key, and a non-string is compared by ClickHouse's own
+// conversion rules, which a substring test cannot mirror. Only
+// eq/contains/startswith/endswith qualify; neq and the numeric comparisons match
+// rows where the value is absent.
+func valuePrefilter(op Operator, value interface{}) (string, bool) {
+	s, ok := value.(string)
+	if !ok || s == "" {
+		return "", false
+	}
+
+	switch op {
+	case OpEq, "":
+	case OpContains, OpStartsWith, OpEndsWith:
+		if strings.ContainsAny(s, `%_\`) {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+
+	if !jsonVerbatim(s) {
+		return "", false
+	}
+	return s, true
+}
+
+// jsonVerbatim reports whether encoding/json writes s unchanged inside a JSON
+// string: valid UTF-8 with no control character, quote, backslash, HTML-escaped
+// `<` `>` `&`, or U+2028/U+2029.
+func jsonVerbatim(s string) bool {
+	if !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r < 0x20, r == '"', r == '\\', r == '<', r == '>', r == '&', r == '\u2028', r == '\u2029':
+			return false
+		}
+	}
+	return true
+}
+
+// eventPageColumns is the page query's projection, in the order QueryEvents
+// scans it.
+var eventPageColumns = []string{"timestamp", "service", "project", "env", "job_id", "request_id", "trace_id", "user_id", "name", "level", "data"}
+
+// hasDataFilter reports whether any filter reads the data column.
+func hasDataFilter(filters []Filter) bool {
+	for _, f := range filters {
+		if f.IsData {
+			return true
+		}
+	}
+	return false
+}
+
+// buildEventPageQuery builds QueryEvents' page statement.
+//
+// Without a data.* filter it is two-phase: the page's rows are found from the
+// narrow timestamp column first, and the wide read (data above all) is bounded
+// to `timestamp >= <oldest timestamp on the page>`, which the sorting key turns
+// into a granule range. The single-phase form decompresses `data` for whole
+// blocks in every part to return one page. The rows are the same; ties at the
+// boundary timestamp break as arbitrarily as they always did. An offset past the
+// end gives min() over nothing, 1970-01-01, so the outer read scans and returns
+// nothing — correct, just not faster.
+//
+// With a data.* filter both phases would have to parse `data` for the same
+// rows, so the page stays a single statement.
+//
+// Both phases start at selectEvents, so each carries its own project predicate:
+// the inner read decides which rows are on the page, and an unscoped one would
+// let another project's timestamps set the boundary.
+func buildEventPageQuery(ctx context.Context, params QueryParams) (string, []interface{}, error) {
+	page, err := selectEvents(ctx, eventPageColumns...)
+	if err != nil {
+		return "", nil, err
+	}
+	page, err = applyFilters(page, params)
+	if err != nil {
+		return "", nil, err
+	}
+
+	if !hasDataFilter(params.Filters) {
+		boundary, err := selectEvents(ctx, "timestamp")
+		if err != nil {
+			return "", nil, err
+		}
+		boundary, err = applyFilters(boundary, params)
+		if err != nil {
+			return "", nil, err
+		}
+		boundary = boundary.
+			OrderBy("timestamp DESC").
+			Limit(uint64(params.Limit)).
+			Offset(uint64(params.Offset))
+		page = page.Where(sq.Expr("timestamp >= (SELECT min(timestamp) FROM (?))", boundary))
+	}
+
+	page = page.
+		OrderBy("timestamp DESC").
+		Limit(uint64(params.Limit)).
+		Offset(uint64(params.Offset))
+
+	querySQL, queryArgs, err := page.ToSql()
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to build query: %w", err)
+	}
+	return querySQL, queryArgs, nil
+}
+
+// runConcurrently runs every fn at once and returns the first error. The first
+// failure cancels the context the others were given, so a doomed request does
+// not wait out its sibling's scan. (golang.org/x/sync/errgroup is not a
+// dependency; this is the part of it needed here.)
+func runConcurrently(ctx context.Context, fns ...func(context.Context) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg       sync.WaitGroup
+		once     sync.Once
+		firstErr error
+	)
+	for _, fn := range fns {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := fn(ctx); err != nil {
+				once.Do(func() {
+					firstErr = err
+					cancel()
+				})
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
+}
+
 func QueryEvents(ctx context.Context, params QueryParams) (*QueryResult, error) {
 	if params.Limit <= 0 {
 		params.Limit = 100
@@ -204,47 +391,47 @@ func QueryEvents(ctx context.Context, params QueryParams) (*QueryResult, error) 
 		return nil, fmt.Errorf("failed to build count query: %w", err)
 	}
 
-	var total uint64
-	if err := db.Conn.QueryRow(ctx, countSQL, countArgs...).Scan(&total); err != nil {
-		return nil, fmt.Errorf("count query failed: %w", err)
-	}
-
 	// Data query
-	queryBuilder, err := selectEvents(ctx, "timestamp", "service", "project", "env", "job_id", "request_id", "trace_id", "user_id", "name", "level", "data")
-	if err != nil {
-		return nil, err
-	}
-	queryBuilder = queryBuilder.
-		OrderBy("timestamp DESC").
-		Limit(uint64(params.Limit)).
-		Offset(uint64(params.Offset))
-	queryBuilder, err = applyFilters(queryBuilder, params)
+	querySQL, queryArgs, err := buildEventPageQuery(ctx, params)
 	if err != nil {
 		return nil, err
 	}
 
-	querySQL, queryArgs, err := queryBuilder.ToSql()
-	if err != nil {
-		return nil, fmt.Errorf("failed to build query: %w", err)
-	}
-
-	rows, err := db.Conn.Query(ctx, querySQL, queryArgs...)
-	if err != nil {
-		return nil, fmt.Errorf("query failed: %w", err)
-	}
-	defer rows.Close()
-
+	// The two are independent reads, so they run side by side rather than
+	// back to back. Both statements are fully built above, so a validation
+	// error never leaves a query in flight.
+	var total uint64
 	var events []*structs.Event
-	for rows.Next() {
-		var e structs.Event
-		var dataStr string
-		if err := rows.Scan(&e.Timestamp, &e.Service, &e.Project, &e.Env, &e.JobID, &e.RequestID, &e.TraceID, &e.UserID, &e.Name, &e.Level, &dataStr); err != nil {
-			return nil, fmt.Errorf("scan failed: %w", err)
-		}
-		if dataStr != "" && dataStr != "{}" {
-			json.Unmarshal([]byte(dataStr), &e.Data)
-		}
-		events = append(events, &e)
+	err = runConcurrently(ctx,
+		func(ctx context.Context) error {
+			if err := db.Conn.QueryRow(ctx, countSQL, countArgs...).Scan(&total); err != nil {
+				return fmt.Errorf("count query failed: %w", err)
+			}
+			return nil
+		},
+		func(ctx context.Context) error {
+			rows, err := db.Conn.Query(ctx, querySQL, queryArgs...)
+			if err != nil {
+				return fmt.Errorf("query failed: %w", err)
+			}
+			defer rows.Close()
+
+			for rows.Next() {
+				var e structs.Event
+				var dataStr string
+				if err := rows.Scan(&e.Timestamp, &e.Service, &e.Project, &e.Env, &e.JobID, &e.RequestID, &e.TraceID, &e.UserID, &e.Name, &e.Level, &dataStr); err != nil {
+					return fmt.Errorf("scan failed: %w", err)
+				}
+				if dataStr != "" && dataStr != "{}" {
+					json.Unmarshal([]byte(dataStr), &e.Data)
+				}
+				events = append(events, &e)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	if events == nil {
@@ -263,11 +450,14 @@ func GetLabelValues(ctx context.Context, label string, params QueryParams) (*Lab
 		return nil, fmt.Errorf("invalid label: %s", label)
 	}
 
-	builder, err := selectEvents(ctx, fmt.Sprintf("DISTINCT %s", column))
+	// GROUP BY rather than DISTINCT: the same rows, but every label column except
+	// user_id is LowCardinality and only GROUP BY aggregates on the dictionary
+	// keys — DISTINCT materialises the strings, about 3x the CPU on a full scan.
+	builder, err := selectEvents(ctx, column)
 	if err != nil {
 		return nil, err
 	}
-	builder = builder.OrderBy(column).Limit(1000)
+	builder = builder.GroupBy(column).OrderBy(column).Limit(1000)
 
 	// Apply filters except the one we're getting values for.
 	//
@@ -382,6 +572,7 @@ func GetDataValues(ctx context.Context, key string, params QueryParams) (*LabelV
 	if err != nil {
 		return nil, err
 	}
+	// Deliberately bare and BOUND: key is not SafeIdentifierRegex-validated, so it MUST stay a ? parameter — never dataStringExpr(key), which would interpolate it (injection).
 	builder = builder.
 		Column("DISTINCT JSONExtractString(data, ?) AS value", key).
 		Where("JSONExtractString(data, ?) != ''", key).

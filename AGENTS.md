@@ -339,7 +339,17 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
   caller-controlled `data.*` field names MUST be validated** against
   `structs.SafeIdentifierRegex` before interpolation (`services/analytics.go`,
   `services/query.go`, `alerts/evaluator.go`) — `JSONExtractString` takes the key as a SQL
-  string literal, so an unvalidated key is an injection vector.
+  string literal, so an unvalidated key is an injection vector. Every extract whose key is
+  **written into the SQL text** (after passing `SafeIdentifierRegex`) goes through the
+  guarded helpers (`services.dataStringExpr` / `dataNumberExpr`, and their `alerts` copies
+  `guardedDataString` / `guardedDataNumber`), never a bare `JSONExtract*`: the
+  `position(data, '"key"') > 0` guard skips the JSON parse on rows that cannot hold the
+  key, and the numeric form keeps a missing key NULL (not 0). Two bare extracts remain on
+  purpose: `services.GetDataValues` binds its key as a `?` parameter because that key is
+  **not** regex-validated — it MUST stay bound; swapping it for `dataStringExpr` would
+  interpolate an unvalidated key (injection) — and the legacy unstamped-row scan in
+  `routes/issues.go` `HandleGetIssueEvents` (constant `'path'`/`'uri'` keys) is temporary
+  and goes when that scan is removed. `services/AGENTS.md` lists the guarded sites.
 - **The identifier regex and the column allowlists live in `structs/columns.go` and
   nowhere else** — `SafeIdentifierRegex`, plus `QueryableColumns`, `GroupByColumns`,
   `FilterColumns` and `LabelColumns`. They were previously copy-pasted per package and the
@@ -1192,7 +1202,7 @@ Ingest decides whose data a row *is*; this decides who may *read* it. **Every re
   |---|---|
   | `services.selectEvents` (`query.go`) | `QueryEvents` (count **and** page), `GetLabelValues`, `GetDataKeys`, `GetDataValues` |
   | `services.buildEventWhere` (`analytics.go`) | `QueryAnalytics`, `QueryTimeSeries`, `QueryTopN`, `QueryGauge`; `QueryCompare` inherits it through `QueryGauge` for both periods |
-  | `routes.selectIssueEvents` (`issues.go`) | the indexed issue-event lookup **and** both arms of the legacy pre-004 scan |
+  | `routes.selectIssueEvents` / `selectIssueEventColumns` (`issues.go`) | both phases of the indexed issue-event lookup **and** both arms of the legacy pre-004 scan |
   | `routes.subscriptionFilters` → `scope.Matches` (`stream.go`, `services/hub.go`) | the SSE live tail |
 
 - **The SSE project filter is server-derived and mandatory.** `project` is absent from

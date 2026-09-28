@@ -473,9 +473,26 @@ func numericFieldExpr(field string) (string, error) {
 		if !structs.SafeIdentifierRegex.MatchString(key) {
 			return "", fmt.Errorf("invalid data field name: %s", key)
 		}
-		return fmt.Sprintf("toFloat64OrNull(JSONExtractRaw(data, '%s'))", key), nil
+		return guardedDataNumber(key), nil
 	}
 	return "", fmt.Errorf("numeric aggregation only supported on data.* fields")
+}
+
+// guardedDataString and guardedDataNumber are this package's copies of
+// services.dataStringExpr / services.dataNumberExpr: the JSON extract behind a
+// `position(data, '"key"') > 0` test that skips the parse on rows whose text
+// cannot hold the key. Results are unchanged — data is always json.Marshal
+// output, which writes a SafeIdentifierRegex key verbatim — and the numeric form
+// guards only the inner extract, so a missing key is still NULL (never 0) and
+// still stays out of sum/avg/min/max and every numeric comparison. The key must
+// already have passed structs.SafeIdentifierRegex. evaluator_test.go pins the
+// same text services' tests pin, so the two copies cannot drift apart silently.
+func guardedDataString(key string) string {
+	return fmt.Sprintf("if(position(data, '\"%s\"') > 0, JSONExtractString(data, '%s'), '')", key, key)
+}
+
+func guardedDataNumber(key string) string {
+	return fmt.Sprintf("toFloat64OrNull(if(position(data, '\"%s\"') > 0, JSONExtractRaw(data, '%s'), ''))", key, key)
 }
 
 func buildFilterCondition(f structs.QueryFilter) (string, []interface{}, error) {
@@ -488,9 +505,9 @@ func buildFilterCondition(f structs.QueryFilter) (string, []interface{}, error) 
 		}
 		switch f.Operator {
 		case "lt", "gt", "lte", "gte":
-			fieldExpr = fmt.Sprintf("toFloat64OrNull(JSONExtractRaw(data, '%s'))", key)
+			fieldExpr = guardedDataNumber(key)
 		default:
-			fieldExpr = fmt.Sprintf("JSONExtractString(data, '%s')", key)
+			fieldExpr = guardedDataString(key)
 		}
 	} else if structs.FilterColumns[f.Field] {
 		fieldExpr = f.Field

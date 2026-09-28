@@ -5,6 +5,8 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,14 +45,43 @@ func withDefaultProject(t *testing.T, slug string) {
 // the interface is present because driver.Conn is wide, and panics rather than
 // silently succeeding so a builder that reaches ClickHouse by some other route
 // cannot slip past unnoticed.
+//
+// QueryEvents and QueryCompare issue their two statements concurrently, so
+// record takes a lock (CI runs -race) and appends a statement and its args
+// together — statements[i] and args[i] always belong to one call. The ORDER of
+// the calls is not deterministic: assert on every statement, or pick one out by
+// its text with find, never by position among concurrent ones. Reading the
+// slices after the builder returns needs no lock; its own wait on the
+// goroutines orders their writes before the read.
 type recordingConn struct {
+	mu         sync.Mutex
 	statements []string
 	args       [][]any
 }
 
 func (c *recordingConn) record(query string, args ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.statements = append(c.statements, query)
 	c.args = append(c.args, args)
+}
+
+// find returns the one recorded statement accepted by match, with its args.
+func (c *recordingConn) find(t *testing.T, match func(statement string) bool) (string, []any) {
+	t.Helper()
+	found := -1
+	for i, statement := range c.statements {
+		if match(statement) {
+			if found >= 0 {
+				t.Fatalf("more than one statement matched:\n\t%s\n\t%s", c.statements[found], statement)
+			}
+			found = i
+		}
+	}
+	if found < 0 {
+		t.Fatalf("no statement matched among %q", c.statements)
+	}
+	return c.statements[found], c.args[found]
 }
 
 func (c *recordingConn) Query(ctx context.Context, query string, args ...any) (driver.Rows, error) {
@@ -343,4 +374,190 @@ func containsArg(args []any, want string) bool {
 		}
 	}
 	return false
+}
+
+// rendezvousConn is a recordingConn whose Query and QueryRow each wait until
+// `want` calls have arrived. A builder that issues its reads one after another
+// never gets its second call in while the first is waiting, so the first times
+// out and sequential is set — which is how the concurrency tests below tell
+// "side by side" from "back to back" without depending on timing when they pass.
+type rendezvousConn struct {
+	*recordingConn
+	arrivals   sync.WaitGroup
+	sequential atomic.Bool
+}
+
+func withRendezvousConn(t *testing.T, want int) *rendezvousConn {
+	t.Helper()
+	conn := &rendezvousConn{recordingConn: withRecordingConn(t)}
+	conn.arrivals.Add(want)
+	db.Conn = conn
+	return conn
+}
+
+func (c *rendezvousConn) wait() {
+	c.arrivals.Done()
+	all := make(chan struct{})
+	go func() {
+		c.arrivals.Wait()
+		close(all)
+	}()
+	select {
+	case <-all:
+	case <-time.After(2 * time.Second):
+		c.sequential.Store(true)
+	}
+}
+
+func (c *rendezvousConn) Query(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+	c.record(query, args...)
+	c.wait()
+	return &emptyRows{}, nil
+}
+
+func (c *rendezvousConn) QueryRow(ctx context.Context, query string, args ...any) driver.Row {
+	c.record(query, args...)
+	c.wait()
+	return &emptyRow{}
+}
+
+// TestQueryEventsRunsCountAndPageConcurrently and its QueryCompare twin pin
+// CH-3/CH-6: the two reads each call makes are independent and must overlap.
+func TestQueryEventsRunsCountAndPageConcurrently(t *testing.T) {
+	withDefaultProject(t, "default")
+	conn := withRendezvousConn(t, 2)
+
+	if _, err := QueryEvents(scopedContext("atlas"), QueryParams{}); err != nil {
+		t.Fatalf("QueryEvents: %v", err)
+	}
+	if conn.sequential.Load() {
+		t.Error("the count and the page ran one after the other")
+	}
+}
+
+func TestQueryCompareRunsBothGaugesConcurrently(t *testing.T) {
+	withDefaultProject(t, "default")
+	conn := withRendezvousConn(t, 2)
+
+	from := time.Now().Add(-time.Hour)
+	if _, err := QueryCompare(scopedContext("atlas"), &structs.CompareQuery{
+		Aggregation: structs.AggCount, From: from, To: time.Now(),
+	}); err != nil {
+		t.Fatalf("QueryCompare: %v", err)
+	}
+	if conn.sequential.Load() {
+		t.Error("the two periods ran one after the other")
+	}
+}
+
+// eventsPagePrefix is the page query's projection, which the row scan in
+// QueryEvents reads positionally.
+const eventsPagePrefix = "SELECT timestamp, service, project, env, job_id, request_id, trace_id, user_id, name, level, data FROM monitor.events WHERE "
+
+// TestQueryEventsPageIsTwoPhaseWithoutDataFilters pins the two-phase page SQL
+// and its argument vector. The inner phase repeats the project predicate, the
+// caller's filters and the time range, so the args are the outer set followed
+// by the inner set — and the inner set must carry the project too, since the
+// inner read decides which rows make the page.
+func TestQueryEventsPageIsTwoPhaseWithoutDataFilters(t *testing.T) {
+	withDefaultProject(t, "default")
+	recorder := withRecordingConn(t)
+
+	from := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)
+	params := QueryParams{
+		Filters: []Filter{{Field: "service", Operator: OpEq, Value: "api"}},
+		From:    from, To: to, Limit: 25, Offset: 50,
+	}
+	if _, err := QueryEvents(scopedContext("atlas"), params); err != nil {
+		t.Fatalf("QueryEvents: %v", err)
+	}
+
+	page, pageArgs := recorder.find(t, func(s string) bool { return strings.HasPrefix(s, eventsPagePrefix) })
+	wantPage := eventsPagePrefix +
+		"project = ? AND service = ? AND timestamp >= ? AND timestamp <= ? AND " +
+		"timestamp >= (SELECT min(timestamp) FROM (SELECT timestamp FROM monitor.events WHERE project = ? AND service = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT 25 OFFSET 50)) " +
+		"ORDER BY timestamp DESC LIMIT 25 OFFSET 50"
+	if page != wantPage {
+		t.Errorf("page sql =\n\t%s\nwant\n\t%s", page, wantPage)
+	}
+	wantPageArgs := []any{"atlas", "api", from, to, "atlas", "api", from, to}
+	if !reflect.DeepEqual(pageArgs, wantPageArgs) {
+		t.Errorf("page args = %v, want %v", pageArgs, wantPageArgs)
+	}
+
+	count, countArgs := recorder.find(t, func(s string) bool { return strings.HasPrefix(s, "SELECT count()") })
+	wantCount := "SELECT count() FROM monitor.events WHERE project = ? AND service = ? AND timestamp >= ? AND timestamp <= ?"
+	if count != wantCount {
+		t.Errorf("count sql =\n\t%s\nwant\n\t%s", count, wantCount)
+	}
+	if want := []any{"atlas", "api", from, to}; !reflect.DeepEqual(countArgs, want) {
+		t.Errorf("count args = %v, want %v", countArgs, want)
+	}
+}
+
+// TestQueryEventsPageStaysSinglePhaseWithADataFilter: with a data.* filter both
+// phases would parse `data` for the same rows, so the page is one statement.
+func TestQueryEventsPageStaysSinglePhaseWithADataFilter(t *testing.T) {
+	withDefaultProject(t, "default")
+	recorder := withRecordingConn(t)
+
+	params := QueryParams{Filters: []Filter{{Field: "latency_ms", Operator: OpEq, Value: "5", IsData: true}}}
+	if _, err := QueryEvents(scopedContext("atlas"), params); err != nil {
+		t.Fatalf("QueryEvents: %v", err)
+	}
+
+	page, pageArgs := recorder.find(t, func(s string) bool { return strings.HasPrefix(s, eventsPagePrefix) })
+	wantPage := eventsPagePrefix + "project = ? AND position(data, ?) > 0 AND " + wantGuardedString + " = ? ORDER BY timestamp DESC LIMIT 100 OFFSET 0"
+	if page != wantPage {
+		t.Errorf("page sql =\n\t%s\nwant\n\t%s", page, wantPage)
+	}
+	if want := []any{"atlas", "5", "5"}; !reflect.DeepEqual(pageArgs, want) {
+		t.Errorf("page args = %v, want %v", pageArgs, want)
+	}
+}
+
+// TestQueryEventsTwoPhaseScopesBothPhasesForTheDefaultProject: the transition
+// arm reaches the inner read too, or pre-006 rows could never set the boundary.
+func TestQueryEventsTwoPhaseScopesBothPhasesForTheDefaultProject(t *testing.T) {
+	withDefaultProject(t, "default")
+	recorder := withRecordingConn(t)
+
+	if _, err := QueryEvents(scopedContext("default"), QueryParams{}); err != nil {
+		t.Fatalf("QueryEvents: %v", err)
+	}
+	page, pageArgs := recorder.find(t, func(s string) bool { return strings.HasPrefix(s, eventsPagePrefix) })
+	if n := strings.Count(page, "(project = ? OR project = '')"); n != 2 {
+		t.Errorf("page carries the default-project predicate %d time(s), want 2 (outer and inner):\n\t%s", n, page)
+	}
+	if want := []any{"default", "default"}; !reflect.DeepEqual(pageArgs, want) {
+		t.Errorf("page args = %v, want %v", pageArgs, want)
+	}
+}
+
+// TestGetLabelValuesGroupsInsteadOfDistinct pins CH-2: GROUP BY aggregates a
+// LowCardinality column on its dictionary keys, DISTINCT does not.
+func TestGetLabelValuesGroupsInsteadOfDistinct(t *testing.T) {
+	withDefaultProject(t, "default")
+	recorder := withRecordingConn(t)
+
+	from := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	params := QueryParams{
+		Filters: []Filter{
+			{Field: "service", Operator: OpEq, Value: "skipped: this is the requested column"},
+			{Field: "level", Operator: OpEq, Value: "error"},
+		},
+		From: from,
+	}
+	if _, err := GetLabelValues(scopedContext("atlas"), "service", params); err != nil {
+		t.Fatalf("GetLabelValues: %v", err)
+	}
+
+	want := "SELECT service FROM monitor.events WHERE project = ? AND level = ? AND timestamp >= ? GROUP BY service ORDER BY service LIMIT 1000"
+	if recorder.statements[0] != want {
+		t.Errorf("sql =\n\t%s\nwant\n\t%s", recorder.statements[0], want)
+	}
+	if wantArgs := []any{"atlas", "error", from}; !reflect.DeepEqual(recorder.args[0], wantArgs) {
+		t.Errorf("args = %v, want %v", recorder.args[0], wantArgs)
+	}
 }
