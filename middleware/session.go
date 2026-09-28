@@ -80,6 +80,29 @@ func GetActor(ctx context.Context) (*structs.Actor, bool) {
 // middleware simply consults it for every JWT-authenticated user.
 var SSOCheckpoint func(userID int64) bool
 
+// SSOCheckpointCtx is the context-aware form of SSOCheckpoint, and is preferred
+// over it whenever it is set. It receives the REQUEST's context, so the
+// introspection the checkpoint makes to the IdP (forta-api) can carry this
+// request's X-Request-ID — without it the IdP-side log line for a revocation
+// check cannot be tied back to the Monitor request that caused it.
+//
+// SSOCheckpoint is kept, unchanged, as the fallback: a nil SSOCheckpointCtx
+// consults SSOCheckpoint exactly as before, and a nil pair always passes.
+var SSOCheckpointCtx func(ctx context.Context, userID int64) bool
+
+// passesSSOCheckpoint runs whichever checkpoint hook is installed, preferring
+// the context-aware one. With neither installed it passes — SSO unconfigured is
+// a legitimate state, not a denial.
+func passesSSOCheckpoint(ctx context.Context, userID int64) bool {
+	if SSOCheckpointCtx != nil {
+		return SSOCheckpointCtx(ctx, userID)
+	}
+	if SSOCheckpoint != nil {
+		return SSOCheckpoint(userID)
+	}
+	return true
+}
+
 // GetUserFromContext returns the user injected by SessionMiddleware.
 func GetUserFromContext(ctx context.Context) (*structs.User, bool) {
 	user, ok := ctx.Value(UserContextKey).(*structs.User)
@@ -105,14 +128,14 @@ func GetUserID(ctx context.Context) (int64, bool) {
 func SessionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if token := extractBearerToken(r); token != "" {
-			if user := validateSessionToken(token); user != nil {
+			if user := validateSessionTokenCtx(r.Context(), token); user != nil {
 				next.ServeHTTP(w, r.WithContext(withUser(r.Context(), user)))
 				return
 			}
 		}
 
 		if cookie, err := r.Cookie("mon-access-token"); err == nil && cookie.Value != "" {
-			if user := validateSessionToken(cookie.Value); user != nil {
+			if user := validateSessionTokenCtx(r.Context(), cookie.Value); user != nil {
 				next.ServeHTTP(w, r.WithContext(withUser(r.Context(), user)))
 				return
 			}
@@ -166,6 +189,13 @@ func withUser(ctx context.Context, user *structs.User) context.Context {
 // inventing a value would put a fabricated identity into audit rows. Nothing a
 // zone serves reads them — /auth/self is a control-plane route.
 func validateSessionToken(tokenStr string) *structs.User {
+	return validateSessionTokenCtx(context.Background(), tokenStr)
+}
+
+// validateSessionTokenCtx is validateSessionToken with the request context
+// threaded through to the SSO checkpoint, so the checkpoint's outbound
+// introspection carries the request id. Behaviour is otherwise identical.
+func validateSessionTokenCtx(ctx context.Context, tokenStr string) *structs.User {
 	userID, role, err := jwt.ValidateAccessToken(tokenStr)
 	if err != nil {
 		return nil
@@ -184,7 +214,7 @@ func validateSessionToken(tokenStr string) *structs.User {
 		return nil
 	}
 
-	if SSOCheckpoint != nil && !SSOCheckpoint(userID) {
+	if !passesSSOCheckpoint(ctx, userID) {
 		return nil
 	}
 
