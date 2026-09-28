@@ -42,7 +42,7 @@ import (
 // It is short deliberately, and the reasoning is the one the persisted verdict
 // exists for in the first place. This runs behind an admin action, synchronously,
 // while a person waits; a zone that accepts TCP and then never answers would
-// otherwise hold the request open until the server's WriteTimeout (60s), so ONE
+// otherwise hold the request open until the server's WriteTimeout (30s), so ONE
 // wedged zone could hang the page whose entire job is to warn about wedged
 // zones. Three seconds is an order of magnitude above a healthy round trip
 // (routes/health.go budgets 2s for a single store ping and that is already

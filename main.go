@@ -596,6 +596,11 @@ func main() {
 		AllowCredentials: true,
 		AllowedHeaders:   []string{"X-Requested-With", "Content-Type", "Origin", "Authorization", "Accept", "Referer", "Dnt", "User-Agent", "X-Api-Key", "X-CSRF-Token"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		// Let browsers cache a preflight for 2h (Chromium's cap) instead of the
+		// 5s default. Without it monitor-js pays a preflight before nearly every
+		// ingest flush. The one cost: a change to AllowedHeaders/AllowedMethods
+		// can take up to 2h to reach an already-open browser.
+		MaxAge: 7200,
 	})
 
 	// Launch Server

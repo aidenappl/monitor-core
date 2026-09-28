@@ -30,7 +30,8 @@ two production defects that produced it.
 ## Features
 
 - **HTTP ingestion endpoint**: `POST /v1/events` accepts NDJSON (newline-delimited JSON)
-- **Gzip support**: Automatically handles gzip-compressed request bodies
+- **Gzip support**: Automatically handles gzip-compressed request bodies, and gzips `/v1`
+  JSON responses of 1 KB or more when the client sends `Accept-Encoding: gzip`
 - **Streaming parser**: Processes events line-by-line without loading entire body into memory
 - **Batched writes**: Collects events and writes to ClickHouse in configurable batches
 - **Non-blocking ingestion**: HTTP handler enqueues events and returns immediately
@@ -834,6 +835,8 @@ monitor-core/
     ingest_auth.go            # X-Api-Key auth for POST /v1/events (env master key OR ingest-scope key)
     query_auth.go             # X-Api-Key (admin) OR Monitor session for /v1/* reads; injects the project (credential-derived for keys, a validated ?project selector for sessions)
     logging.go header.go      # Request logging (SSE-safe) + Server header
+    timeout.go                # 25s request-context deadline on /v1 (SSE streams skipped)
+    gzip.go                   # gzip for /v1 JSON responses >= 1 KB (SSE, HEAD, POST /v1/api-keys skipped)
   responder/responder.go      # Standardized JSON response utilities
   routes/                     # HTTP handlers (thin) — auth + SSO + events/query/analytics/… (see routes/AGENTS.md)
   services/                   # queue.go batcher.go hub.go query.go analytics.go (ingestion + query engines)

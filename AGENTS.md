@@ -66,7 +66,9 @@ what is deliberately **not** built yet.
     `db.SQL` (`db/sql.go`); this is the standard-shape `db.Queryable` +
     squirrel-against-`database/sql` stack. **Which store owns what, and why, is §6
     *Stores — configuration vs facts*.**
-- **CORS:** `github.com/rs/cors`.
+- **CORS:** `github.com/rs/cors` (`main.go`). `MaxAge: 7200` caches a preflight for 2h
+  (Chromium's cap) so monitor-js does not pay one before nearly every ingest flush; the cost is
+  that an `AllowedHeaders`/`AllowedMethods` change takes up to 2h to reach an open browser.
 - **Sessions/JWT:** `github.com/golang-jwt/jwt/v5` (Monitor-owned HS512 tokens).
 - **SSO:** `github.com/aidenappl/go-forta/sso` **v1.11.0** — the shared SSO module. It brings
   `coreos/go-oidc/v3` and `golang.org/x/oauth2` transitively; this repo no longer imports
@@ -108,6 +110,8 @@ monitor-core/
     ingest_auth.go         # X-Api-Key auth for POST /v1/events (env master key OR ingest-scope DB key); injects the credential's project
     query_auth.go          # X-Api-Key (admin) OR a Monitor session for /v1/* reads; injects the project EVERY read is scoped to — credential-derived for keys, a validated ?project SELECTOR for sessions (§6)
     logging.go header.go   # RequestID + logging (SSE-safe); Server header
+    timeout.go             # RequestTimeout: 25s context deadline on /v1 (REQUEST_TIMEOUT), SSE streams skipped
+    gzip.go                # GzipMiddleware: gzips /v1 application/json bodies >= 1 KB; Flush + Unwrap; SSE/HEAD/POST /v1/api-keys skipped
   responder/responder.go   # Standard JSON envelope helpers
   routes/                  # HTTP handlers (thin) — see routes/AGENTS.md
     HandleLogin/Register/Refresh/Logout/GetSelf/Identities.router.go   # native auth + self + identities
@@ -539,6 +543,8 @@ HS512** via `WithValidMethods` and the keyfunc re-checks the method (defeats
 | `QueryAuthMiddleware` | all other `/v1/*` | env master key **or** DB **admin-scope** key **or** a valid Monitor session (`mon-access-token`/Bearer, incl. SSO checkpoint). Ingest keys → `403`. Injects the project every read is scoped to: **credential-derived** for the two key branches, a validated **`?project=` selector** (defaulting to `MON_DEFAULT_PROJECT`) for a session — see §6 *The project asymmetry*. |
 | `SessionMiddleware` (`Protected`) | `/auth/*`, `/admin/*` | a valid access JWT (Bearer or `mon-access-token`) → puts the user in context. `RequireAdmin`/`RequireEditor`/`RejectPending` gate on `role`. **Resolves the user two ways** — control plane reads the live row (`Active` + SSO checkpoint); a zone builds it from the token's claims. See *Zone session trust* below. |
 | `CSRFMiddleware` (global) | all unsafe methods | `mon-csrf` cookie == `X-CSRF-Token` header (constant-time). Safe methods, Bearer clients, `X-Api-Key` clients, and `/auth/{login,register,refresh}` + SSO callbacks are exempt. |
+| `RequestTimeout(REQUEST_TIMEOUT)` | `/v1` subrouter, after `QueryAuthMiddleware` | not auth — derives the request context with a **25s** deadline, so a ClickHouse query started from `r.Context()` is cancelled before the server's 30s `WriteTimeout` gives up on the response. **Skips `/v1/events/stream` and `/v1/alerts/stream` by path.** A context deadline, never `http.TimeoutHandler` (which buffers and hides `http.Flusher`). |
+| `GzipMiddleware` | `/v1` subrouter, innermost | not auth — gzips a response only when the request accepts gzip, the method is not `HEAD`, the path is not one of the two SSE streams and not `POST /v1/api-keys` (freshly minted secret — BREACH), the handler set `Content-Type: application/json` and no `Content-Encoding`, the status is not 204/304/206, and the body reaches **1 KB** (`GZIP_MIN_SIZE`). When it compresses it deletes any handler `Content-Length` and adds `Vary: Accept-Encoding`. The wrapper implements `Flush` (an early flush of a sub-1 KB body abandons compression) and `Unwrap`. **Never on the root router** — `/auth/*`, the SSO icon, ingest, probes and the webhook are deliberately outside it. |
 
 Both `X-Api-Key` middlewares compare the env master key with `subtle.ConstantTimeCompare` via
 the shared `middleware.matchesEnvMasterKey`, which also refuses an empty key on both sides —
@@ -1631,6 +1637,7 @@ answer to "whose data is this".
 ```
 monitor-web → Next.js proxy (mon-* cookies + X-CSRF-Token) → GET/POST /v1/*  [QueryAuthMiddleware]
       resolves the credential's project and injects it (scope.WithProject)
+  → RequestTimeout (25s context deadline) → GzipMiddleware (JSON ≥ 1 KB, when accepted)
   → routes/* handler → services.Query / services.Analytics builds squirrel SQL
       every builder starts at its chokepoint, which ANDs scope.ProjectPredicate(ctx);
       no project on the context ⇒ an error, never an unscoped query
@@ -2053,6 +2060,14 @@ deviating.
   *every* event to a subscriber who asked for a subset — no error, no log line. Matching
   nothing is the safe side of that drift, but neither side is correct: keep the two in sync
   and extend `services/hub_test.go`, which asserts the full contract.
+- **Response compression and the request deadline belong to the `/v1` subrouter only, and a
+  new streaming `/v1` route must join `middleware.isStreamPath`.** Both middlewares skip the two
+  SSE routes by path (the Content-Type is not known when they decide). A stream they did not
+  know about would be cut at 25s by the deadline and have its events held in a deflate window.
+  Moving either onto the root router would wrap `/auth/*` and the SSO icon (which sets its own
+  `Content-Length`); `router_http_test.go` fails if that happens. Any wrapper added around the
+  `ResponseWriter` must implement `Flush` and `Unwrap` — the SSE handlers clear `WriteTimeout`
+  through `http.ResponseController` and discard the error.
 - **Keep `/health` returning 200.** It is liveness, the container HEALTHCHECK points at it,
   and a dependency verdict belongs in `/ready` (§5).
 - **Never create a table from an `Init()`.** Eight tables in this repo were created by

@@ -127,6 +127,10 @@ This assertion now **succeeds**: `middleware/logging.go`'s `loggingResponseWrite
 forwards `Flush`/`Hijack`/`Unwrap`. After setting the SSE headers, each handler also
 clears its write deadline (`http.NewResponseController(w).SetWriteDeadline(time.Time{})`)
 so the global `WriteTimeout: 30s` (kept for all other routes) doesn't sever the stream.
+The two `/v1` wrappers mounted after `QueryAuthMiddleware` — `RequestTimeout` (25s context
+deadline) and `GzipMiddleware` — **skip both stream paths** (`middleware.isStreamPath`), so a
+stream's context ends only on client disconnect and its events are never buffered by a
+compressor. A new SSE route under `/v1` must be added to `isStreamPath`.
 
 ⚠️ **`stream.go`'s filter allowlist and `services.matchesFilters` are one contract in two
 files.** `clientStreamFilters` holds the four keys a subscriber may choose — `service`,

@@ -180,6 +180,16 @@ func buildRouter(role env.Role) *mux.Router {
 	// MariaDB, the session branch verifies a JWT the control plane issued).
 	v1 := r.PathPrefix("/v1").Subrouter()
 	v1.Use(middleware.QueryAuthMiddleware)
+	// Request deadline and response compression — /v1 ONLY, and both skip the two
+	// SSE streams by path. On this subrouter rather than the root one so that
+	// /auth/* (cookies, the public SSO icon), POST /v1/events ingest, the webhook
+	// and the probes are never touched: every one of those is registered on r
+	// above. The timeout (25s) sits under WriteTimeout (30s, main.go) so a
+	// ClickHouse query is cancelled while there is still time to answer; gzip
+	// compresses only application/json bodies of 1 KB or more. See
+	// middleware/timeout.go and middleware/gzip.go for the full rule sets.
+	v1.Use(middleware.RequestTimeout(middleware.REQUEST_TIMEOUT))
+	v1.Use(middleware.GzipMiddleware)
 
 	// Tenancy registry reads. These are what the project switcher in monitor-web
 	// populates from, and they are READS ONLY — the registry is seeded by
