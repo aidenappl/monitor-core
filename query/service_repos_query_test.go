@@ -255,8 +255,8 @@ func TestListServicesForRepoStaysCrossProjectAndReturnsPairs(t *testing.T) {
 }
 
 // TestListServiceReposForOmitsAmbiguousServices covers the deprecated unscoped
-// bulk read, whose one caller (enrichIssues, routes/issues.go) has not been moved
-// to the scoped variant yet.
+// bulk read. It has no callers now that enrichIssues (routes/issues.go) uses the
+// scoped variant, but while it exists it must still refuse to guess.
 //
 // A service name mapped in two projects has no correct answer without a tenant,
 // and the tempting implementation — last row into the map wins — picks one at

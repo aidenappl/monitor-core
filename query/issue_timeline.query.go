@@ -142,18 +142,31 @@ func AppendTimelineEntry(engine db.Queryable, req AppendTimelineEntryRequest) (*
 		metadata  = VALUES(metadata),
 		deleted_at = NULL`
 
-	if _, err := engine.Exec(insertSQL,
+	res, err := engine.Exec(insertSQL,
 		req.IssueID, string(req.Type), string(req.Actor.Kind),
 		userID, apiKeyID, req.Actor.Label,
 		body, metadata, dedupe,
-	); err != nil {
+	)
+	if err != nil {
 		return nil, fmt.Errorf("failed to append timeline entry: %w", err)
 	}
 
+	// A deduped write may have updated an existing row, or been a no-op, so the
+	// insert id does not name it; the (issue_id, dedupe_key) pair always does.
 	if dedupe != nil {
 		return GetTimelineEntryByDedupeKey(engine, req.IssueID, *req.DedupeKey)
 	}
-	return getLastTimelineEntry(engine, req.IssueID)
+
+	// Without a dedupe_key the unique key holds NULL and can never collide, so
+	// ON DUPLICATE KEY UPDATE cannot fire and LastInsertId is always THIS row.
+	// Reading back "the issue's newest entry" instead would hand the caller a
+	// concurrent append to the same issue — someone else's comment returned as
+	// the one just posted.
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read timeline entry id: %w", err)
+	}
+	return getTimelineEntryByID(engine, req.IssueID, id)
 }
 
 // GetTimelineEntryByDedupeKey returns the entry an agent's dedupe key resolves
@@ -163,26 +176,6 @@ func GetTimelineEntryByDedupeKey(engine db.Queryable, issueID, dedupeKey string)
 		Where(sq.Eq{"monitor.issue_timeline.issue_id": issueID}).
 		Where(sq.Eq{"monitor.issue_timeline.dedupe_key": dedupeKey}).
 		Limit(1)
-
-	qStr, args, err := q.ToSql()
-	if err != nil {
-		return nil, fmt.Errorf("failed to build sql query: %w", err)
-	}
-
-	entry, err := scanTimelineEntry(engine.QueryRow(qStr, args...))
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to scan timeline entry: %w", err)
-	}
-	return entry, nil
-}
-
-func getLastTimelineEntry(engine db.Queryable, issueID string) (*structs.IssueTimelineEntry, error) {
-	q := sq.Select(timelineColumns...).From(timelineTable).
-		Where(sq.Eq{"monitor.issue_timeline.issue_id": issueID}).
-		OrderBy("monitor.issue_timeline.id DESC").Limit(1)
 
 	qStr, args, err := q.ToSql()
 	if err != nil {

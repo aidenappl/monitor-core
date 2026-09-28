@@ -443,13 +443,14 @@ both projects at one tenant's repo. Every read, the upsert and the delete now bi
 `api` here and `api` there are two mappings. `idx_service_repos_lookup (provider, owner, repo)` is
 deliberately **left alone** — see the webhook below, which is the one caller with no project.
 
-⚠️ **One unscoped read survives: `query.ListServiceReposFor`, and it is deprecated.** Its single
-caller is `enrichIssues` (`routes/issues.go`), which decorates a page of issues with their
-repositories and should call `ListServiceReposForProject` — every issue on the page carries a
-project. Until it does, the unscoped one **omits any service name mapped in more than one
-project** rather than picking one: the obvious "last row wins" would put a foreign `owner/repo`
-on somebody's issue and a foreign URL behind "view source", whereas omitting it degrades to the
-unmapped state every caller already renders. Do not give it a second caller.
+⚠️ **`enrichIssues` (`routes/issues.go`) resolves repositories in the caller's project.** It
+takes the project the page was read under (`HandleListIssues` and `HandleGetIssue` both pass the
+one `requireProject` returned) and calls `ListServiceReposForProject`, so an issue whose service
+is unmapped here stays unmapped even when another project maps a service of the same name —
+before, the unscoped read handed it that tenant's `owner/repo` and a foreign URL behind "view
+source". The unscoped `query.ListServiceReposFor` is deprecated and now has **no callers**; it
+still omits any service name mapped in more than one project rather than picking one. Do not
+give it a caller.
 
 **Tokens are per-owner**, because a fine-grained PAT is scoped to a single org. `github.TokenFor`
 derives the env var name from the owner — `TeamTrailblaze` → `MON_GITHUB_TOKEN_TEAMTRAILBLAZE`,

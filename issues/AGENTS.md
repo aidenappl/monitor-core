@@ -116,6 +116,12 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
   `ignored` are left alone, so an agent mid-work is never clobbered. `recordRegression`
   then appends a `regressed` timeline entry keyed on the stored `regressed_at`, so
   racing workers compute the same `dedupe_key` and collapse to one row.
+- **`query.AppendTimelineEntry` returns the row it wrote.** An entry with no
+  `dedupe_key` is read back by the INSERT's `LastInsertId` — its NULL key never
+  collides, so the id is always this row's. A deduped entry is read back by
+  `(issue_id, dedupe_key)`, because an upsert that updated or no-op'd has no useful
+  insert id. Never re-read "the issue's newest entry": under concurrent appends that
+  returns another caller's comment. `query/issue_timeline_query_test.go` pins both.
 
 ## API surface (wired in main.go → routes/issues.go + routes/issue_timeline.go)
 

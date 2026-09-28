@@ -170,7 +170,7 @@ func HandleListIssues(w http.ResponseWriter, r *http.Request) {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to list issues", err)
 		return
 	}
-	if err := enrichIssues(list); err != nil {
+	if err := enrichIssues(project, list); err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to enrich issues", err)
 		return
 	}
@@ -205,7 +205,12 @@ func HandleListIssues(w http.ResponseWriter, r *http.Request) {
 // Enrichment is best-effort per concern: a failure to resolve, say, the service
 // repository must not fail the whole listing, because the core issue data is
 // already correct and useful without it.
-func enrichIssues(list []structs.Issue) error {
+//
+// project is the tenant the page was read under. Repositories are resolved in
+// that project only: a service name is unique within one project and nowhere
+// else, so an unscoped lookup would attach another tenant's owner/repo — and a
+// foreign "view source" URL — to an issue whose service happens to share a name.
+func enrichIssues(project string, list []structs.Issue) error {
 	if len(list) == 0 {
 		return nil
 	}
@@ -232,7 +237,7 @@ func enrichIssues(list []structs.Issue) error {
 	if err != nil {
 		return err
 	}
-	reposByService, err := query.ListServiceReposFor(db.SQL, services)
+	reposByService, err := query.ListServiceReposForProject(db.SQL, project, services)
 	if err != nil {
 		return err
 	}
@@ -283,7 +288,7 @@ func HandleGetIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	one := []structs.Issue{*issue}
-	if err := enrichIssues(one); err != nil {
+	if err := enrichIssues(project, one); err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to enrich issue", err)
 		return
 	}

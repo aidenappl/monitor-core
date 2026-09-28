@@ -149,11 +149,11 @@ func ListServiceReposForProject(engine db.Queryable, project string, services []
 
 // ListServiceReposFor is the UNSCOPED bulk lookup, and it is deprecated.
 //
-// ⚠️ IT HAS EXACTLY ONE CALLER — enrichIssues in routes/issues.go, which decorates
-// a page of issues with their repositories. That caller holds the project (every
-// issue on the page carries one, and the listing that produced them was scoped)
-// and should call ListServiceReposForProject; this function exists only until it
-// does, and must not acquire a second caller.
+// ⚠️ IT HAS NO CALLERS. Its last one, enrichIssues in routes/issues.go, now calls
+// ListServiceReposForProject with the project the page was read under. It is
+// kept only so removing it is a deliberate change of its own, and it must not
+// acquire a caller: every page of issues carries a project, so there is no read
+// that needs the unscoped shape.
 //
 // WHAT IT DOES ABOUT AMBIGUITY, since it cannot resolve it: a service name mapped
 // in more than one project is OMITTED from the result entirely. The obvious
