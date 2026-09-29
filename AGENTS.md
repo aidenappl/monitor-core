@@ -120,6 +120,8 @@ monitor-core/
     HandleAdminZones.router.go     # POST /admin/zones, PUT /admin/zones/{id}, POST .../retire, POST .../probe — plus the shared registryWriteError / registryPathID / decodeJSONBody helpers
     HandleAdminProjects.router.go  # POST /admin/zones/{id}/projects, PUT /admin/projects/{id}, POST .../retire
     health.go              # GET /ready (readiness) + the 2s dependency pings /health also reports
+    ingest_summary.go      # RunIngestSummary: the every-15-min ingest.summary.reported, emitted only when something moved (the loop guard for healthy ingest)
+    draining.go            # StartDraining/Draining: the shutdown signal the SSE loops select on, so a stream does not hold server.Shutdown for its whole timeout
     HandleGitHubWebhook.router.go  # POST /webhooks/github — root-mounted, HMAC-authenticated
   github/                  # GitHub link parsing, live-state client, webhook signature verification
     parse.go client.go verify.go
@@ -336,7 +338,11 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
     **exactly one** enriched event, a successful authenticated read is exactly one info
     event, the level table, a panic files one issue; `routes/telemetry_test.go` — a zone
     probe emits on a state change only; `telemetry/telemetry_test.go` — the coalescing
-    window, the stdout policy and its redaction, safe error text, goroutine panics, Fatal.
+    window, the stdout policy and its redaction, safe error text, goroutine panics, Fatal,
+    and that a stop flush delivers before the listener closes.
+  - **The stop path**, which is how a deploy loses (or keeps) its shutdown events:
+    `routes/draining_test.go` — an SSE handler returns when draining starts even with a live
+    request context, so `server.Shutdown` does not wait out its timeout on it.
 
 ---
 
@@ -1922,7 +1928,7 @@ past-tense verb (`issue.created`, `alert.fired`).
 | `github.webhook.processed` / `.state.updated` | info / debug | PR state applied to linked issues | owner, repo, number, entry_type, issues_updated |
 | `github.webhook.timeline.append.failed` | error, coalesced | an issue's timeline missed a PR change | issue_id, owner, repo, number |
 | `github.webhook.payload.invalid`, `.services.resolve.failed`, `.issue.resolve.failed` | warn | a delivery degraded | owner, repo, issue_id |
-| `stream.subscriber.connected`/`.disconnected` | debug | SSE connect / disconnect | stream, subscriber_id, project, events_sent, duration_ms |
+| `stream.subscriber.connected`/`.disconnected` | debug | SSE connect / disconnect; `reason: server_draining` when shutdown ended the stream rather than the client | stream, subscriber_id, project, events_sent, duration_ms, reason |
 | `stream.write.failed`, `stream.subscriber.lagging`, `stream.event.encode.failed` | warn, coalesced | a live stream could not keep up or be written | stream, events_sent, dropped, buffer |
 | `zone.probe.unhealthy` / `zone.probe.recovered` | warn / info | an admin probe verdict CHANGED (not per probe) | zone, reachability, previous, detail, reported_zone |
 
@@ -2295,12 +2301,17 @@ are listed in §4.
     the events under the wrong tenant silently — `MON_TELEMETRY_ZONE=appleby` makes the boot
     banner catch a wrong URL.
   - *A zone logs `http.shutdown.failed` (`shutdown_timeout`) on a deploy, or its container is
-    killed rather than exiting* → an open live-tail stream. The SSE handlers end on
-    `r.Context()`, which `server.Shutdown` does not cancel, so one connected dashboard holds
-    shutdown for its full 10s. Then comes the 2s batcher drain, then the telemetry flush (up to
-    ~5–7s on appleby-core, whose own listener is already gone). That is longer than Docker's
-    default 10s stop grace. Known, not yet fixed. The fix is to cancel streams on shutdown
-    (`server.RegisterOnShutdown`, or a `BaseContext` that `main` cancels).
+    killed rather than exiting* → **fixed; if it recurs, this is the cause to rule out first.**
+    An SSE handler ends only when its client goes away, and `server.Shutdown` waits for active
+    requests, so one connected dashboard used to hold shutdown for its full 10s — and with the
+    2s batcher drain and the telemetry flush after it, a stop could exceed Docker's default 10s
+    stop grace and be SIGKILLed, losing the very shutdown events this telemetry delivers.
+    `main` now wires `routes.StartDraining` to `server.RegisterOnShutdown`, and both SSE loops
+    select on `routes.Draining()` as well as `r.Context()`, so streams end themselves as
+    shutdown begins (`stream.subscriber.disconnected` with `reason: server_draining`).
+    `routes/draining.go` explains why this must not become a cancelled `BaseContext` — that
+    would abort ordinary in-flight requests too. Pinned by
+    `TestStreamEndsWhenDrainingStarts`.
 
 ---
 

@@ -122,6 +122,18 @@ func StreamEventsHandler(w http.ResponseWriter, r *http.Request) {
 				"duration_ms":   time.Since(started).Milliseconds(),
 			})
 			return
+		case <-Draining():
+			// Shutdown has begun. Ending here is what lets Shutdown return
+			// instead of waiting out its timeout on a stream that never ends;
+			// see routes/draining.go. The client reconnects to the new process.
+			telemetry.Debug(ctx, "stream.subscriber.disconnected", map[string]any{
+				"stream":        "events",
+				"subscriber_id": sub.ID,
+				"events_sent":   sent,
+				"duration_ms":   time.Since(started).Milliseconds(),
+				"reason":        "server_draining",
+			})
+			return
 		case <-keepalive.C:
 			reportLaggingSubscriber(ctx, "events", filters["project"], sub.TakeDropped(), services.SUBSCRIBER_BUFFER)
 			_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))

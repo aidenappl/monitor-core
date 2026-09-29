@@ -406,6 +406,17 @@ func HandleStreamAlerts(w http.ResponseWriter, r *http.Request) {
 				"duration_ms":   time.Since(started).Milliseconds(),
 			})
 			return
+		case <-Draining():
+			// See routes/draining.go: a stream that never ends would otherwise
+			// hold Shutdown for its whole timeout.
+			telemetry.Debug(ctx, "stream.subscriber.disconnected", map[string]any{
+				"stream":        "alerts",
+				"subscriber_id": sub.ID,
+				"events_sent":   sent,
+				"duration_ms":   time.Since(started).Milliseconds(),
+				"reason":        "server_draining",
+			})
+			return
 		case <-keepalive.C:
 			reportLaggingSubscriber(ctx, "alerts", project, sub.TakeDropped(), alerts.ALERT_SUBSCRIBER_BUFFER)
 			_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))

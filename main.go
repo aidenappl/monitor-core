@@ -700,6 +700,12 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	// Called as Shutdown begins. An SSE stream ends only when its client goes
+	// away, so without this one open live-tail tab holds every deploy for the
+	// full shutdown timeout — long enough, with the drain and flush below, to be
+	// SIGKILLed past Docker's stop grace. See routes/draining.go.
+	server.RegisterOnShutdown(routes.StartDraining)
+
 	go func() {
 		defer telemetry.Recover(ctx, "http-server", "the HTTP server stopped serving")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
