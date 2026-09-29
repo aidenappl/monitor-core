@@ -1,7 +1,6 @@
 package services
 
 import (
-	"log"
 	"sync/atomic"
 
 	"github.com/aidenappl/monitor-core/structs"
@@ -23,6 +22,11 @@ func NewQueue(size int) *Queue {
 
 // Enqueue adds an event to the queue
 // Returns false if the queue is full (event dropped)
+//
+// Nothing is logged or emitted here: this is the ingest hot path, and during an
+// overflow it runs once per refused event. The ingest handler reports overflow
+// once per request, coalesced (routes.IngestEventsHandler) — and never with the
+// event's name, which is tenant data.
 func (q *Queue) Enqueue(event *structs.Event) bool {
 	select {
 	case q.events <- event:
@@ -30,9 +34,13 @@ func (q *Queue) Enqueue(event *structs.Event) bool {
 		return true
 	default:
 		q.dropped.Add(1)
-		log.Printf("queue overflow: dropped event %s", event.Name)
 		return false
 	}
+}
+
+// Capacity is the queue's buffer size (QUEUE_SIZE).
+func (q *Queue) Capacity() int {
+	return cap(q.events)
 }
 
 // RecordDropped adds n events that were accepted by the queue but lost further

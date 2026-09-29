@@ -9,6 +9,7 @@ import (
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 // DEPENDENCY_PING_TIMEOUT bounds each store ping. A probe that hangs is worse
@@ -84,7 +85,8 @@ func ReadyHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(body)
+	// The status is already sent; an encode failure means the prober went away.
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // DEPENDENCY_PING_TTL is how long a probe result is reused before both stores
@@ -150,6 +152,7 @@ func pingDependencies(ctx context.Context) (clickhouseOK, mariadbOK bool) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		defer telemetry.Recover(ctx, "dependency-ping", "ClickHouse reported down for this probe")
 		clickhouseOK = pingClickHouse(ctx)
 	}()
 	mariadbOK = pingMariaDB(ctx)

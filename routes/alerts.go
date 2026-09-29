@@ -3,15 +3,16 @@ package routes
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/aidenappl/monitor-core/alerts"
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/gorilla/mux"
 )
 
@@ -81,6 +82,11 @@ func HandleCreateAlertRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	telemetry.Info(r.Context(), "alert_rule.created", map[string]any{
+		"rule_id":   created.ID,
+		"project":   project,
+		"rule_type": created.Type,
+	})
 	responder.New(w, created)
 }
 
@@ -130,6 +136,7 @@ func HandleUpdateAlertRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	telemetry.Info(r.Context(), "alert_rule.updated", map[string]any{"rule_id": id, "project": project})
 	responder.New(w, updated)
 }
 
@@ -146,10 +153,11 @@ func HandleDeleteAlertRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := alerts.DeleteRule(r.Context(), project, id); err != nil {
-		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to delete alert rule", err)
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to delete alert rule", err, map[string]any{"rule_id": id})
 		return
 	}
 
+	telemetry.Info(r.Context(), "alert_rule.deleted", map[string]any{"rule_id": id, "project": project})
 	responder.New(w, nil, "alert rule deleted")
 }
 
@@ -177,7 +185,9 @@ func HandleTestAlertRule(w http.ResponseWriter, r *http.Request) {
 
 	value, firing, err := alerts.EvaluateRuleNow(r.Context(), &ruleWithState.AlertRule)
 	if err != nil {
-		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to evaluate alert rule", err)
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to evaluate alert rule", err, map[string]any{
+			"rule_id": id, "rule_type": ruleWithState.Type,
+		})
 		return
 	}
 
@@ -254,6 +264,12 @@ func HandleCreateNotificationChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Id and type only. The config is the credential (a Slack or webhook URL).
+	telemetry.Info(r.Context(), "notification_channel.created", map[string]any{
+		"channel_id":   created.ID,
+		"channel_type": created.Type,
+		"project":      project,
+	})
 	responder.New(w, created)
 }
 
@@ -270,10 +286,11 @@ func HandleDeleteNotificationChannel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := query.DeleteNotificationChannel(db.SQL, project, id); err != nil {
-		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to delete notification channel", err)
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to delete notification channel", err, map[string]any{"channel_id": id})
 		return
 	}
 
+	telemetry.Info(r.Context(), "notification_channel.deleted", map[string]any{"channel_id": id, "project": project})
 	responder.New(w, nil, "notification channel deleted")
 }
 
@@ -302,9 +319,14 @@ func HandleTestNotificationChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The cause is an alerts.NotifyError: channel type, stage and the
+	// destination's status — the URL already stripped. It lands on this
+	// request's event, which is the one report of the failure.
 	notifier := alerts.NewNotifier()
 	if err := notifier.SendTest(ch); err != nil {
-		responder.ErrorWithCause(w, http.StatusInternalServerError, "test notification failed", err)
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "test notification failed", err, map[string]any{
+			"channel_id": ch.ID, "channel_type": ch.Type,
+		})
 		return
 	}
 
@@ -314,12 +336,14 @@ func HandleTestNotificationChannel(w http.ResponseWriter, r *http.Request) {
 // HandleStreamAlerts handles GET /v1/alerts/stream (SSE for alert state changes)
 func HandleStreamAlerts(w http.ResponseWriter, r *http.Request) {
 	if AlertNotifHub == nil {
+		middleware.RecordFailure(w, http.StatusInternalServerError, "alert notifications not initialized", nil, map[string]any{"stream": "alerts", "reason": "hub_not_initialized"})
 		http.Error(w, "alert notifications not initialized", http.StatusInternalServerError)
 		return
 	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		middleware.RecordFailure(w, http.StatusInternalServerError, "streaming not supported", nil, map[string]any{"stream": "alerts", "reason": "writer_cannot_flush"})
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
@@ -339,6 +363,7 @@ func HandleStreamAlerts(w http.ResponseWriter, r *http.Request) {
 
 	sub := AlertNotifHub.Subscribe(project)
 	if sub == nil {
+		middleware.RecordFailure(w, http.StatusServiceUnavailable, "too many concurrent subscribers", nil, map[string]any{"stream": "alerts", "reason": "max_subscribers"})
 		http.Error(w, "too many concurrent subscribers", http.StatusServiceUnavailable)
 		return
 	}
@@ -352,25 +377,42 @@ func HandleStreamAlerts(w http.ResponseWriter, r *http.Request) {
 	// Clear the server's WriteTimeout for this connection so the SSE stream is
 	// not severed after WriteTimeout (30s in main.go). Relies on the logging
 	// middleware exposing Unwrap() so the controller can reach the raw conn.
+	// An error here means the writer cannot take deadlines at all; the stream
+	// keeps the server's. Nothing to report per connection.
 	rc := http.NewResponseController(w)
 	_ = rc.SetWriteDeadline(time.Time{})
 
 	flusher.Flush()
 
-	log.Printf("alert SSE subscriber connected: %s (project: %s)", sub.ID, project)
+	ctx := r.Context()
+	telemetry.Debug(ctx, "stream.subscriber.connected", map[string]any{
+		"stream":        "alerts",
+		"subscriber_id": sub.ID,
+		"project":       project,
+	})
 
 	keepalive := time.NewTicker(15 * time.Second)
 	defer keepalive.Stop()
 
-	ctx := r.Context()
+	started := time.Now()
+	sent := 0
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("alert SSE subscriber disconnected: %s", sub.ID)
+			telemetry.Debug(ctx, "stream.subscriber.disconnected", map[string]any{
+				"stream":        "alerts",
+				"subscriber_id": sub.ID,
+				"events_sent":   sent,
+				"duration_ms":   time.Since(started).Milliseconds(),
+			})
 			return
 		case <-keepalive.C:
-			rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			fmt.Fprintf(w, ": keepalive\n\n")
+			reportLaggingSubscriber(ctx, "alerts", project, sub.TakeDropped(), alerts.ALERT_SUBSCRIBER_BUFFER)
+			_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			if _, err := fmt.Fprintf(w, ": keepalive\n\n"); err != nil {
+				reportStreamWriteFailure(ctx, "alerts", sent, err)
+				return
+			}
 			flusher.Flush()
 		case event, ok := <-sub.Events:
 			if !ok {
@@ -378,11 +420,19 @@ func HandleStreamAlerts(w http.ResponseWriter, r *http.Request) {
 			}
 			data, err := json.Marshal(event)
 			if err != nil {
+				telemetry.WarnCoalesced(ctx, "stream.event.encode.failed", "stream.event.encode.failed", err, map[string]any{
+					"stream":  "alerts",
+					"outcome": "one alert event was skipped for this subscriber",
+				})
 				continue
 			}
-			rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				reportStreamWriteFailure(ctx, "alerts", sent, err)
+				return
+			}
 			flusher.Flush()
+			sent++
 		}
 	}
 }

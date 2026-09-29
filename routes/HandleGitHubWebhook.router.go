@@ -1,16 +1,18 @@
 package routes
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/github"
+	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 // maxWebhookBody caps the payload read. GitHub's pull_request deliveries run to
@@ -95,8 +97,16 @@ func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	if err := github.VerifySignature(body, r.Header.Get(github.SignatureHeader)); err != nil {
 		// 401 for both an unconfigured secret and a bad signature. The caller is
 		// GitHub, which retries on failure and needs no diagnostic detail; a
-		// forger gets none either.
-		log.Printf("github webhook: rejected delivery: %v", err)
+		// forger gets none either. The warning is the record — the request's own
+		// event drops to info so a rejection is reported once. Coalesced: an
+		// unconfigured secret refuses every delivery, and GitHub retries each.
+		middleware.ExpectedClientError(w)
+		telemetry.WarnCoalesced(r.Context(), "github.webhook.rejected", "github.webhook.rejected", err, map[string]any{
+			"reason":       "signature_invalid",
+			"github_event": r.Header.Get("X-GitHub-Event"),
+			"client_ip":    middleware.GetClientIPFromContext(r.Context()),
+			"outcome":      "returned 401; the delivery was not processed",
+		})
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -118,7 +128,10 @@ func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 
 	var payload githubWebhookPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		log.Printf("github webhook: malformed pull_request payload: %v", err)
+		telemetry.WarnErr(r.Context(), "github.webhook.payload.invalid", err, map[string]any{
+			"github_event": event,
+			"outcome":      "acknowledged and ignored",
+		})
 		writeWebhookOK(w, "ignored")
 		return
 	}
@@ -133,9 +146,12 @@ func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 
 	// Only touch PRs something is actually linked to. Most deliveries from a busy
 	// repo concern nothing Monitor tracks, and this is the cheap early exit.
+	prFields := map[string]any{"owner": owner, "repo": repo, "number": number, "action": payload.Action}
+
 	issueIDs, err := query.ListIssueIDsForPR(db.SQL, owner, repo, number)
 	if err != nil {
-		log.Printf("github webhook: failed to resolve linked issues for %s/%s#%d: %v", owner, repo, number, err)
+		// The 500 is reported by this request's own event, with this cause.
+		middleware.RecordFailure(w, http.StatusInternalServerError, "failed to resolve linked issues", err, prFields)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -158,7 +174,7 @@ func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		Title:  &title,
 		Author: &author,
 	}); err != nil {
-		log.Printf("github webhook: failed to update link state for %s/%s#%d: %v", owner, repo, number, err)
+		middleware.RecordFailure(w, http.StatusInternalServerError, "failed to update link state", err, prFields)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -167,6 +183,9 @@ func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		// State was refreshed above; this action just has no timeline meaning
 		// (a `synchronize` is a push to the branch, not a lifecycle change).
+		telemetry.Debug(r.Context(), "github.webhook.state.updated", map[string]any{
+			"owner": owner, "repo": repo, "number": number, "issues": len(issueIDs),
+		})
 		writeWebhookOK(w, "state updated")
 		return
 	}
@@ -190,7 +209,10 @@ func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	// primary key. The scoping happens one step later, per issue.
 	mapped, err := query.ListServicesForRepo(db.SQL, owner, repo)
 	if err != nil {
-		log.Printf("github webhook: failed to resolve services for %s/%s: %v", owner, repo, err)
+		telemetry.WarnErr(r.Context(), "github.webhook.services.resolve.failed", err, map[string]any{
+			"owner": owner, "repo": repo, "dependency": "mariadb",
+			"outcome": "timeline entries are written without affected_services",
+		})
 		mapped = nil
 	}
 
@@ -204,8 +226,9 @@ func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		servicesByProject[m.Project] = append(servicesByProject[m.Project], m.Service)
 	}
 
+	failed := 0
 	for _, issueID := range issueIDs {
-		affected := affectedServicesForIssue(db.SQL, issueID, servicesByProject)
+		affected := affectedServicesForIssue(r.Context(), db.SQL, issueID, servicesByProject)
 
 		if _, err := query.AppendTimelineEntry(db.SQL, query.AppendTimelineEntryRequest{
 			IssueID: issueID,
@@ -225,12 +248,30 @@ func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 			},
 			DedupeKey: &dedupeKey,
 		}); err != nil {
-			// Log and continue: one issue's timeline failing must not stop the
-			// others, and the link state is already updated either way.
-			log.Printf("github webhook: failed to append %s to issue %s: %v", entryType, issueID, err)
+			// Report and continue: one issue's timeline failing must not stop the
+			// others, and the link state is already updated either way. The
+			// delivery is still acknowledged with a 200, so this event — not the
+			// request's — is the record of the failure.
+			failed++
+			telemetry.ErrorCoalesced(r.Context(), "github.webhook.timeline.append.failed", "github.webhook.timeline.append.failed", &db.SQLError{Op: "issues.timeline.append", Err: err}, map[string]any{
+				"issue_id":   issueID,
+				"entry_type": string(entryType),
+				"owner":      owner,
+				"repo":       repo,
+				"number":     number,
+				"reason":     "mariadb_write_failed",
+				"outcome":    "the PR's state is updated, but this issue's timeline does not show the change",
+			})
 		}
 	}
 
+	telemetry.Info(r.Context(), "github.webhook.processed", map[string]any{
+		"owner":          owner,
+		"repo":           repo,
+		"number":         number,
+		"entry_type":     string(entryType),
+		"issues_updated": len(issueIDs) - failed,
+	})
 	writeWebhookOK(w, fmt.Sprintf("updated %d issue(s)", len(issueIDs)))
 }
 
@@ -259,13 +300,16 @@ func HandleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 // mapped in no project at all, or only in projects that own none of these issues.
 // The entry is still written — `affected_services` has always been decoration,
 // and losing it must not cost the timeline entry it decorates.
-func affectedServicesForIssue(engine db.Queryable, issueID string, servicesByProject map[string][]string) []string {
+func affectedServicesForIssue(ctx context.Context, engine db.Queryable, issueID string, servicesByProject map[string][]string) []string {
 	for project, services := range servicesByProject {
 		issue, err := query.GetIssue(engine, project, issueID)
 		if err != nil {
 			// Best-effort, like every other enrichment on this path: a failed
 			// probe costs the annotation, never the entry.
-			log.Printf("github webhook: failed to resolve issue %s in project %s: %v", issueID, project, err)
+			telemetry.WarnErr(ctx, "github.webhook.issue.resolve.failed", err, map[string]any{
+				"issue_id": issueID, "project": project, "dependency": "mariadb",
+				"outcome": "this issue's timeline entry is written without affected_services",
+			})
 			continue
 		}
 		if issue != nil {

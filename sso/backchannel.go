@@ -1,7 +1,6 @@
 package sso
 
 import (
-	"log"
 	"net/http"
 
 	ssolib "github.com/aidenappl/go-forta/sso"
@@ -41,7 +40,7 @@ func BackchannelLogoutHandler(slug string) http.Handler {
 		// disagree.
 		Sessions:  NewSessionStore(db.SQL),
 		Providers: loadLibProvider,
-		Logf:      log.Printf,
+		Logf:      libraryLogf,
 	}
 	return bcl.Handler(slug)
 }

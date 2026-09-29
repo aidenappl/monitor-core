@@ -1,7 +1,6 @@
 package routes
 
 import (
-	"log"
 	"net/http"
 
 	ssolib "github.com/aidenappl/go-forta/sso"
@@ -10,6 +9,7 @@ import (
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
 	"github.com/aidenappl/monitor-core/sso"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/gorilla/mux"
 )
 
@@ -85,7 +85,7 @@ func HandleLinkIdentity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("sso link: user %d beginning link to %q", user.ID, slug)
+	telemetry.Debug(r.Context(), "auth.identity.link.started", map[string]any{"user_id": user.ID, "provider": slug})
 	responder.New(w, linkIdentityResponse{AuthorizeURL: authURL}, "link started")
 }
 
@@ -135,10 +135,15 @@ func HandleUnlinkIdentity(w http.ResponseWriter, r *http.Request) {
 	// If this SSO identity backed a revocation checkpoint session, drop it too.
 	if slug != "password" {
 		if delErr := query.DeleteSSOSession(db.SQL, user.ID); delErr != nil {
-			log.Printf("sso unlink: failed to clear sso_session for user %d: %v", user.ID, delErr)
+			telemetry.WarnErr(r.Context(), "auth.identity.unlink.session.failed", delErr, map[string]any{
+				"user_id":    user.ID,
+				"provider":   slug,
+				"dependency": "mariadb",
+				"outcome":    "unlinked, but the cached IdP session remains and the checkpoint keeps consulting it",
+			})
 		}
 	}
 
-	log.Printf("sso unlink: user %d unlinked provider %q (identity %d)", user.ID, slug, identity.ID)
+	telemetry.Info(r.Context(), "auth.identity.unlinked", map[string]any{"user_id": user.ID, "provider": slug})
 	responder.New(w, nil, "identity unlinked")
 }

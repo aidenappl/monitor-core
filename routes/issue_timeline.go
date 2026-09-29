@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,6 +16,7 @@ import (
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/gorilla/mux"
 )
 
@@ -371,7 +371,15 @@ func HandleCreateIssueLink(w http.ResponseWriter, r *http.Request) {
 		createReq.Number = &n
 	}
 	if resource, err := github.Fetch(r.Context(), ref); err != nil {
-		log.Printf("issues: failed to fetch %s from github: %v", ref.URL(), err)
+		telemetry.WarnErr(r.Context(), "issue.link.github.fetch.failed", err, map[string]any{
+			"issue_id":   issue.ID,
+			"kind":       string(ref.Kind),
+			"owner":      ref.Owner,
+			"repo":       ref.Repo,
+			"number":     ref.Number,
+			"dependency": "github",
+			"outcome":    "linked without live state; the webhook fills it in later",
+		})
 	} else if resource != nil {
 		createReq.Title = &resource.Title
 		createReq.State = &resource.State
@@ -396,9 +404,20 @@ func HandleCreateIssueLink(w http.ResponseWriter, r *http.Request) {
 			"number": ref.Number, "kind": string(ref.Kind),
 		},
 	}); err != nil {
-		log.Printf("issues: failed to record link on %s: %v", issue.ID, err)
+		telemetry.WarnErr(r.Context(), "issue.timeline.append.failed", &db.SQLError{Op: "issues.timeline.append", Err: err}, map[string]any{
+			"issue_id":   issue.ID,
+			"entry_type": string(structs.TimelinePRLinked),
+			"outcome":    "the link was created, but has no timeline entry",
+		})
 	}
 
+	telemetry.Info(r.Context(), "issue.link.created", map[string]any{
+		"issue_id": issue.ID,
+		"project":  issue.Project,
+		"kind":     string(ref.Kind),
+		"owner":    ref.Owner,
+		"repo":     ref.Repo,
+	})
 	responder.New(w, link, "link created")
 }
 
@@ -437,8 +456,17 @@ func HandleDeleteIssueLink(w http.ResponseWriter, r *http.Request) {
 		Body:     &entryBody,
 		Metadata: map[string]any{"link_id": linkID},
 	}); err != nil {
-		log.Printf("issues: failed to record unlink on %s: %v", issue.ID, err)
+		telemetry.WarnErr(r.Context(), "issue.timeline.append.failed", &db.SQLError{Op: "issues.timeline.append", Err: err}, map[string]any{
+			"issue_id":   issue.ID,
+			"entry_type": string(structs.TimelinePRUnlinked),
+			"outcome":    "the link was removed, but has no timeline entry",
+		})
 	}
 
+	telemetry.Info(r.Context(), "issue.link.deleted", map[string]any{
+		"issue_id": issue.ID,
+		"project":  issue.Project,
+		"link_id":  linkID,
+	})
 	responder.New(w, nil, "link removed")
 }

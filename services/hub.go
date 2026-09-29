@@ -2,17 +2,33 @@ package services
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
 	"github.com/google/uuid"
 )
 
+// SUBSCRIBER_BUFFER is how many events a live-tail subscriber may fall behind by
+// before events are skipped for it.
+const SUBSCRIBER_BUFFER = 256
+
 // Subscriber represents a client subscribed to live events
 type Subscriber struct {
 	ID      string
 	Filters map[string]string
 	Events  chan *structs.Event
+
+	// dropped counts events skipped because Events was full. Publish runs on the
+	// ingest hot path, so it only bumps this; the stream handler reports it
+	// (coalesced) from its own goroutine.
+	dropped atomic.Int64
+}
+
+// TakeDropped returns the events skipped since the last call, and resets the
+// count.
+func (s *Subscriber) TakeDropped() int64 {
+	return s.dropped.Swap(0)
 }
 
 // Hub is a fan-out pub/sub hub for live event streaming
@@ -43,7 +59,7 @@ func (h *Hub) Subscribe(filters map[string]string) *Subscriber {
 	sub := &Subscriber{
 		ID:      uuid.New().String(),
 		Filters: filters,
-		Events:  make(chan *structs.Event, 256),
+		Events:  make(chan *structs.Event, SUBSCRIBER_BUFFER),
 	}
 	h.subscribers[sub.ID] = sub
 	return sub
@@ -70,7 +86,9 @@ func (h *Hub) Publish(event *structs.Event) {
 			select {
 			case sub.Events <- event:
 			default:
-				// Channel full, skip this event for this subscriber
+				// Channel full, skip this event for this subscriber — and count
+				// it, so a lagging tail is visible (routes.StreamEventsHandler).
+				sub.dropped.Add(1)
 			}
 		}
 	}

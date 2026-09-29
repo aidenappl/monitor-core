@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"regexp"
 	"strings"
 	"time"
@@ -15,6 +14,7 @@ import (
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/google/uuid"
 )
 
@@ -106,7 +106,7 @@ type trackJob struct {
 func Init(ctx context.Context) error {
 	trackQueue = make(chan trackJob, trackQueueSize)
 	for i := 0; i < trackWorkers; i++ {
-		go trackWorker(ctx)
+		telemetry.Go(ctx, "issue-tracker", trackWorker)
 	}
 	return nil
 }
@@ -126,7 +126,16 @@ func TrackError(event *structs.Event) {
 	select {
 	case trackQueue <- trackJob{event: event}:
 	default:
-		log.Printf("issues: track queue full, dropping error event %s/%s", event.Service, event.Name)
+		// On the ingest hot path, so coalesced — and the event's name and
+		// message are left out: they are the tenant's. Project and service
+		// identify the producer.
+		telemetry.WarnCoalesced(context.Background(), "issue.track.dropped", "issue.track.dropped", nil, map[string]any{
+			"project":        event.Project,
+			"service":        event.Service,
+			"queue_capacity": trackQueueSize,
+			"reason":         "track_queue_full",
+			"outcome":        "the event is stored, but its issue's count and last_seen were not updated",
+		})
 	}
 }
 
@@ -139,11 +148,9 @@ func trackWorker(ctx context.Context) {
 			return
 		case job := <-trackQueue:
 			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("issues: panic tracking error: %v", r)
-					}
-				}()
+				// Recovered per job, so one bad event costs its own fold and the
+				// worker keeps draining.
+				defer telemetry.Recover(ctx, "issue-tracker", "one error event was not folded into its issue; the worker continues")
 				processError(ctx, job.event)
 			}()
 		}
@@ -193,14 +200,40 @@ func processError(ctx context.Context, event *structs.Event) {
 		SeenAt:      seenAt,
 	})
 	if err != nil {
-		log.Printf("issues: failed to record occurrence for fingerprint %s: %v", fingerprint, err)
+		// Coalesced: a MariaDB outage fails every error event the same way, and
+		// on appleby-core this event is itself an error event that would be
+		// tracked. Identifiers only — the message is the tenant's, and a MariaDB
+		// error can quote it (db.SQLError elides quoted values).
+		telemetry.ErrorCoalesced(ctx, "issue.upsert.failed", "issue.upsert.failed", &db.SQLError{Op: "issues.upsert", Err: err}, map[string]any{
+			"project":     project,
+			"service":     event.Service,
+			"issue_id":    issueIDFor(fingerprint),
+			"fingerprint": fingerprint,
+			"reason":      "mariadb_write_failed",
+			"outcome":     "the event is stored, but not counted against its issue",
+		})
 		return
 	}
 	if issue == nil {
 		return
 	}
 
-	recordRegression(issue)
+	switch {
+	case issue.OccurrenceCount == 1:
+		telemetry.Info(ctx, "issue.created", map[string]any{
+			"issue_id": issue.ID,
+			"project":  project,
+			"service":  event.Service,
+		})
+	default:
+		telemetry.Debug(ctx, "issue.occurrence.recorded", map[string]any{
+			"issue_id":         issue.ID,
+			"project":          project,
+			"occurrence_count": issue.OccurrenceCount,
+		})
+	}
+
+	recordRegression(ctx, issue)
 }
 
 // recordRegression appends a timeline entry when an issue has just come back
@@ -213,7 +246,7 @@ func processError(ctx context.Context, event *structs.Event) {
 //
 // A failure here is logged, not propagated: losing a timeline entry must never
 // cost the occurrence count that was already durably recorded.
-func recordRegression(issue *structs.Issue) {
+func recordRegression(ctx context.Context, issue *structs.Issue) {
 	if issue.RegressedAt == nil {
 		return
 	}
@@ -236,8 +269,20 @@ func recordRegression(issue *structs.Issue) {
 		},
 		DedupeKey: &dedupeKey,
 	}); err != nil {
-		log.Printf("issues: failed to record regression for issue %s: %v", issue.ID, err)
+		telemetry.WarnCoalesced(ctx, "issue.regression.record.failed", "issue.regression.record.failed", &db.SQLError{Op: "issues.timeline.append", Err: err}, map[string]any{
+			"issue_id":   issue.ID,
+			"project":    issue.Project,
+			"dependency": "mariadb",
+			"outcome":    "the regression is counted but has no timeline entry",
+		})
+		return
 	}
+	telemetry.Info(ctx, "issue.regressed", map[string]any{
+		"issue_id":         issue.ID,
+		"project":          issue.Project,
+		"service":          issue.Service,
+		"regression_count": issue.RegressionCount,
+	})
 }
 
 // regressionActorLabel attributes automated regressions to ingestion itself,

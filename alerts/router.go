@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
+	"time"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 type AlertContext struct {
@@ -46,10 +47,14 @@ func BuildAlertContext(ctx context.Context, rule *structs.AlertRule, status stri
 		// Non-fatal, preserving what ResolveServiceGroups did: a group lookup
 		// that fails costs a policy keyed on service_group its match, which is a
 		// narrower loss than dropping the alert entirely.
-		log.Printf("alert router: failed to resolve service groups for project %s: %v", rule.Project, err)
+		telemetry.WarnCoalesced(ctx, "alert.route.groups.failed", "alert.route.groups.failed", err, map[string]any{
+			"rule_id":    rule.ID,
+			"project":    rule.Project,
+			"dependency": "mariadb",
+			"outcome":    "policies keyed on a service group cannot match this alert",
+		})
 		groups = nil
 	}
-	_ = ctx
 	return buildAlertContextFrom(groups, rule, status, value, message)
 }
 
@@ -120,8 +125,6 @@ func buildAlertContextFrom(groups []structs.ServiceGroup, rule *structs.AlertRul
 // the evaluator's timer, which has no request and no credential — the rule row
 // is the only thing that knows whose alert this is.
 func (r *Router) Route(ctx context.Context, alertCtx *AlertContext, rule *structs.AlertRule) (int, error) {
-	_ = ctx
-
 	policies, err := query.ListNotificationPolicies(db.SQL, rule.Project)
 	if err != nil {
 		return 0, fmt.Errorf("failed to list policies: %w", err)
@@ -144,11 +147,24 @@ func (r *Router) Route(ctx context.Context, alertCtx *AlertContext, rule *struct
 		// somebody else's PagerDuty.
 		ch, err := query.GetNotificationChannel(db.SQL, rule.Project, chID)
 		if err != nil {
-			log.Printf("alert router: failed to get channel %s: %v", chID, err)
+			telemetry.ErrorCoalesced(ctx, "alert.channel.load.failed:"+chID, "alert.channel.load.failed", err, map[string]any{
+				"channel_id": chID,
+				"rule_id":    rule.ID,
+				"project":    rule.Project,
+				"dependency": "mariadb",
+				"reason":     "mariadb_read_failed",
+				"outcome":    "alert not delivered to this channel",
+			})
 			continue
 		}
 		if ch == nil {
-			log.Printf("alert router: channel %s no longer exists, skipping", chID)
+			telemetry.WarnCoalesced(ctx, "alert.channel.missing:"+chID, "alert.channel.missing", nil, map[string]any{
+				"channel_id": chID,
+				"rule_id":    rule.ID,
+				"project":    rule.Project,
+				"reason":     "channel_deleted",
+				"outcome":    "skipped; a rule or policy still names a channel that no longer exists",
+			})
 			continue
 		}
 		delivered++
@@ -162,22 +178,39 @@ func (r *Router) Route(ctx context.Context, alertCtx *AlertContext, rule *struct
 		ruleName := alertCtx.RuleName
 		message := alertCtx.Message
 		value := alertCtx.Value
+		ruleID, project := rule.ID, rule.Project
 		go func(ch *structs.NotificationChannel) {
-			defer func() {
-				if rec := recover(); rec != nil {
-					log.Printf("alert router: panic sending to channel %s: %v", ch.ID, rec)
-				}
-			}()
+			defer telemetry.Recover(ctx, "alert-notify", "one alert notification was not sent")
 
+			start := time.Now()
 			var sendErr error
 			if status == "resolved" {
 				sendErr = r.notifier.SendResolved(ch, ruleName, message, value)
 			} else {
 				sendErr = r.notifier.Send(ch, ruleName, message, value)
 			}
+			// The channel's id and type, never its config: a Slack or webhook
+			// URL is the credential. NotifyError carries the destination's
+			// status code with the URL already stripped.
 			if sendErr != nil {
-				log.Printf("alert router: failed to send to channel %s: %v", ch.ID, sendErr)
+				telemetry.ErrorCoalesced(ctx, "alert.notify.failed:"+ch.ID, "alert.notify.failed", sendErr, map[string]any{
+					"channel_id":   ch.ID,
+					"channel_type": ch.Type,
+					"rule_id":      ruleID,
+					"project":      project,
+					"alert_status": status,
+					"duration_ms":  time.Since(start).Milliseconds(),
+					"reason":       "delivery_failed",
+					"outcome":      "alert not delivered to this channel",
+				})
+				return
 			}
+			telemetry.Debug(ctx, "alert.notify.sent", map[string]any{
+				"channel_id":   ch.ID,
+				"channel_type": ch.Type,
+				"rule_id":      ruleID,
+				"alert_status": status,
+			})
 		}(ch)
 	}
 
@@ -188,11 +221,30 @@ func (r *Router) Route(ctx context.Context, alertCtx *AlertContext, rule *struct
 	// resolve as well as on fire — a resolution nobody is told about is the same
 	// missing signal.
 	if delivered == 0 {
-		log.Printf("alert router: WARN alert %s fired and matched no notification destination (rule %s, project %s, status %s) — check the rule's notification_channel_ids and the project's notification policies",
-			alertCtx.RuleName, rule.ID, rule.Project, alertCtx.Status)
+		telemetry.WarnCoalesced(ctx, "alert.route.unmatched:"+rule.ID, "alert.route.unmatched", nil, map[string]any{
+			"rule_id":      rule.ID,
+			"project":      rule.Project,
+			"alert_status": alertCtx.Status,
+			"reason":       "no_destination",
+			"outcome":      "no channel was notified — check the rule's notification_channel_ids and the project's notification policies",
+		})
 	}
 
 	return delivered, nil
+}
+
+// reportInvalidPolicy reports a policy whose stored JSON cannot be read.
+// matchedChannelIDs also serves the has_destinations badge on every
+// GET /v1/alert-rules, so this is coalesced per policy rather than emitted per
+// read.
+func reportInvalidPolicy(policy structs.NotificationPolicy, column string, err error) {
+	telemetry.WarnCoalesced(context.Background(), "alert.policy.invalid:"+policy.ID, "alert.policy.invalid", err, map[string]any{
+		"policy_id": policy.ID,
+		"project":   policy.Project,
+		"column":    column,
+		"reason":    "unparseable_json",
+		"outcome":   "policy skipped when routing",
+	})
 }
 
 // matchedChannelIDs walks the project's policies in routing order and returns
@@ -229,7 +281,7 @@ func matchedChannelIDs(alertCtx *AlertContext, rule *structs.AlertRule, policies
 
 		var matchers PolicyMatchers
 		if err := json.Unmarshal([]byte(policy.Matchers), &matchers); err != nil {
-			log.Printf("alert router: failed to parse matchers for policy %s: %v", policy.ID, err)
+			reportInvalidPolicy(policy, "matchers", err)
 			continue
 		}
 
@@ -241,7 +293,7 @@ func matchedChannelIDs(alertCtx *AlertContext, rule *structs.AlertRule, policies
 
 		var channelIDs []string
 		if err := json.Unmarshal([]byte(policy.ChannelIDs), &channelIDs); err != nil {
-			log.Printf("alert router: failed to parse channel IDs for policy %s: %v", policy.ID, err)
+			reportInvalidPolicy(policy, "channel_ids", err)
 			continue
 		}
 		add(channelIDs)

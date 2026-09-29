@@ -1,14 +1,15 @@
 package bootstrap
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/query"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/google/uuid"
 )
 
@@ -64,6 +65,6 @@ func EnsureInstallID(engine db.Queryable) (string, error) {
 	// is new information — and because "this database has never been booted
 	// before" is worth seeing in a log when you believed you were restarting an
 	// existing install.
-	log.Printf("bootstrap: minted install id %s for this database", id)
+	telemetry.Info(context.Background(), "install_id.minted", map[string]any{"install_id": id})
 	return id, nil
 }

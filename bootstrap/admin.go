@@ -3,14 +3,15 @@
 package bootstrap
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
-	"log"
 	"strings"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/query"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/aidenappl/monitor-core/tools"
 )
 
@@ -29,7 +30,10 @@ func EnsureAdminUser(engine db.Queryable) error {
 	}
 
 	if env.AdminEmail == "" || env.AdminPassword == "" {
-		log.Println("bootstrap: no users exist and MON_ADMIN_EMAIL/MON_ADMIN_PASSWORD not set — no admin created")
+		telemetry.Warn(context.Background(), "admin.bootstrap.skipped", map[string]any{
+			"reason":  "admin_env_unset",
+			"outcome": "no users exist and none was seeded — nobody can sign in with a password until MON_ADMIN_EMAIL/MON_ADMIN_PASSWORD are set",
+		})
 		return nil
 	}
 
@@ -62,7 +66,7 @@ func EnsureAdminUser(engine db.Queryable) error {
 		if _, err := query.CreateIdentity(engine, adminIdentityReq(user.ID, email, hash)); err != nil {
 			return fmt.Errorf("failed to create admin identity: %w", err)
 		}
-		log.Printf("bootstrap: created admin user %s (role=admin)", email)
+		reportAdminCreated(user.ID)
 		return nil
 	}
 
@@ -83,8 +87,14 @@ func EnsureAdminUser(engine db.Queryable) error {
 		return fmt.Errorf("failed to commit admin bootstrap: %w", err)
 	}
 
-	log.Printf("bootstrap: created admin user %s (role=admin)", email)
+	reportAdminCreated(user.ID)
 	return nil
+}
+
+// reportAdminCreated records the seed by user id. The address it was seeded
+// with is in MON_ADMIN_EMAIL for anyone who needs it, and nowhere else.
+func reportAdminCreated(userID int64) {
+	telemetry.Info(context.Background(), "admin.bootstrap.created", map[string]any{"user_id": userID, "role": "admin"})
 }
 
 func adminIdentityReq(userID int64, email string, hash []byte) query.CreateIdentityRequest {

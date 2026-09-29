@@ -109,12 +109,14 @@ func CSRFMiddleware(next http.Handler) http.Handler {
 
 		cookie, err := r.Cookie(csrfCookieName)
 		if err != nil || cookie.Value == "" {
-			writeCSRFError(w, `{"success":false,"message":"missing csrf cookie","error_code":4030}`)
+			writeCSRFError(w, "missing csrf cookie", 4030, "csrf_cookie_missing",
+				`{"success":false,"message":"missing csrf cookie","error_code":4030}`)
 			return
 		}
 		headerToken := r.Header.Get(csrfHeaderName)
 		if headerToken == "" || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(headerToken)) != 1 {
-			writeCSRFError(w, `{"success":false,"message":"csrf token mismatch","error_code":4031}`)
+			writeCSRFError(w, "csrf token mismatch", 4031, "csrf_token_mismatch",
+				`{"success":false,"message":"csrf token mismatch","error_code":4031}`)
 			return
 		}
 
@@ -122,10 +124,17 @@ func CSRFMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func writeCSRFError(w http.ResponseWriter, body string) {
+// writeCSRFError refuses the request. The reason goes to the request's own
+// event (a warning, as an auth-security denial), since this body bypasses the
+// responder that would otherwise record it.
+func writeCSRFError(w http.ResponseWriter, message string, code int, reason, body string) {
+	if rw := findStatusWriter(w); rw != nil {
+		rw.RecordFailure(http.StatusForbidden, message, nil, code, map[string]any{"reason": reason})
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusForbidden)
-	w.Write([]byte(body))
+	// The status is already sent; a failed write means the client went away.
+	_, _ = w.Write([]byte(body))
 }
 
 func setCSRFCookie(w http.ResponseWriter) {

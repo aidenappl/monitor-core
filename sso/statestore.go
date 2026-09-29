@@ -9,6 +9,7 @@ import (
 	ssolib "github.com/aidenappl/go-forta/sso"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/query"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 // statePrefix namespaces in-flight login records in the settings KV table.
@@ -39,7 +40,9 @@ func (s *StateStore) SaveState(_ context.Context, state string, data []byte, _ t
 	if err := query.SetSetting(s.Engine, statePrefix+state, string(data)); err != nil {
 		return fmt.Errorf("sso: persist state: %w", err)
 	}
-	go s.sweepExpired()
+	// A background context: the sweep outlives the login request that
+	// triggered it.
+	telemetry.Go(context.Background(), "sso-state-sweep", func(context.Context) { s.sweepExpired() })
 	return nil
 }
 
@@ -85,19 +88,40 @@ func (s *StateStore) ConsumeState(_ context.Context, state string) ([]byte, erro
 //
 // A record whose payload will not parse is deleted too: it can never be consumed
 // successfully, so leaving it is strictly worse than removing it.
+//
+// Best-effort still, but no longer silent: a sweep that cannot read or delete is
+// reported (coalesced — it runs on every login), because dead rows accumulating
+// in settings is the failure it exists to prevent.
 func (s *StateStore) sweepExpired() {
+	ctx := context.Background()
 	states, err := query.GetSettingsByPrefix(s.Engine, statePrefix)
 	if err != nil {
+		telemetry.WarnCoalesced(ctx, "sso.state.sweep.failed", "sso.state.sweep.failed", err, map[string]any{
+			"stage":      "list",
+			"dependency": "mariadb",
+			"outcome":    "expired login states were not pruned this time",
+		})
 		return
 	}
+	failed := 0
+	var lastErr error
 	for k, v := range states {
 		var sd ssolib.StateData
-		if err := json.Unmarshal([]byte(v), &sd); err != nil {
-			_ = query.DeleteSetting(s.Engine, k)
+		expired := json.Unmarshal([]byte(v), &sd) != nil || time.Now().After(sd.ExpiresAt)
+		if !expired {
 			continue
 		}
-		if time.Now().After(sd.ExpiresAt) {
-			_ = query.DeleteSetting(s.Engine, k)
+		if err := query.DeleteSetting(s.Engine, k); err != nil {
+			failed++
+			lastErr = err
 		}
+	}
+	if failed > 0 {
+		telemetry.WarnCoalesced(ctx, "sso.state.sweep.failed", "sso.state.sweep.failed", lastErr, map[string]any{
+			"stage":      "delete",
+			"failed":     failed,
+			"dependency": "mariadb",
+			"outcome":    "some expired login states were left in settings",
+		})
 	}
 }

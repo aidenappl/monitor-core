@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -19,6 +18,7 @@ import (
 	"github.com/aidenappl/monitor-core/responder"
 	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/gorilla/mux"
 )
 
@@ -189,7 +189,11 @@ func HandleListIssues(w http.ResponseWriter, r *http.Request) {
 		if byIssue, err := issues.GetOccurrenceHistoryBulk(r.Context(), ids, from, to); err != nil {
 			// Best-effort: the strip is a scanning aid, and losing it must not
 			// cost the listing it decorates.
-			log.Printf("issues: failed to load bulk history: %v", err)
+			telemetry.WarnErr(r.Context(), "issue.history.load.failed", err, map[string]any{
+				"scope":   "list",
+				"issues":  len(ids),
+				"outcome": "listed without the activity strip",
+			})
 		} else {
 			for i := range list {
 				list[i].History = byIssue[list[i].ID]
@@ -308,7 +312,11 @@ func HandleGetIssue(w http.ResponseWriter, r *http.Request) {
 	if history, err := issues.GetOccurrenceHistory(r.Context(), id, from, to); err == nil {
 		issue.History = history
 	} else {
-		log.Printf("issues: failed to load history for %s: %v", id, err)
+		telemetry.WarnErr(r.Context(), "issue.history.load.failed", err, map[string]any{
+			"scope":    "detail",
+			"issue_id": id,
+			"outcome":  "returned without the sparkline",
+		})
 	}
 
 	responder.New(w, issue)
@@ -432,7 +440,15 @@ func HandleUpdateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	appendUpdateTimeline(id, actor, before, updated)
+	appendUpdateTimeline(r.Context(), id, actor, before, updated)
+	if before.Status != updated.Status {
+		telemetry.Info(r.Context(), "issue.status.updated", map[string]any{
+			"issue_id": id,
+			"project":  project,
+			"from":     string(before.Status),
+			"to":       string(updated.Status),
+		})
+	}
 	responder.New(w, updated, "issue updated")
 }
 
@@ -443,7 +459,7 @@ func HandleUpdateIssue(w http.ResponseWriter, r *http.Request) {
 // reflects changes rather than attempts. Failures are logged, never propagated:
 // the update is already durable, and losing an entry must not report the whole
 // operation as failed.
-func appendUpdateTimeline(issueID string, actor *structs.Actor, before, after *structs.Issue) {
+func appendUpdateTimeline(ctx context.Context, issueID string, actor *structs.Actor, before, after *structs.Issue) {
 	type entry struct {
 		typ      structs.TimelineEntryType
 		body     string
@@ -496,7 +512,11 @@ func appendUpdateTimeline(issueID string, actor *structs.Actor, before, after *s
 			Body:     &e.body,
 			Metadata: e.metadata,
 		}); err != nil {
-			log.Printf("issues: failed to record %s on %s: %v", e.typ, issueID, err)
+			telemetry.WarnErr(ctx, "issue.timeline.append.failed", &db.SQLError{Op: "issues.timeline.append", Err: err}, map[string]any{
+				"issue_id":   issueID,
+				"entry_type": string(e.typ),
+				"outcome":    "the change was saved, but has no timeline entry",
+			})
 		}
 	}
 }
@@ -635,7 +655,8 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if dataStr != "" && dataStr != "{}" {
-			json.Unmarshal([]byte(dataStr), &e.Data)
+			// A stored row whose data is not a JSON object is shown without it.
+			_ = json.Unmarshal([]byte(dataStr), &e.Data)
 		}
 		scanned++
 		if issues.FingerprintForEvent(&e) != issue.Fingerprint {
@@ -649,7 +670,12 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 	// page read as "that's all there is". Only the legacy scan can hit this — the
 	// indexed path above has no such window.
 	if len(events) < limit && scanned >= candidateScanLimit(limit) {
-		log.Printf("issues: legacy event scan window exhausted for issue %s (%d matched of %d scanned); older occurrences may exist", id, len(events), scanned)
+		telemetry.Warn(r.Context(), "issue.events.scan.exhausted", map[string]any{
+			"issue_id": id,
+			"matched":  len(events),
+			"scanned":  scanned,
+			"outcome":  "the page may be missing older occurrences",
+		})
 	}
 
 	// Both paths order newest-first independently, so a merged page has to be
@@ -774,7 +800,8 @@ func queryEventsByIssueID(ctx context.Context, issueID string, limit int) ([]*st
 			return nil, err
 		}
 		if dataStr != "" && dataStr != "{}" {
-			json.Unmarshal([]byte(dataStr), &e.Data)
+			// A stored row whose data is not a JSON object is shown without it.
+			_ = json.Unmarshal([]byte(dataStr), &e.Data)
 		}
 		e.IssueID = issueID
 		events = append(events, &e)

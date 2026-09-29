@@ -30,6 +30,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+
+	"github.com/aidenappl/monitor-core/env"
 )
 
 // Severity orders the outcomes worst-first.
@@ -88,7 +90,55 @@ func Env() []Check {
 	var checks []Check
 
 	checks = append(checks, unresolvedInterpolation()...)
+	checks = append(checks, telemetryConfig()...)
 
+	return checks
+}
+
+// telemetryConfig catches a self-telemetry configuration that can only half
+// work. None of it is fatal — telemetry is never a boot dependency — but each
+// case means monitor-core's own failures go unrecorded while everything looks
+// configured, which for the service that records everyone else's failures is
+// the worst place to be blind.
+func telemetryConfig() []Check {
+	url := env.TelemetryIngestURL
+	if url == "" {
+		return []Check{{
+			Name:     "telemetry.disabled",
+			Severity: Info,
+			Detail: "MON_TELEMETRY_INGEST_URL is unset, so monitor-core's own warnings and errors are printed " +
+				"to stdout but not shipped to Monitor.",
+			Remedy: "Set MON_TELEMETRY_INGEST_URL=${MONITOR_APPLEBY_INGEST_URL} and " +
+				"MON_TELEMETRY_API_KEY=${MONITOR_APPLEBY_INGEST_KEY} on this container.",
+		}}
+	}
+
+	var checks []Check
+	if env.TelemetryAPIKey == "" {
+		checks = append(checks, Check{
+			Name:     "telemetry.api_key",
+			Severity: Warn,
+			Detail:   "MON_TELEMETRY_INGEST_URL is set but MON_TELEMETRY_API_KEY is not, so the ingest endpoint refuses every batch.",
+			Remedy:   "Set MON_TELEMETRY_API_KEY to an ingest-scope key minted on the zone the URL points at.",
+		})
+	}
+	if !strings.HasSuffix(strings.TrimRight(url, "/"), "/v1/events") {
+		checks = append(checks, Check{
+			Name:     "telemetry.ingest_url",
+			Severity: Warn,
+			Detail: "MON_TELEMETRY_INGEST_URL does not end in /v1/events. The SDK appends no path, so events are " +
+				"POSTed to exactly this URL — and the web origin (monitor.appleby.cloud) ingests nothing.",
+			Remedy: "Use the zone's full ingest endpoint, e.g. https://appleby-monitor-api.appleby.cloud/v1/events.",
+		})
+	}
+	if env.TelemetryZone == "" {
+		checks = append(checks, Check{
+			Name:     "telemetry.zone",
+			Severity: Info,
+			Detail:   "MON_TELEMETRY_ZONE is unset, so the destination zone is not asserted at boot.",
+			Remedy:   "Set MON_TELEMETRY_ZONE=appleby to have a misdirected telemetry URL reported loudly at startup.",
+		})
+	}
 	return checks
 }
 
@@ -174,6 +224,11 @@ func Snapshot() map[string]string {
 	return snapshot
 }
 
+// Sink, when set, receives every finding instead of the log. main sets it while
+// serving, so each finding becomes a Monitor event (which telemetry also prints);
+// `check-env` leaves it nil and prints for the terminal it was run in.
+var Sink func(Check)
+
 // Report logs findings worst-first and reports whether any was Fatal.
 //
 // It does not exit. The caller decides, because the two callers differ: the boot
@@ -186,6 +241,10 @@ func Report(checks []Check) (fatal bool) {
 	for _, check := range checks {
 		if check.Severity == Fatal {
 			fatal = true
+		}
+		if Sink != nil {
+			Sink(check)
+			continue
 		}
 		log.Printf("preflight %s [%s] %s", check.Severity, check.Name, check.Detail)
 		if check.Remedy != "" {

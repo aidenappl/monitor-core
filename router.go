@@ -39,7 +39,10 @@ import (
 func buildRouter(role env.Role) *mux.Router {
 	r := mux.NewRouter()
 	r.Use(middleware.RequestIDMiddleware)
+	// Logging OUTSIDE Recover: a panicking handler becomes a 500 that the
+	// request's own event still records.
 	r.Use(middleware.LoggingMiddleware)
+	r.Use(middleware.RecoverMiddleware)
 	r.Use(middleware.MuxHeaderMiddleware)
 	// Double-submit CSRF for cookie-authenticated browsers. Safe methods, Bearer
 	// clients, and X-Api-Key clients (ingestion) are exempt, so this does not

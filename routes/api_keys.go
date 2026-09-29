@@ -7,6 +7,7 @@ import (
 
 	"github.com/aidenappl/monitor-core/apikeys"
 	"github.com/aidenappl/monitor-core/responder"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/gorilla/mux"
 )
 
@@ -63,6 +64,13 @@ func HandleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The key's id, scope and project — never the key, which this response is
+	// the one and only place to see.
+	telemetry.Info(r.Context(), "api_key.created", map[string]any{
+		"key_id":  result.ID,
+		"scope":   string(result.Scope),
+		"project": result.ProjectSlug,
+	})
 	responder.New(w, result)
 }
 
@@ -75,9 +83,10 @@ func HandleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := apikeys.Delete(r.Context(), id); err != nil {
-		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to delete api key", err)
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to delete api key", err, map[string]any{"key_id": id})
 		return
 	}
 
+	telemetry.Info(r.Context(), "api_key.deleted", map[string]any{"key_id": id})
 	responder.New(w, nil, "api key deleted")
 }

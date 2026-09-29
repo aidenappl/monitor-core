@@ -93,6 +93,7 @@ monitor-core/
   env/role.go              # MON_ROLE: the Role type (app/zone/both), ParseRole, RunsControlPlane/RunsDataPlane, RequireValidRole
   db/
     clickhouse.go          # ClickHouse connection (db.Connect/db.Close) + batch Writer + ValidateDatabaseName + the per-query max_memory_usage ceiling
+    observe.go             # The ClickHouse chokepoint: observedConn (every read/exec gets a query kind + slow-query warning) and QueryError/SQLError (quoted values elided from what reaches Monitor)
     sql.go                 # MariaDB connection (db.SQL), db.Queryable, db.RunMigrations (embeds db/migrations/*.sql)
     migrations/            # MariaDB DDL: identity + tenancy + issues + alert/dashboard config (100_users … 133_service_repos_project)
   jwt/jwt.go               # Monitor-owned HS512 access/refresh JWTs (mint + validate, alg-pinned)
@@ -107,8 +108,9 @@ monitor-core/
     csrf.go                # Double-submit CSRF (mon-csrf ↔ X-CSRF-Token); Bearer/X-Api-Key/safe-method exempt
     ingest_auth.go         # X-Api-Key auth for POST /v1/events (env master key OR ingest-scope DB key); injects the credential's project
     query_auth.go          # X-Api-Key (admin) OR a Monitor session for /v1/* reads; injects the project EVERY read is scoped to — credential-derived for keys, a validated ?project SELECTOR for sessions (§6)
-    logging.go header.go   # RequestID + logging (SSE-safe); Server header
-  responder/responder.go   # Standard JSON envelope helpers
+    logging.go header.go   # RequestID; the ONE http.request.end event per request, the failure recorder the responder feeds, RecoverMiddleware (SSE-safe); Server header
+  responder/responder.go   # Standard JSON envelope helpers; writeError hands the cause to the request event (never the client, for a 5xx)
+  telemetry/               # Self-telemetry — the ONLY importer of go-monitor: Init/Shutdown/Fatal, level helpers, coalescing, the stdout policy. See §6 *Monitor self-telemetry*
   routes/                  # HTTP handlers (thin) — see routes/AGENTS.md
     HandleLogin/Register/Refresh/Logout/GetSelf/Identities.router.go   # native auth + self + identities
     HandleSSOConfig/Login/Callback.router.go, HandleAdminSSOProviders.router.go, RegisterSSORoutes.go
@@ -322,6 +324,19 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
     `project` is in the INSERT but **not** in the `ON DUPLICATE KEY UPDATE` set list: a
     project is part of an issue's identity, so a fold that could rewrite it would be a fold
     across tenants.
+  - **The self-telemetry loop guards** (§6 *Monitor self-telemetry*) — each is invisible
+    when it breaks, because the symptom is appleby-core quietly reporting itself in a loop:
+    `selftelemetry_test.go` (package main, through the real `buildRouter`) — a successful
+    `POST /v1/events` emits **nothing**, ingest rejections coalesce, and
+    `TestTenantEventDataNeverReachesSelfTelemetry` drives every failing ingest path with a
+    marker in every tenant-owned field and fails if it reaches any event;
+    `services/batcher_telemetry_test.go` — a 50-drop storm is one `batch.write.dropped`,
+    then one trailing count, then one `batch.write.recovered` with the totals, and a healthy
+    flush emits nothing; `middleware/logging_test.go` — a 5xx through the responder is
+    **exactly one** enriched event, a successful authenticated read is exactly one info
+    event, the level table, a panic files one issue; `routes/telemetry_test.go` — a zone
+    probe emits on a state change only; `telemetry/telemetry_test.go` — the coalescing
+    window, the stdout policy and its redaction, safe error text, goroutine panics, Fatal.
 
 ---
 
@@ -369,7 +384,8 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
     — pending account → web redirects to `/pending`), and CSRF **`4030`** (missing cookie) /
     **`4031`** (token mismatch).
   - Three endpoints bypass `responder`: `GET /health`
-    (`{status,enqueued,dropped,pending,clickhouse_ok,mariadb_ok,last_flush_at,role,zone}`),
+    (`{status,enqueued,dropped,pending,clickhouse_ok,mariadb_ok,last_flush_at,role,zone,alerting_ok,telemetry}`
+    — `telemetry` is the self-telemetry shipper's own counters, §6),
     `GET /ready` (`{status,clickhouse_ok,mariadb_ok,role[,failing]}`) and `POST /v1/events`
     (`{accepted:<int>}`). Ingest errors are plain text.
   - **`/health` is liveness, `/ready` is readiness — do not merge them.** `/health` always
@@ -403,6 +419,16 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
   from the local map, so without the refresher a key revoked on another replica — or straight
   in the database — stayed valid until the container restarted. The refresher starts even when
   the initial load fails, since `main.go` treats `Init`'s error as a warning and serves on.
+- **Failures are reported ONCE, at the layer that decides the outcome** (§6 *Monitor
+  self-telemetry*). A handler that fails with a 5xx calls
+  `responder.ErrorWithCause(w, status, msg, err, fields)` and does nothing else: the request's
+  own event carries the cause, its type, the stack inside the handler and `fields` (the ids
+  and dependency detail — a rule id, a channel type). Reporting it again from the handler
+  files a second issue for one failure. A handler that writes its own error body
+  (`http.Error`, an SSE refusal) calls `middleware.RecordFailure` first. Events are emitted
+  only through `telemetry.*` — never `log.Printf` for a warning or error, never go-monitor
+  directly. `log.Printf` is left only for CLI output (`check-env`, `version`, the
+  backfills) and the role line at the top of boot.
 
 ---
 
@@ -1653,10 +1679,16 @@ API-key refresher starts in every role, because both planes authenticate API key
 - **API-key cache refresher** — `CACHE_REFRESH_INTERVAL` (30s) ticker started by
   `apikeys.Init`; re-reads `api_keys` from MariaDB so revocation propagates (§5).
 
-All three are wrapped in `recover()` and cancelled via the shutdown context. Note the
-`recover()` sits **outside** the loop in each of them, so a panic ends that goroutine for
-the life of the process rather than restarting it — a shared weakness, not one of them
-deviating.
+- **Ingest summary** (data plane) — `routes.RunIngestSummary`, every 15 minutes: the only
+  trace of healthy ingest in Monitor (§6 *Monitor self-telemetry*).
+
+Every goroutine in the process — these, the HTTP server, the registry refresher, the four
+issue-tracker workers (recovered per job as well), the per-channel notification sends, the
+SSO state sweep, the dependency-ping probe and telemetry's own coalescing sweeper — runs
+through `telemetry.Go` or defers `telemetry.Recover`, so a panic is reported as
+`panic.recovered` with the goroutine's name and what stopping it costs. Note the recover
+still sits **outside** each loop, so a panic ends that goroutine for the life of the
+process rather than restarting it — now reported, but still a shared weakness.
 
 ### External systems
 
@@ -1682,6 +1714,220 @@ deviating.
 - **Keyring** — optional secret injection at boot (`main.go`); skipped if `KEYRING_*` is
   absent, falling back to plain env vars. Sources `MON_DB_DSN`, `MON_JWT_SIGNING_KEY`,
   `MON_CRYPTO_KEY`, `MON_ADMIN_*`, and each provider's `client_secret_ref` in production.
+
+### Monitor self-telemetry
+
+monitor-core reports its own errors, warnings and activity to Monitor. `telemetry/` is the
+**only** package that imports go-monitor; everything else calls its helpers
+(`Info`/`Warn`/`WarnErr`/`Error`/`Fatal`, `WarnCoalesced`/`ErrorCoalesced`, `Go`/`Recover`).
+
+**Destination.** Every monitor-core process reports into the **appleby** zone as service
+`monitor-core`, like every other appleby.cloud service: the control plane (stack 30,
+`MON_ROLE=both`, serving the trailblaze zone) and `appleby-core` (stack 32,
+`MON_ROLE=zone`). Every event carries `mon_role` and `mon_zone` to tell them apart. The
+control plane's failures therefore land in a different zone from the one it serves, which is
+what keeps them visible; appleby-core reports **into itself**, which is what the loop guards
+below exist for.
+
+**Configuration** — read by `env.LoadTelemetry` from the **plain** environment, before Keyring
+injects anything, because a Keyring failure is one of the things it has to report:
+
+| Var | Default | Notes |
+|---|---|---|
+| `MON_TELEMETRY_INGEST_URL` | `` | The appleby zone's full ingest endpoint. Unset = nothing shipped (one stdout line says so) and the service runs normally |
+| `MON_TELEMETRY_API_KEY` | `` | An ingest-scope key minted **on the appleby zone** |
+| `MON_TELEMETRY_ENV` | `production` | |
+| `MON_TELEMETRY_ZONE` | `` | Set `appleby`: asserted once at boot against the destination's `/health`, never sent |
+| `MON_TELEMETRY_SPOOL_DIR` | `` | Durable spool (host path or named volume). Without it the SDK holds events in memory and retries ~7s |
+| `MON_TELEMETRY_DEBUG` | `false` | Enables debug events |
+| `MON_TELEMETRY_STDOUT` | `false` | The SDK prints **every** event as NDJSON — local verification only |
+
+⚠️ **`MON_TELEMETRY_*`, never `MONITOR_*`.** `MONITOR_API_KEY` is this service's ingest
+MASTER key, and on stack 30 a stack-level variable holding the trailblaze zone's. On Lattice:
+`MON_TELEMETRY_INGEST_URL=${MONITOR_APPLEBY_INGEST_URL}`,
+`MON_TELEMETRY_API_KEY=${MONITOR_APPLEBY_INGEST_KEY}` (globals 6/7). `check-env` reports a
+missing key, a URL without `/v1/events`, and an unset zone (`preflight.telemetryConfig`).
+
+**Never a boot dependency — least of all Monitor's own.** `telemetry.Init` cannot fail or
+block. appleby-core's URL points at itself while it is still booting: events queue and ship
+once the listener is up. Without a spool that window is the SDK's ~7s memory retry, so a slow
+boot can lose its own boot events; `MON_TELEMETRY_SPOOL_DIR` on a volume closes it. The
+subcommands (`check-env`, `version`, `backfill-*`) never initialise telemetry — their output
+is for the terminal, and every event they trigger prints there.
+
+**Loop guards.**
+
+1. **A successful `POST /v1/events` emits no request event** (`middleware.LoggingMiddleware`).
+   Otherwise each batch appleby-core ships to itself produces an event that ships in the next
+   batch, forever. Healthy ingest shows up only as `ingest.summary.reported` every 15 minutes
+   (`routes.RunIngestSummary`), and not at all in a window where nothing moved. A 5xx on
+   ingest is still reported — nothing else would.
+2. **Every failure mode that can feed itself is coalesced**: at most one event per mode per
+   minute (`telemetry.COALESCE_WINDOW`), carrying `suppressed`. When a window closes with
+   occurrences unreported, the sweeper replays the event once — carrying the **most recent**
+   occurrence's fields, so a running total is current — with its count and
+   `trailing: true`; `Shutdown` flushes pending counts. Coalesced: batch retry / drop /
+   recovery, queue overflow, ingest body rejections (per reason) and credential rejections
+   (per reason), slow ClickHouse calls (per kind), issue-tracker drops and upserts, alert
+   evaluation / state / history / routing / delivery, cache refreshes, SSE writes and lag,
+   the SSO checkpoint, failed logins (per client IP — a password spray is one event a minute
+   whose `suppressed` is the attempt rate) and refresh failures, GitHub webhook rejections.
+3. **Stdout is the channel of last resort.** The SDK's own stdout is off (unless
+   `MON_TELEMETRY_STDOUT`); telemetry prints every **warn, error and fatal** as one line with
+   its own redaction, and **info only while booting and stopping**. Container logs carry every
+   failure and about zero lines per request — see the 2026-09-11 orchestrator disk-full
+   incident for why that matters.
+4. **Nothing on the ingest hot path blocks or grows.** `Emit` is non-blocking (a full SDK
+   buffer is a counted drop — `telemetry.dropped` on `/health`); `Queue.Enqueue` and
+   `Hub.Publish` only bump counters; overflow and rejection events are per request, coalesced.
+   The only synchronous flushes are `telemetry.Fatal` and the bounded (2s) `telemetry.Flush`
+   `main` makes on a stop signal, before `server.Shutdown`, because appleby-core ships to its
+   own listener.
+
+**⚠️ The blind spot: the appleby zone's OWN datastore.** When appleby-core's ClickHouse or
+MariaDB is down, its self-telemetry cannot land in the appleby zone — ingest still answers
+`200`, and those events are dropped with everything else. While it lasts, that failure is
+visible **only** on appleby-core's stdout (`lattice_get_container_logs` for container 691:
+`WARN batch.write.retrying` / `ERROR batch.write.dropped` lines), on its `/health`
+(`clickhouse_ok:false`, `dropped` rising) and `/ready` (503), and to the **control plane's
+zone probe** (Admin → Registry → Probe: the row turns unreachable/degraded, and a
+`zone.probe.unhealthy` line prints on the control plane's stdout — the event itself ships to
+the same broken zone). After recovery, `batch.write.recovered` lands with the outage's totals.
+
+**Reporting to itself: boot and stop.** appleby-core's ingest URL leads back to its own
+listener, which is not up yet at boot and is gone near the end of a stop.
+- **Every boot** prints `monitor: could not verify zone "appleby": … unreachable`. The SDK
+  checks the zone before that listener is up. The check is fail-open and shipping carries on,
+  so this line is expected, not a fault. The events buffered meanwhile ship once the listener
+  answers. A pod that dies before that loses them unless `MON_TELEMETRY_SPOOL_DIR` is set.
+- **On a stop signal,** `main` emits `service.stopping` and flushes while the listener is still
+  up (`telemetry.Flush`), so the stop and any pending coalesced counts land. Anything after
+  `server.Shutdown` (`http.shutdown.failed`, the batcher's final drops, `service.shutdown`)
+  reaches the zone only through the spool on the next boot, or not at all without one. The
+  SDK's `monitor: failed to ship events … connection refused` / `retrying flush` lines at the
+  very end of a stop are that, and they cost up to ~7s of the stop.
+
+**Level policy.**
+- **error / fatal — verbose.** `error`, `error_type`, `stack_trace`; what was being attempted
+  with its scoping ids (`zone`, `project`, rule / channel / issue / key id, `batch_size`,
+  `query_kind`); dependency detail (`dependency`, status code, `attempt`/`max_attempts`,
+  `duration_ms`, `timed_out`); the consequence as `reason` + `outcome`. Inside a request,
+  `r.Context()` — never `context.Background()`.
+- **warn — the same context, stack optional.** Anything that worked but should not be
+  ignored: degraded modes and fallbacks, retries that eventually succeeded, preflight
+  findings, a zone turning unhealthy, slow queries, ingest rejections, auth-security denials,
+  4xx caused by the caller. Routine protocol steps are not warnings: an expired access token
+  on its way to a refresh is a 401 marked `middleware.ExpectedClientError` and logged at info.
+- **info — lean.** One event per state change or business action, two to six identifying
+  fields, no bodies, lists or diffs. Reads get no domain event; the request event covers them.
+- **debug** — step traces behind `MON_TELEMETRY_DEBUG`, used sparingly.
+
+**The request event.** One `http.request.end` per request: `method`, `path` (the mux
+template — issues group by it), `request_path`, `status_code`, `duration_ms`,
+`response_bytes`, `client_ip`, `user_agent`, `user_id` once authenticated, and annotations
+(`auth`, `project`, `key_id`). 5xx is error, 4xx warn, else info. The cause arrives through
+the failure recorder (`responder.writeError` → `RecordFailure`): `error_message`, `error`,
+`error_type`, `error_code`, the handler's fields and — for a 5xx — the stack inside the
+handler. A panic is `panic.recovered` (error) plus a request event that stays a warning
+(`reported_as`), so one failure files one issue. Skipped: `/health`, `/ready`,
+`/healthcheck`, `/version`, and a successful `POST /v1/events`.
+
+**Dependency detail without data.** ClickHouse calls go through `db.observedConn`: a failure
+becomes `db.QueryError` (`query_kind` = the calling function, never the SQL; `duration_ms`,
+`timed_out`, `ch_code`/`ch_error`) with quoted literals elided — clickhouse-go binds parameters
+client-side, so a server error can quote a value. Calls over 5s emit `clickhouse.query.slow`.
+MariaDB failures reported outside a request wrap in `db.SQLError`, which elides quoted values
+the same way ("Duplicate entry '…'"). Notification failures are `alerts.NotifyError`: channel
+type, stage and the destination's status code, with the URL — the credential — stripped from
+transport errors.
+
+**Never sent to Monitor** (self-telemetry is appleby-zone data, and monitor-core holds every
+Trailblaze service's events): an ingested event's data, name, message or timestamp (counts,
+sizes, project slugs and service names only — ingest rejections carry a classification and a
+JSON error class, never the error text, which quotes the body); API key values (a `key_id`,
+or the 12-character prefix the admin UI shows); JWTs, cookies, passwords; SSO client secrets;
+webhook secrets; notification-channel URLs and tokens; SQL with values; email addresses
+(`RedactKeys` plus a free-text scrub of `error`/`message`/`detail`). Pinned by
+`TestTenantEventDataNeverReachesSelfTelemetry` and the batcher storm test.
+
+**Event catalogue.** `{resource}.{action}.{result}`: stable, lowercase, never an id
+(variable parts go in `data`). Lifecycle events collapse action and result into one
+past-tense verb (`issue.created`, `alert.fired`).
+
+| Name | Level | When | Key fields |
+|---|---|---|---|
+| `service.startup` | info | serving boot, after the role is settled | role, zone, version, commit, port, telemetry_spool |
+| `http.listen.started` / `service.stopping` / `service.shutdown` | info | listening / signal received / last event | port, role / signal / reason, uptime_s |
+| `config.zone.defaulted`, `config.public_url.unset` | warn | boot fallbacks | zone, reason, outcome |
+| `preflight.check.failed` / `.warned` / `.noted` | warn / warn / info | each preflight finding while serving | check, detail, remedy |
+| `config.preflight.failed`, `config.role.invalid`, `config.zone.unset`, `config.ingest_key.missing`, `config.secrets.insecure` | fatal | refused boot (reported, flushed, exit 1) | reason, message, error, failed_checks |
+| `clickhouse.connect.retrying`, `mariadb.connect.retrying`, `clickhouse.schema.probe.retrying` | warn | a boot connect/probe attempt failed | attempt, max_attempts, stage, outcome |
+| `clickhouse.connect.succeeded`, `mariadb.connect.succeeded` | info | connected | addr, database, attempts |
+| `clickhouse.migrations.applied`, `mariadb.migrations.applied` | info | migration runners finished | statements, files, database / applied |
+| `clickhouse.connect.failed`, `clickhouse.migrate.failed`, `clickhouse.schema.unreadable`, `mariadb.connect.failed`, `mariadb.schema.unusable`, `mariadb.migrate.failed`, `tenancy.bootstrap.failed`, `admin.bootstrap.failed`, `http.listen.failed` | fatal | a fail-fast boot step failed | reason, message, error, database / zone |
+| `keyring.inject.failed` | error | Keyring injection failed | error, outcome |
+| `apikeys.cache.load.failed` / `registry.cache.load.failed` | error / warn | cache load at boot failed | error, outcome |
+| `alerting.cutover.pending` | warn | config backfill not run — evaluation disabled | error, reason, outcome |
+| `cutover.marker.read.failed`, `cutover.probe.failed` | warn | the cutover guard fell back / failed open | table, stage, outcome |
+| `alerts.init.failed`, `issues.init.failed` | error | subsystem init failed | project, outcome |
+| `install_id.minted` / `install_id.ensure.failed`, `migrations.ledger.read.failed` | info / warn | install identity / ledger | install_id / error, outcome |
+| `admin.bootstrap.created` / `admin.bootstrap.skipped` | info / warn | first admin seeded / not seeded | user_id, role / outcome |
+| `tenancy.zone.created`/`.updated`/`.retired`, `tenancy.project.created`/`.updated`/`.retired` | info | registry change (bootstrap or admin) | zone, zone_id / project, project_id, via |
+| `tenancy.bootstrap.retired`, `tenancy.config.orphaned`, `tenancy.config.unverified` | warn | tenancy diagnostics at boot | zone, project, table, remedy |
+| `http.request.end` | by status | every request except the skips above | see *The request event* |
+| `panic.recovered` | error | any goroutine or handler panicked | goroutine, error, panic_type, stack_trace, outcome |
+| `ingest.request.rejected` | warn, coalesced per reason | an ingest body refused (400) | reason, line, detail, error_type, service, project, client_ip |
+| `ingest.auth.rejected` | warn, coalesced per reason | an ingest credential refused (401) | reason, key_id / key_prefix, scope, project, client_ip |
+| `ingest.queue.overflow` | error, coalesced | a request's events refused by a full queue | refused, batch_size, queue_pending, queue_capacity, dropped_total, project |
+| `ingest.summary.reported` | info | every 15 min when anything moved | window_s, enqueued, flushed, dropped, rejected, auth_rejected, queue_pending |
+| `batch.write.retrying` | warn, coalesced | a ClickHouse batch write failed, will retry | batch_size, attempt, max_attempts, duration_ms, timed_out, query_kind, ch_code |
+| `batch.write.dropped` | error, coalesced | a batch abandoned | batch_size, attempts, reason (retries_exhausted / shutdown_during_retry), dropped_total, queue_pending |
+| `batch.write.recovered` | warn, coalesced | first successful write after failures | outage_ms, failed_attempts, batches_dropped, events_dropped |
+| `clickhouse.query.slow` | warn, coalesced per kind | a ClickHouse call over 5s | query_kind, duration_ms, threshold_ms, failed |
+| `issue.created` / `issue.regressed` | info | a new fingerprint / a resolved issue recurred | issue_id, project, service, regression_count |
+| `issue.occurrence.recorded` | debug | recurrence bookkeeping | issue_id, occurrence_count |
+| `issue.upsert.failed` | error, coalesced | an occurrence could not be recorded | issue_id, fingerprint, project, service, db_op |
+| `issue.track.dropped` | warn, coalesced | the tracker queue was full | project, service, queue_capacity |
+| `issue.regression.record.failed`, `issue.timeline.append.failed` | warn | a timeline entry was not written | issue_id, entry_type |
+| `issue.status.updated`, `issue.link.created`/`.deleted` | info | issue changed / PR linked or unlinked | issue_id, project, from, to / kind, owner, repo, link_id |
+| `issue.history.load.failed`, `issue.events.scan.exhausted`, `issue.link.github.fetch.failed` | warn | a best-effort read degraded | issue_id, scope, matched, scanned / owner, repo |
+| `alert.fired` / `alert.resolved` | info | a rule changed state (and on re-notification) | rule_id, project, priority, rule_type |
+| `alert.rules.list.failed`, `alert.evaluate.failed` | error, coalesced (per rule) | evaluation could not run — a rule's window failed and its schedule is held | rule_id, project, rule_type, query_kind, window_from, window_to, retry_in_s |
+| `alert.state.read.failed` / `alert.state.write.failed`, `alert.history.write.failed` | warn (per project) / error, coalesced | alert state/history I/O | project, states, rule_id, status |
+| `alert.schedule.windows.skipped` | warn, coalesced per rule | a rule fell further behind than `maxCatchUpWindows`; the span is abandoned, so an alert that should have fired in it never will | rule_id, project, windows, skipped_from, skipped_to |
+| `alert.evaluator.trace` | debug | the evaluator's schedule narrative (skips, holds, catch-ups) — the `logf` seam; every failure it describes is also one of the events above | message |
+| `alert.route.failed` | error, coalesced per rule | policies could not be read — nothing notified | rule_id, project, alert_status |
+| `alert.route.unmatched`, `alert.route.groups.failed`, `alert.channel.missing`, `alert.policy.invalid` | warn, coalesced | routing degraded | rule_id, channel_id, policy_id, column |
+| `alert.channel.load.failed` | error, coalesced per channel | a channel could not be loaded | channel_id, rule_id, project |
+| `alert.notify.failed` | error, coalesced per channel | delivery failed — alert not delivered there | channel_id, channel_type, status_code, stage, timed_out, rule_id, duration_ms |
+| `alert.notify.sent` | debug | delivery succeeded | channel_id, channel_type, rule_id |
+| `alert_rule.created`/`.updated`/`.deleted`, `alert_rule.state.cleanup.failed` | info / warn | a rule changed | rule_id, project, rule_type |
+| `notification_channel.created`/`.deleted` | info | a channel changed (id and type only) | channel_id, channel_type, project |
+| `api_key.created`/`.deleted` | info | a key minted / revoked | key_id, scope, project |
+| `auth.login.succeeded` | info | a session was issued | user_id, method, provider |
+| `auth.login.failed` | warn, coalesced per client IP | a login refused (neutral 401) | reason, method, user_id, client_ip |
+| `auth.refresh.failed` | warn, coalesced per IP+reason | forged / unknown / reused / disabled refresh. `reason` is `invalid_token`, `unknown_token`, `user_inactive`, or `reuse_detected_reuse` / `reuse_detected_revoked` (the classification, per `refreshOutcome`) | reason, user_id, client_ip |
+| `auth.refresh.grace.sibling` | info | a token re-presented within `refreshGraceWindow` — a concurrent tab or a retried lost response, answered with a sibling instead of a logout. A climbing rate means clients are racing more than expected | user_id, grace_window_s |
+| `auth.refresh.revoke.failed` | error | reuse detected and the family could NOT be revoked | user_id, reason |
+| `auth.logout.succeeded` / `auth.logout.revoke.failed` | info / warn | logout; `revoked` says whether the server-side revocation landed | user_id, revoke_scope, revoked |
+| `auth.logout.family.lookup.failed` | warn | the presented refresh cookie could not be resolved, so logout fell back to the `fid` claim or to every session | user_id |
+| `auth.register.succeeded`, `auth.sso.user.provisioned` | info | a pending account was created | user_id, provider, role |
+| `auth.identity.linked` / `.unlinked` / `.link.failed` / `.link.started` | info / info / warn / debug | identity link lifecycle | user_id, provider, via |
+| `auth.identity.touch.failed`, `auth.identity.unlink.session.failed`, `auth.sso.session.cache.failed` | warn | best-effort identity bookkeeping failed | user_id, provider, outcome |
+| `auth.sso.callback.failed` | warn, coalesced per reason | callback refused (denied, stale state, disabled account) | provider, reason, client_ip |
+| `auth.sso.callback.broken` | error, coalesced | this side or the IdP failed (adapter, exchange, session) | provider, reason, dependency |
+| `sso.provider.created`/`.updated`/`.deleted`, `sso.provider.icon.failed` | info / warn | provider config changed | provider, kind, enabled, stage |
+| `sso.checkpoint.denied`/`.failed`/`.unavailable`, `sso.session.revoked`, `sso.backchannel.*`, `sso.state.sweep.failed` | warn / info | go-forta/sso checkpoint and back-channel lines, mapped by code | user_id, message |
+| `github.webhook.rejected` | warn, coalesced | a delivery failed signature verification | reason, github_event, client_ip |
+| `github.webhook.processed` / `.state.updated` | info / debug | PR state applied to linked issues | owner, repo, number, entry_type, issues_updated |
+| `github.webhook.timeline.append.failed` | error, coalesced | an issue's timeline missed a PR change | issue_id, owner, repo, number |
+| `github.webhook.payload.invalid`, `.services.resolve.failed`, `.issue.resolve.failed` | warn | a delivery degraded | owner, repo, issue_id |
+| `stream.subscriber.connected`/`.disconnected` | debug | SSE connect / disconnect | stream, subscriber_id, project, events_sent, duration_ms |
+| `stream.write.failed`, `stream.subscriber.lagging`, `stream.event.encode.failed` | warn, coalesced | a live stream could not keep up or be written | stream, events_sent, dropped, buffer |
+| `zone.probe.unhealthy` / `zone.probe.recovered` | warn / info | an admin probe verdict CHANGED (not per probe) | zone, reachability, previous, detail, reported_zone |
+
+**Goroutines** are covered under *Background goroutines* above. **Tests** that pin all of this
+are listed in §4.
 
 ---
 
@@ -1940,6 +2186,10 @@ deviating.
   | `MON_GITHUB_TOKEN_<OWNER>` | `` | per-org token, name derived from the GitHub owner (`TeamTrailblaze` → `MON_GITHUB_TOKEN_TEAMTRAILBLAZE`). Takes precedence over the default; adding an org needs no code change |
   | `MON_GITHUB_WEBHOOK_SECRET_TRAILBLAZE` | `` | shared secret GitHub signs deliveries with. **Optional, but unset REJECTS every delivery** — it never fails open. Generate with `openssl rand -hex 32` and paste the same value into the repo's webhook config |
   | `BATCH_SIZE` / `FLUSH_INTERVAL` / `QUEUE_SIZE` / `MAX_SSE_SUBSCRIBERS` | `1000` / `5s` / `100000` / `100` | ingestion/SSE tuning. `FLUSH_INTERVAL` + 3 s is also the alert evaluator's settle delay: a window is evaluated only once its end is that old, so raising it delays alerts by the same amount |
+  | `MON_TELEMETRY_INGEST_URL` / `MON_TELEMETRY_API_KEY` | `` / `` | Self-telemetry destination (the appleby zone) and its ingest key. **Plain env, never Keyring**, read before Keyring injects. Unset URL = not shipped, service runs normally. Lattice: `${MONITOR_APPLEBY_INGEST_URL}` / `${MONITOR_APPLEBY_INGEST_KEY}`. See §6 *Monitor self-telemetry* |
+  | `MON_TELEMETRY_ENV` / `MON_TELEMETRY_ZONE` | `production` / `` | Event env; the expected destination zone (`appleby`), asserted at boot and never sent |
+  | `MON_TELEMETRY_SPOOL_DIR` | `` | Durable telemetry spool on a volume; without it boot events on appleby-core (which reports into itself) can be lost to the SDK's ~7s memory retry |
+  | `MON_TELEMETRY_DEBUG` / `MON_TELEMETRY_STDOUT` | `false` / `false` | Debug events; the SDK printing every event as NDJSON (local verification only — info would otherwise stay off stdout) |
 
 - **Manual reconciliation scripts (`migrations/manual/`) — the operator runbook.**
 
@@ -1983,8 +2233,13 @@ deviating.
   reconstructed from `events` once the 30-day window has passed. Prove the subquery returns a
   non-zero count first, and take the backup the header describes.
 
-- **Monitoring:** Monitor monitors itself — `mcp__monitor__monitor_service_overview` on
-  `monitor-core`; `lattice_get_container_logs` for the container.
+- **Monitoring:** both monitor-core processes report to the **appleby** zone as service
+  `monitor-core` (tell them apart by `mon_role`/`mon_zone`) — §6 *Monitor self-telemetry*.
+  monitor-mcp is bound to the trailblaze zone's `default` project and **cannot see** these
+  events; read them in the Monitor UI under the appleby zone. `lattice_get_container_logs`
+  (containers 652 and 691) shows every warning and error as one line each, plus the boot and
+  shutdown sequence. `GET /health`'s `telemetry` block says whether self-telemetry is shipping
+  (`flushed` rising) or stuck (`pending`/`dropped` rising).
 - **Common failure modes:**
   - *Refuses to start: "MON_ROLE=… is not a recognised role"* → a typo in `MON_ROLE`. Unset
     it (that means `both`) or set exactly `app`, `zone` or `both`. It refuses on purpose;
@@ -2029,6 +2284,23 @@ deviating.
     or shutdown mid-retry), so a rising `dropped` with a stale/absent `last_flush_at` means
     the writer is failing, not that ingestion is outrunning the queue — check `/ready`,
     which names the store that is down.
+  - *appleby-core's ClickHouse is down and the appleby zone shows nothing about it* → by
+    design, not a gap in the fix: that zone's self-telemetry is dropped with everything else.
+    Read container 691's logs (`batch.write.retrying`/`batch.write.dropped` lines, coalesced
+    to one a minute), its `/ready`, and the control plane's zone probe. §6 *Monitor
+    self-telemetry* — the blind spot.
+  - *No monitor-core events in the appleby zone at all* → `MON_TELEMETRY_INGEST_URL` or
+    `MON_TELEMETRY_API_KEY` unset or wrong: the boot log says `telemetry: … not set`, and
+    `check-env` names the problem. A key minted on the control plane or another zone files
+    the events under the wrong tenant silently — `MON_TELEMETRY_ZONE=appleby` makes the boot
+    banner catch a wrong URL.
+  - *A zone logs `http.shutdown.failed` (`shutdown_timeout`) on a deploy, or its container is
+    killed rather than exiting* → an open live-tail stream. The SSE handlers end on
+    `r.Context()`, which `server.Shutdown` does not cancel, so one connected dashboard holds
+    shutdown for its full 10s. Then comes the 2s batcher drain, then the telemetry flush (up to
+    ~5–7s on appleby-core, whose own listener is already gone). That is longer than Docker's
+    default 10s stop grace. Known, not yet fixed. The fix is to cancel streams on shutdown
+    (`server.RegisterOnShutdown`, or a `BaseContext` that `main` cancels).
 
 ---
 
@@ -2115,6 +2387,22 @@ deviating.
 - **New one-off reconciliation SQL goes in `migrations/manual/`, never in `migrations/`.**
   The runner replays every embedded file on every boot; a mutation there re-queues a
   table-wide rewrite per restart, and an in-comment semicolon is fatal at startup (§8).
+- **Never make a successful ingest produce an event**, and never emit per event on the
+  ingest path. appleby-core ingests its own telemetry: an event per batch is a loop. Report
+  ingest failures per request, coalesced (§6 *Monitor self-telemetry*).
+- **Coalesce every failure that can feed itself** (`telemetry.WarnCoalesced` /
+  `ErrorCoalesced`) — anything that fails per batch, per tick, per event or per request.
+- **Never put tenant event data in a self-telemetry event** — no ingested event's data, name,
+  message or timestamp, no parse error text from an ingest body. Counts, sizes, project slugs
+  and service names only. `TestTenantEventDataNeverReachesSelfTelemetry` must keep passing
+  with a new ingest failure path added to its table.
+- **Report each failure once.** A 5xx through the responder is already the request's event —
+  pass context as `responder.ErrorWithCause(..., fields)`, never a second `telemetry.Error`.
+- **Emit only through `telemetry/`**, and read `MON_TELEMETRY_*` from plain env
+  (`env.LoadTelemetry`) — never from Keyring, never by adding telemetry config to `env.Load`.
+- **Never put a notification channel's config, an API key, a secret or an address in an
+  event** — ids and types only. Name no diagnostic field with a credential fragment
+  (`token`, `secret`, `key` under `api_key`…): go-monitor redacts the whole value.
 - Any new `/v1/*` route → update this file, the `monitor-web` docs if the UI will call it,
   and add/skip a `monitor-mcp` tool. Any change to the auth model, cookies, or schema →
   update §6 here and `monitor-web/AGENTS.md` in the same change.

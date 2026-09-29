@@ -1,8 +1,8 @@
 package bootstrap
 
 import (
+	"context"
 	"fmt"
-	"log"
 	"sort"
 	"strings"
 
@@ -10,6 +10,7 @@ import (
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 // VerifyConfigTenancy reports rows filed under a project this zone does not have.
@@ -35,16 +36,24 @@ import (
 // exist in this table?" — the question this function needs is precisely the one
 // the scoped layer is designed to make unaskable.
 func VerifyConfigTenancy(engine db.Queryable) {
+	ctx := context.Background()
 	known, err := knownProjectSlugs(engine)
 	if err != nil {
-		log.Printf("⚠️ could not verify config tenancy (this is a diagnostic, not a failure): %v", err)
+		telemetry.WarnErr(ctx, "tenancy.config.unverified", err, map[string]any{
+			"zone":    env.ZoneSlug,
+			"outcome": "the config-tenancy diagnostic did not run (a diagnostic, not a failure)",
+		})
 		return
 	}
 	if len(known) == 0 {
 		// bootstrap.EnsureZoneAndProject runs before this and is fail-fast, so an
 		// empty set means something changed underneath a running process. Saying
 		// nothing would be worse than saying this.
-		log.Printf("⚠️ config tenancy check skipped: this zone has no active projects")
+		telemetry.Warn(ctx, "tenancy.config.unverified", map[string]any{
+			"zone":    env.ZoneSlug,
+			"reason":  "no_active_projects",
+			"outcome": "the config-tenancy diagnostic was skipped",
+		})
 		return
 	}
 
@@ -59,10 +68,14 @@ func VerifyConfigTenancy(engine db.Queryable) {
 		if len(orphans) == 0 {
 			continue
 		}
-		log.Printf("⚠️ %s holds rows under project(s) %s, which are not active projects in zone %q — "+
-			"those rows exist but no session can select them. If MON_DEFAULT_PROJECT was changed after "+
-			"these rows were written, re-file them with: UPDATE %s SET project = %q WHERE project = '<old>'",
-			table, strings.Join(orphans, ", "), env.ZoneSlug, table, env.DefaultProjectSlug)
+		telemetry.Warn(ctx, "tenancy.config.orphaned", map[string]any{
+			"table":             table,
+			"orphaned_projects": strings.Join(orphans, ", "),
+			"zone":              env.ZoneSlug,
+			"outcome":           "those rows exist but no session can select them",
+			"remedy": fmt.Sprintf("if MON_DEFAULT_PROJECT was changed after these rows were written: UPDATE %s SET project = %q WHERE project = '<old>'",
+				table, env.DefaultProjectSlug),
+		})
 	}
 }
 

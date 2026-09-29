@@ -1,6 +1,7 @@
 package routes
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -261,7 +262,7 @@ func TestAffectedServicesForIssueUsesTheIssuesOwnProject(t *testing.T) {
 					WillReturnRows(rows)
 			}
 
-			got := affectedServicesForIssue(mockDB, "iss-1", tt.servicesByProject)
+			got := affectedServicesForIssue(context.Background(), mockDB, "iss-1", tt.servicesByProject)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("affected = %v, want %v", got, tt.want)
 			}

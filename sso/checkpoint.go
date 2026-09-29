@@ -2,11 +2,11 @@ package sso
 
 import (
 	"context"
-	"log"
 
 	ssolib "github.com/aidenappl/go-forta/sso"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/middleware"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 // Install wires the shared Checkpointer into the session middleware.
@@ -40,7 +40,8 @@ func newCheckpointer(sessions ssolib.SessionStore, providers func(context.Contex
 		// that caused it. go-forta drops any id that is not a UUID or 8-64 hex.
 		Correlation: requestCorrelation,
 		// LogfCtx replaces Logf so each checkpoint line carries the request id.
-		LogfCtx: logfWithRequestID,
+		// It takes precedence over Logf in the library, so only this one is set.
+		LogfCtx: libraryLogfCtx,
 		// Interval and Grace are left at the library defaults — 5 minutes and 30
 		// minutes. Overriding them here would be a policy decision made in the wrong
 		// place: the reasoning for both numbers, and for why neither fail-open nor
@@ -57,17 +58,6 @@ func newCheckpointer(sessions ssolib.SessionStore, providers func(context.Contex
 func requestCorrelation(ctx context.Context) (string, string) {
 	rid, _ := ctx.Value(middleware.RequestIDKey).(string)
 	return rid, ""
-}
-
-// logfWithRequestID is the Checkpointer's LogfCtx: the library's line, through
-// the standard logger monitor-core uses everywhere, with the request id
-// appended when the context carries one.
-func logfWithRequestID(ctx context.Context, format string, args ...any) {
-	if rid, _ := requestCorrelation(ctx); rid != "" {
-		log.Printf(format+" request_id=%s", append(args, rid)...)
-		return
-	}
-	log.Printf(format, args...)
 }
 
 // checkpointDecision maps the library's three-way result onto the middleware's
@@ -96,7 +86,12 @@ func checkpointDecision(checkpointer *ssolib.Checkpointer) func(ctx context.Cont
 			// Widening the hook to return a status is the right fix and belongs with
 			// the middleware, not here. Until then this comment is the record of what
 			// is being lost.
-			logfWithRequestID(ctx, "sso: checkpoint unavailable for user %d — denying (should be 503; the middleware hook cannot express it)", userID)
+			telemetry.WarnCoalesced(ctx, "sso.checkpoint.denied", "sso.checkpoint.denied", nil, map[string]any{
+				"user_id":    userID,
+				"reason":     "idp_unreachable_past_grace",
+				"dependency": "idp",
+				"outcome":    "session refused with a 401 (should be a 503; the middleware hook cannot express it)",
+			})
 			return false
 
 		default:

@@ -1,14 +1,15 @@
 package bootstrap
 
 import (
+	"context"
 	"fmt"
-	"log"
 	"strings"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/aidenappl/monitor-core/tools"
 )
 
@@ -67,7 +68,9 @@ func EnsureZoneAndProject(engine db.Queryable) error {
 				return err
 			}
 		} else {
-			log.Printf("bootstrap: created project %q (id=%d) in zone %q", project.Slug, project.ID, zone.Slug)
+			telemetry.Info(context.Background(), "tenancy.project.created", map[string]any{
+				"project": project.Slug, "project_id": project.ID, "zone": zone.Slug, "via": "bootstrap",
+			})
 		}
 	}
 
@@ -75,8 +78,13 @@ func EnsureZoneAndProject(engine db.Queryable) error {
 		// Not fatal — the rows exist and everything resolves — but a Monitor whose
 		// only zone or only project is retired will file every event under a tenant
 		// the UI hides by default, which is worth one loud line at boot.
-		log.Printf("bootstrap: WARNING zone %q is %s and project %q is %s — ingestion still stamps this project",
-			zone.Slug, zone.Status, project.Slug, project.Status)
+		telemetry.Warn(context.Background(), "tenancy.bootstrap.retired", map[string]any{
+			"zone":           zone.Slug,
+			"zone_status":    string(zone.Status),
+			"project":        project.Slug,
+			"project_status": string(project.Status),
+			"outcome":        "ingestion still stamps this project, which the UI hides by default",
+		})
 	}
 	return nil
 }
@@ -125,7 +133,9 @@ func ensureZone(engine db.Queryable, slug string) (*structs.Zone, error) {
 		return recoverZoneRace(engine, slug, err)
 	}
 
-	log.Printf("bootstrap: created zone %q (id=%d)", zone.Slug, zone.ID)
+	telemetry.Info(context.Background(), "tenancy.zone.created", map[string]any{
+		"zone": zone.Slug, "zone_id": zone.ID, "via": "bootstrap",
+	})
 	return zone, nil
 }
 
@@ -147,7 +157,7 @@ func recoverZoneRace(engine db.Queryable, slug string, createErr error) (*struct
 	if getErr != nil || zone == nil {
 		return nil, fmt.Errorf("failed to create zone %q: %w", slug, createErr)
 	}
-	log.Printf("bootstrap: zone %q already created by another process — continuing", slug)
+	telemetry.Debug(context.Background(), "tenancy.bootstrap.race_lost", map[string]any{"zone": slug})
 	return zone, nil
 }
 
@@ -157,7 +167,7 @@ func recoverProjectRace(engine db.Queryable, zoneID int64, slug string, createEr
 	if getErr != nil || project == nil {
 		return nil, fmt.Errorf("failed to create project %q in zone %d: %w", slug, zoneID, createErr)
 	}
-	log.Printf("bootstrap: project %q already created by another process — continuing", slug)
+	telemetry.Debug(context.Background(), "tenancy.bootstrap.race_lost", map[string]any{"project": slug, "zone_id": zoneID})
 	return project, nil
 }
 
