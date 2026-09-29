@@ -175,3 +175,77 @@ func TestReadyReportsDisabledAlerting(t *testing.T) {
 		t.Errorf("failing = %v, want it to name \"alerting\"", failing)
 	}
 }
+
+// TestHealthDegradesWithADependency is the "reports healthy while broken" guard.
+//
+// `status` on /health was the literal "ok" beside a `mariadb_ok` that could say
+// false, so a datastore outage read as a healthy service to anything that looked
+// at the top-level field — a dashboard, a human, an uptime check. It must now
+// answer from the same judgement /ready uses, and name what is failing.
+func TestHealthDegradesWithADependency(t *testing.T) {
+	resetDependencyProbe()
+	t.Cleanup(resetDependencyProbe)
+
+	// No datastores are wired in this package's tests, so both pings report down.
+	rec := httptest.NewRecorder()
+	HealthHandler(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	// ⚠️ 200 EVEN WHILE DEGRADED, deliberately: the container HEALTHCHECK polls
+	// this path with `curl -f`, so a non-2xx here turns a MariaDB blip into a
+	// restart loop. /ready is the endpoint that gets to be 503.
+	if rec.Code != http.StatusOK {
+		t.Errorf("/health = %d, want 200 even when degraded — the HEALTHCHECK would restart-loop", rec.Code)
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode /health body: %v", err)
+	}
+	if body["status"] != "degraded" {
+		t.Errorf("status = %v with both stores down, want \"degraded\"", body["status"])
+	}
+	if body["mariadb_ok"] != false {
+		t.Errorf("mariadb_ok = %v, want false", body["mariadb_ok"])
+	}
+	failing, _ := body["failing"].([]interface{})
+	if len(failing) == 0 {
+		t.Fatal("failing is absent or empty — the status says degraded without saying by what")
+	}
+	named := map[string]bool{}
+	for _, f := range failing {
+		if s, ok := f.(string); ok {
+			named[s] = true
+		}
+	}
+	if !named["mariadb"] {
+		t.Errorf("failing = %v, want it to name \"mariadb\"", failing)
+	}
+}
+
+// TestHealthAndReadyAgreeOnWhatIsFailing pins the two endpoints to one
+// judgement. They drifted before — /ready computed its own list while /health
+// hardcoded "ok" — and an operator comparing them got contradictory answers
+// about the same process.
+func TestHealthAndReadyAgreeOnWhatIsFailing(t *testing.T) {
+	resetDependencyProbe()
+	t.Cleanup(resetDependencyProbe)
+
+	health := httptest.NewRecorder()
+	HealthHandler(health, httptest.NewRequest(http.MethodGet, "/health", nil))
+	ready := httptest.NewRecorder()
+	ReadyHandler(ready, httptest.NewRequest(http.MethodGet, "/ready", nil))
+
+	var healthBody, readyBody map[string]interface{}
+	if err := json.Unmarshal(health.Body.Bytes(), &healthBody); err != nil {
+		t.Fatalf("decode /health: %v", err)
+	}
+	if err := json.Unmarshal(ready.Body.Bytes(), &readyBody); err != nil {
+		t.Fatalf("decode /ready: %v", err)
+	}
+
+	hf, _ := json.Marshal(healthBody["failing"])
+	rf, _ := json.Marshal(readyBody["failing"])
+	if string(hf) != string(rf) {
+		t.Errorf("/health failing = %s but /ready failing = %s; the two endpoints disagree", hf, rf)
+	}
+}

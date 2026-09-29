@@ -126,6 +126,11 @@ curl http://localhost:8080/health
 
 Response:
 
+`status` is `ok`, or `degraded` with a `failing` array naming what this role needs and is
+not getting. The HTTP code stays 200 either way — the container HEALTHCHECK polls this path,
+and restarting the process cannot repair a datastore. `GET /ready` is the endpoint that
+answers 503.
+
 ```json
 {
   "status": "ok",

@@ -395,10 +395,13 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
     `GET /ready` (`{status,clickhouse_ok,mariadb_ok,role[,failing]}`) and `POST /v1/events`
     (`{accepted:<int>}`). Ingest errors are plain text.
   - **`/health` is liveness, `/ready` is readiness — do not merge them.** `/health` always
-    returns **200** with `status:"ok"`, even with both stores dead, because the container
-    HEALTHCHECK points at it and restarting the process cannot repair ClickHouse; the
-    dependency booleans there are diagnostics, not a verdict. `/ready` returns **503** and
-    names the failing store in `failing`. **`/ready`'s verdict is role-aware:** ClickHouse
+    returns **200**, even with both stores dead, because the container HEALTHCHECK points at
+    it and restarting the process cannot repair ClickHouse. But its **`status` is `"ok"` or
+    `"degraded"`**, from the same `failingDependencies` judgement `/ready` uses, and it names
+    the same `failing` list when degraded — `status` was the literal `"ok"` beside a
+    `mariadb_ok:false` until 2026-09-28, which is the "reports healthy while broken" failure
+    the dependency pings exist to end. The HTTP code is the liveness answer; the body is the
+    diagnosis. `/ready` returns **503** and names the failing store in `failing`. **`/ready`'s verdict is role-aware:** ClickHouse
     counts as a dependency in every role *except* `app`, which holds no connection by
     design and would otherwise be permanently un-ready for doing exactly what it was
     configured to do. `clickhouse_ok` still reports `false` there — it is the true answer —

@@ -89,15 +89,31 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// ⚠️ `status` USED TO BE THE LITERAL "ok", beside a `mariadb_ok` that could
+	// say false — so this endpoint reported a healthy service during a datastore
+	// outage, which is the exact failure the dependency pings were added to end.
+	// It now answers from the same judgement /ready uses.
+	//
+	// The HTTP status stays 200 either way, deliberately: the container
+	// HEALTHCHECK polls this path with `curl -f`, so degrading the status code
+	// would turn a MariaDB blip into a restart loop. /ready is the endpoint that
+	// gets to be 503, because taking a replica out of rotation is recoverable
+	// and killing the process is not.
+	failing := failingDependencies(clickhouseOK, mariadbOK)
+	health := "ok"
+	if len(failing) > 0 {
+		health = "degraded"
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	body := map[string]interface{}{
 		// Additive: the self-telemetry shipper's own counters, so a Monitor that
 		// has stopped reporting on itself can be seen from outside the process.
 		// `dropped` rising here is loss; `pending` rising with `flushed` still is
 		// the destination zone being down.
 		"telemetry":     telemetry.Stats(),
-		"status":        "ok",
+		"status":        health,
 		"enqueued":      enqueued,
 		"dropped":       dropped,
 		"pending":       pending,
@@ -128,7 +144,13 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 		// needs it cannot check.
 		"zone":        env.ZoneSlug,
 		"alerting_ok": AlertingDisabledReason == "",
-	})
+	}
+	// Named only when there is something to name, so the healthy shape is
+	// unchanged for anything already parsing it.
+	if len(failing) > 0 {
+		body["failing"] = failing
+	}
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // IngestEventsHandler processes incoming NDJSON events
