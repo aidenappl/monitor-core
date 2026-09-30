@@ -3,10 +3,12 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/aidenappl/monitor-core/apikeys"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/scope"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 // WithProject and GetProject move the resolved project slug through a request.
@@ -80,13 +82,57 @@ func IngestAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		// authorises the write is the one that decides whose data it is, so the
 		// answer to "may you write?" and the answer to "as whom?" cannot drift
 		// apart or be resolved against different rows.
+		rejection := map[string]any{"reason": "missing_key"}
 		if key != "" {
-			if identity, ok := apikeys.ValidateWithIdentity(key); ok && identity.Scope == apikeys.ScopeIngest {
+			identity, ok := apikeys.ValidateWithIdentity(key)
+			if ok && identity.Scope == apikeys.ScopeIngest {
 				next(w, r.WithContext(WithProject(r.Context(), identity.ProjectSlug)))
 				return
 			}
+			if ok {
+				rejection = map[string]any{
+					"reason":  "wrong_scope",
+					"key_id":  identity.ID,
+					"scope":   string(identity.Scope),
+					"project": identity.ProjectSlug,
+				}
+			} else {
+				rejection = map[string]any{"reason": "unknown_key", "key_prefix": presentedKeyPrefix(key)}
+			}
 		}
+
+		// Coalesced per reason: a producer with a revoked key retries every
+		// batch, and appleby-core's own telemetry is one of those producers when
+		// its key is wrong — uncoalesced, each refusal would be an event that is
+		// itself refused. The successful path emits nothing (see
+		// LoggingMiddleware), so this is the only record of a refusal.
+		ingestAuthRejected.Add(1)
+		rejection["client_ip"] = GetClientIPFromContext(r.Context())
+		rejection["outcome"] = "returned 401; the batch was not ingested"
+		telemetry.WarnCoalesced(r.Context(), "ingest.auth.rejected:"+rejection["reason"].(string), "ingest.auth.rejected", nil, rejection)
 
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 	}
+}
+
+// ingestAuthRejected counts refused ingest credentials, for the periodic ingest
+// summary.
+var ingestAuthRejected atomic.Int64
+
+// IngestAuthRejected is the number of ingest requests refused for their
+// credential since boot.
+func IngestAuthRejected() int64 {
+	return ingestAuthRejected.Load()
+}
+
+// presentedKeyPrefix identifies an unrecognised key by the same 12-character
+// prefix the admin UI shows for every stored key (api_keys.key_prefix), so a
+// revoked key can be matched to its row. Anything too short to be a real key
+// yields nothing: a 12-character "prefix" of a short value would be the whole
+// value.
+func presentedKeyPrefix(key string) string {
+	if len(key) < 24 {
+		return ""
+	}
+	return key[:12]
 }

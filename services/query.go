@@ -423,7 +423,8 @@ func QueryEvents(ctx context.Context, params QueryParams) (*QueryResult, error) 
 					return fmt.Errorf("scan failed: %w", err)
 				}
 				if dataStr != "" && dataStr != "{}" {
-					json.Unmarshal([]byte(dataStr), &e.Data)
+					// A stored row whose data is not a JSON object is returned without it.
+					_ = json.Unmarshal([]byte(dataStr), &e.Data)
 				}
 				events = append(events, &e)
 			}

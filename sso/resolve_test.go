@@ -1,6 +1,7 @@
 package sso
 
 import (
+	"context"
 	"database/sql"
 	"testing"
 	"time"
@@ -71,7 +72,7 @@ func TestResolveIdentity_KnownIdentity(t *testing.T) {
 	mock.ExpectExec("UPDATE identities SET last_login_at").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	user, err := ResolveIdentity(dbMock, testProvider(true, true), ni("google", "sub-123", "a@b.com", true))
+	user, err := ResolveIdentity(context.Background(), dbMock, testProvider(true, true), ni("google", "sub-123", "a@b.com", true))
 	if err != nil {
 		t.Fatalf("ResolveIdentity: %v", err)
 	}
@@ -111,7 +112,7 @@ func TestResolveIdentity_SafeLink_VerifiedBothSides(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(identityCols).
 			AddRow(int64(15), int64(9), "google", "sub-new", "v@b.com", true, nil, []byte("{}"), nil, now))
 
-	user, err := ResolveIdentity(dbMock, testProvider(true, true), ni("google", "sub-new", "v@b.com", true))
+	user, err := ResolveIdentity(context.Background(), dbMock, testProvider(true, true), ni("google", "sub-new", "v@b.com", true))
 	if err != nil {
 		t.Fatalf("ResolveIdentity: %v", err)
 	}
@@ -143,7 +144,7 @@ func TestResolveIdentity_NoLink_UnverifiedExistingUser(t *testing.T) {
 			AddRow(int64(3), "u@b.com", false /* NOT verified */, nil, nil, "viewer", true, now, now))
 	// No INSERT expected — linking and provisioning are both refused.
 
-	_, err = ResolveIdentity(dbMock, testProvider(true, true), ni("google", "sub-x", "u@b.com", true))
+	_, err = ResolveIdentity(context.Background(), dbMock, testProvider(true, true), ni("google", "sub-x", "u@b.com", true))
 	if err == nil {
 		t.Fatalf("expected error when existing account is unverified, got nil")
 	}
@@ -183,7 +184,7 @@ func TestResolveIdentity_NoLink_UnverifiedIdPEmail(t *testing.T) {
 			AddRow(int64(60), int64(50), "google", "sub-unv", "new@b.com", false, nil, []byte("{}"), nil, now))
 	mock.ExpectCommit()
 
-	user, err := ResolveIdentity(dbMock, testProvider(true, true), ni("google", "sub-unv", "new@b.com", false))
+	user, err := ResolveIdentity(context.Background(), dbMock, testProvider(true, true), ni("google", "sub-unv", "new@b.com", false))
 	if err != nil {
 		t.Fatalf("ResolveIdentity: %v", err)
 	}
@@ -228,7 +229,7 @@ func TestResolveIdentity_Provision_UnknownProvider(t *testing.T) {
 			AddRow(int64(80), int64(70), "google", "sub-fresh", "fresh@b.com", true, nil, []byte("{}"), nil, now))
 	mock.ExpectCommit()
 
-	user, err := ResolveIdentity(dbMock, testProvider(true, true), ni("google", "sub-fresh", "fresh@b.com", true))
+	user, err := ResolveIdentity(context.Background(), dbMock, testProvider(true, true), ni("google", "sub-fresh", "fresh@b.com", true))
 	if err != nil {
 		t.Fatalf("ResolveIdentity: %v", err)
 	}
@@ -256,7 +257,7 @@ func TestResolveIdentity_Provision_Disabled(t *testing.T) {
 		WithArgs("x@b.com").
 		WillReturnError(errNoRows())
 
-	_, err = ResolveIdentity(dbMock, testProvider(true, false /* autoProvision off */), ni("google", "sub-none", "x@b.com", true))
+	_, err = ResolveIdentity(context.Background(), dbMock, testProvider(true, false /* autoProvision off */), ni("google", "sub-none", "x@b.com", true))
 	if err == nil {
 		t.Fatalf("expected error when auto-provisioning disabled, got nil")
 	}

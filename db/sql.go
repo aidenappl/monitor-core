@@ -1,15 +1,16 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"fmt"
-	"log"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/aidenappl/monitor-core/env"
+	"github.com/aidenappl/monitor-core/telemetry"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -42,8 +43,6 @@ var migrationsFS embed.FS
 // (sourced from Keyring MON_DB_DSN in production). Panics on a malformed DSN;
 // connectivity is verified separately via a bounded ping-with-retry.
 func InitSQL() error {
-	fmt.Print("Connecting to MariaDB... ")
-
 	dsn := ensureDSNParams(env.MonDBDSN)
 	conn, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -55,11 +54,16 @@ func InitSQL() error {
 	conn.SetConnMaxLifetime(5 * time.Minute)
 
 	// Ping with a short retry loop so a still-booting MariaDB doesn't fail startup.
+	attempts := 0
 	for attempt := 1; attempt <= 10; attempt++ {
+		attempts = attempt
 		if err = conn.Ping(); err == nil {
 			break
 		}
-		log.Printf("attempt %d: failed to ping mariadb: %v", attempt, err)
+		telemetry.WarnErr(context.Background(), "mariadb.connect.retrying", err, map[string]any{
+			"attempt": attempt, "max_attempts": 10,
+			"outcome": fmt.Sprintf("retrying in %ds", attempt),
+		})
 		time.Sleep(time.Duration(attempt) * time.Second)
 	}
 	if err != nil {
@@ -67,7 +71,7 @@ func InitSQL() error {
 	}
 
 	SQL = conn
-	fmt.Println("✅ Done")
+	telemetry.Info(context.Background(), "mariadb.connect.succeeded", map[string]any{"attempts": attempts})
 	return nil
 }
 
@@ -94,8 +98,6 @@ func ensureDSNParams(dsn string) string {
 // These are the RELATIONAL (MariaDB) migrations only — the ClickHouse schema
 // lives in the repo-root migrations/ dir and is applied by ClickHouse itself.
 func RunMigrations() error {
-	fmt.Print("Running MariaDB migrations... ")
-
 	_, err := SQL.Exec(`CREATE TABLE IF NOT EXISTS migrations_applied (
 		name VARCHAR(255) NOT NULL PRIMARY KEY,
 		applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -143,10 +145,6 @@ func RunMigrations() error {
 		applied++
 	}
 
-	if applied > 0 {
-		fmt.Printf("✅ %d migration(s) applied\n", applied)
-	} else {
-		fmt.Println("✅ Up to date")
-	}
+	telemetry.Info(context.Background(), "mariadb.migrations.applied", map[string]any{"applied": applied})
 	return nil
 }

@@ -4,12 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
 
 	ssolib "github.com/aidenappl/go-forta/sso"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 // Resolver implements ssolib.UserResolver for Monitor.
@@ -33,8 +33,8 @@ func NewResolver(engine db.Queryable) *Resolver { return &Resolver{Engine: engin
 // user row to check user.Active before issuing a session — a user id alone cannot
 // answer that. This method is the interface-shaped view of the same logic, so the
 // two can never diverge.
-func (r *Resolver) ResolveUser(_ context.Context, p *ssolib.Provider, id ssolib.Identity) (int64, error) {
-	user, err := ResolveIdentity(r.Engine, p, id)
+func (r *Resolver) ResolveUser(ctx context.Context, p *ssolib.Provider, id ssolib.Identity) (int64, error) {
+	user, err := ResolveIdentity(ctx, r.Engine, p, id)
 	if err != nil {
 		return 0, err
 	}
@@ -93,7 +93,7 @@ func LinkIdentity(engine db.Queryable, userID int64, ni ssolib.Identity) error {
 //     provisioning is disabled, the login is rejected.
 //
 // engine is a db.Queryable so this is unit-testable against a mocked DB.
-func ResolveIdentity(engine db.Queryable, p *ssolib.Provider, ni ssolib.Identity) (*structs.User, error) {
+func ResolveIdentity(ctx context.Context, engine db.Queryable, p *ssolib.Provider, ni ssolib.Identity) (*structs.User, error) {
 	if ni.Subject == "" {
 		return nil, fmt.Errorf("sso: cannot resolve identity with empty subject")
 	}
@@ -112,7 +112,11 @@ func ResolveIdentity(engine db.Queryable, p *ssolib.Provider, ni ssolib.Identity
 			return nil, fmt.Errorf("sso: identity %d references missing user %d", identity.ID, identity.UserID)
 		}
 		if err := query.TouchIdentityLogin(engine, identity.ID); err != nil {
-			log.Printf("sso: failed to touch identity %d login time: %v", identity.ID, err)
+			telemetry.WarnErr(ctx, "auth.identity.touch.failed", err, map[string]any{
+				"identity_id": identity.ID,
+				"user_id":     identity.UserID,
+				"outcome":     "signed in; the identity's last-login time was not updated",
+			})
 		}
 		return user, nil
 	}
@@ -128,7 +132,11 @@ func ResolveIdentity(engine db.Queryable, p *ssolib.Provider, ni ssolib.Identity
 				if _, err := createIdentityFor(engine, existing.ID, ni); err != nil {
 					return nil, fmt.Errorf("sso: link identity onto user %d: %w", existing.ID, err)
 				}
-				log.Printf("sso: link-on-login: linked %s:%s onto verified user %d (%s)", ni.Provider, ni.Subject, existing.ID, existing.Email)
+				telemetry.Info(ctx, "auth.identity.linked", map[string]any{
+					"user_id":  existing.ID,
+					"provider": ni.Provider,
+					"via":      "login",
+				})
 				return existing, nil
 			}
 			// Existing user is UNVERIFIED — refuse to link (pre-account-takeover
@@ -145,7 +153,11 @@ func ResolveIdentity(engine db.Queryable, p *ssolib.Provider, ni ssolib.Identity
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("sso: provisioned pending user %d (%s) from %s:%s", user.ID, user.Email, ni.Provider, ni.Subject)
+	telemetry.Info(ctx, "auth.sso.user.provisioned", map[string]any{
+		"user_id":  user.ID,
+		"provider": ni.Provider,
+		"role":     user.Role,
+	})
 	return user, nil
 }
 

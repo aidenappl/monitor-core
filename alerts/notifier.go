@@ -3,16 +3,72 @@ package alerts
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
-	"log"
+	"net"
 	"net/http"
 	"net/smtp"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/aidenappl/monitor-core/structs"
 )
+
+// NotifyError is a failed delivery, described WITHOUT the channel's destination.
+//
+// A channel's config is its credential — a Slack or webhook URL whose path is
+// the secret, a PagerDuty routing key — and net/http puts the full request URL
+// into every transport error it returns ("Post \"https://hooks.slack.com/…\":
+// dial tcp: …"). So the transport error is unwrapped from its *url.Error before
+// it is kept, and what reaches Monitor, a log line or a client is the channel
+// type, the stage that failed and the destination's status code.
+type NotifyError struct {
+	ChannelType string
+	Stage       string // config | request | response | send
+	StatusCode  int    // the destination's HTTP status; 0 when it never answered
+	Err         error
+}
+
+func (e *NotifyError) Error() string {
+	if e.StatusCode != 0 {
+		return fmt.Sprintf("%s returned status %d", e.ChannelType, e.StatusCode)
+	}
+	return e.Err.Error()
+}
+
+func (e *NotifyError) Unwrap() error { return e.Err }
+
+// TelemetryFields is the dependency detail on the alert.notify.failed event.
+func (e *NotifyError) TelemetryFields() map[string]any {
+	fields := map[string]any{
+		"dependency": "notification_" + e.ChannelType,
+		"stage":      e.Stage,
+	}
+	if e.StatusCode != 0 {
+		fields["status_code"] = e.StatusCode
+	}
+	var netErr net.Error
+	if errors.As(e.Err, &netErr) && netErr.Timeout() {
+		fields["timed_out"] = true
+	}
+	return fields
+}
+
+func notifyError(channelType, stage string, err error) error {
+	return &NotifyError{ChannelType: channelType, Stage: stage, Err: err}
+}
+
+// withoutURL drops the request URL net/http wraps a transport error in, keeping
+// the cause.
+func withoutURL(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Errorf("%s failed: %w", urlErr.Op, urlErr.Err)
+	}
+	return err
+}
 
 // Notifier dispatches notifications to different channel types
 type Notifier struct {
@@ -71,10 +127,10 @@ func (n *Notifier) sendWebhook(channel *structs.NotificationChannel, alertName, 
 		URL string `json:"url"`
 	}
 	if err := json.Unmarshal([]byte(channel.Config), &config); err != nil {
-		return fmt.Errorf("invalid webhook config: %w", err)
+		return notifyError("webhook", "config", fmt.Errorf("invalid webhook config: %w", err))
 	}
 	if config.URL == "" {
-		return fmt.Errorf("webhook url is required")
+		return notifyError("webhook", "config", fmt.Errorf("webhook url is required"))
 	}
 
 	payload := map[string]interface{}{
@@ -91,12 +147,12 @@ func (n *Notifier) sendWebhook(channel *structs.NotificationChannel, alertName, 
 
 	resp, err := n.client.Post(config.URL, "application/json", bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("webhook request failed: %w", err)
+		return notifyError("webhook", "request", fmt.Errorf("webhook request failed: %w", withoutURL(err)))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("webhook returned status %d", resp.StatusCode)
+		return &NotifyError{ChannelType: "webhook", Stage: "response", StatusCode: resp.StatusCode, Err: fmt.Errorf("webhook returned status %d", resp.StatusCode)}
 	}
 
 	return nil
@@ -107,10 +163,10 @@ func (n *Notifier) sendSlack(channel *structs.NotificationChannel, alertName, me
 		WebhookURL string `json:"webhook_url"`
 	}
 	if err := json.Unmarshal([]byte(channel.Config), &config); err != nil {
-		return fmt.Errorf("invalid slack config: %w", err)
+		return notifyError("slack", "config", fmt.Errorf("invalid slack config: %w", err))
 	}
 	if config.WebhookURL == "" {
-		return fmt.Errorf("slack webhook_url is required")
+		return notifyError("slack", "config", fmt.Errorf("slack webhook_url is required"))
 	}
 
 	payload := map[string]interface{}{
@@ -148,12 +204,12 @@ func (n *Notifier) sendSlack(channel *structs.NotificationChannel, alertName, me
 
 	resp, err := n.client.Post(config.WebhookURL, "application/json", bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("slack request failed: %w", err)
+		return notifyError("slack", "request", fmt.Errorf("slack request failed: %w", withoutURL(err)))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("slack returned status %d", resp.StatusCode)
+		return &NotifyError{ChannelType: "slack", Stage: "response", StatusCode: resp.StatusCode, Err: fmt.Errorf("slack returned status %d", resp.StatusCode)}
 	}
 
 	return nil
@@ -172,10 +228,10 @@ type emailConfig struct {
 func (n *Notifier) sendEmail(channel *structs.NotificationChannel, alertName, message string, value float64) error {
 	var config emailConfig
 	if err := json.Unmarshal([]byte(channel.Config), &config); err != nil {
-		return fmt.Errorf("invalid email config: %w", err)
+		return notifyError("email", "config", fmt.Errorf("invalid email config: %w", err))
 	}
 	if config.SMTPHost == "" || config.To == "" {
-		return fmt.Errorf("smtp_host and to are required for email channels")
+		return notifyError("email", "config", fmt.Errorf("smtp_host and to are required for email channels"))
 	}
 	if config.SMTPPort == "" {
 		config.SMTPPort = "587"
@@ -210,11 +266,12 @@ func (n *Notifier) sendEmail(channel *structs.NotificationChannel, alertName, me
 		auth = smtp.PlainAuth("", config.SMTPUsername, config.SMTPPassword, config.SMTPHost)
 	}
 
+	// An SMTP refusal can quote a recipient address; telemetry scrubs addresses
+	// out of the error text before it ships (telemetry.scrubFreeText).
 	if err := smtp.SendMail(addr, auth, config.FromEmail, recipients, []byte(msg)); err != nil {
-		return fmt.Errorf("email send failed: %w", err)
+		return notifyError("email", "send", fmt.Errorf("email send failed: %w", err))
 	}
 
-	log.Printf("alert notifier: email sent to %s for alert %s", config.To, alertName)
 	return nil
 }
 
@@ -224,10 +281,10 @@ func (n *Notifier) sendPagerDuty(channel *structs.NotificationChannel, alertName
 		Severity   string `json:"severity"`
 	}
 	if err := json.Unmarshal([]byte(channel.Config), &config); err != nil {
-		return fmt.Errorf("invalid pagerduty config: %w", err)
+		return notifyError("pagerduty", "config", fmt.Errorf("invalid pagerduty config: %w", err))
 	}
 	if config.RoutingKey == "" {
-		return fmt.Errorf("pagerduty routing_key is required")
+		return notifyError("pagerduty", "config", fmt.Errorf("pagerduty routing_key is required"))
 	}
 	if config.Severity == "" {
 		config.Severity = "critical"
@@ -262,15 +319,14 @@ func (n *Notifier) sendPagerDuty(channel *structs.NotificationChannel, alertName
 
 	resp, err := n.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("pagerduty request failed: %w", err)
+		return notifyError("pagerduty", "request", fmt.Errorf("pagerduty request failed: %w", withoutURL(err)))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("pagerduty returned status %d", resp.StatusCode)
+		return &NotifyError{ChannelType: "pagerduty", Stage: "response", StatusCode: resp.StatusCode, Err: fmt.Errorf("pagerduty returned status %d", resp.StatusCode)}
 	}
 
-	log.Printf("alert notifier: pagerduty %s sent for alert %s", action, alertName)
 	return nil
 }
 

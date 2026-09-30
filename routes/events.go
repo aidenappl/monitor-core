@@ -4,9 +4,9 @@ import (
 	"bufio"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -16,6 +16,7 @@ import (
 	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/services"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 // MaxRequestBodySize limits request body to 10MB
@@ -88,10 +89,31 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// ⚠️ `status` USED TO BE THE LITERAL "ok", beside a `mariadb_ok` that could
+	// say false — so this endpoint reported a healthy service during a datastore
+	// outage, which is the exact failure the dependency pings were added to end.
+	// It now answers from the same judgement /ready uses.
+	//
+	// The HTTP status stays 200 either way, deliberately: the container
+	// HEALTHCHECK polls this path with `curl -f`, so degrading the status code
+	// would turn a MariaDB blip into a restart loop. /ready is the endpoint that
+	// gets to be 503, because taking a replica out of rotation is recoverable
+	// and killing the process is not.
+	failing := failingDependencies(clickhouseOK, mariadbOK)
+	health := "ok"
+	if len(failing) > 0 {
+		health = "degraded"
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":        "ok",
+	body := map[string]interface{}{
+		// Additive: the self-telemetry shipper's own counters, so a Monitor that
+		// has stopped reporting on itself can be seen from outside the process.
+		// `dropped` rising here is loss; `pending` rising with `flushed` still is
+		// the destination zone being down.
+		"telemetry":     telemetry.Stats(),
+		"status":        health,
 		"enqueued":      enqueued,
 		"dropped":       dropped,
 		"pending":       pending,
@@ -122,7 +144,13 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 		// needs it cannot check.
 		"zone":        env.ZoneSlug,
 		"alerting_ok": AlertingDisabledReason == "",
-	})
+	}
+	// Named only when there is something to name, so the healthy shape is
+	// unchanged for anything already parsing it.
+	if len(failing) > 0 {
+		body["failing"] = failing
+	}
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // IngestEventsHandler processes incoming NDJSON events
@@ -132,7 +160,7 @@ func IngestEventsHandler(w http.ResponseWriter, r *http.Request) {
 
 	bodyReader, err := getBodyReader(r)
 	if err != nil {
-		log.Printf("failed to get body reader: %v", err)
+		reportIngestRejection(r, &ingestRejection{Reason: "gzip_invalid", Err: err, message: err.Error()})
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
@@ -143,7 +171,7 @@ func IngestEventsHandler(w http.ResponseWriter, r *http.Request) {
 	// lines that preceded the bad one.
 	events, err := parseEvents(bodyReader)
 	if err != nil {
-		log.Printf("failed to parse events: %v", err)
+		reportIngestRejection(r, err)
 		http.Error(w, fmt.Sprintf("Invalid event: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -194,11 +222,108 @@ func IngestEventsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Overflow is reported ONCE PER REQUEST, not per refused event, and
+	// coalesced: a full queue refuses every event of every request until the
+	// batcher drains it, and appleby-core's own telemetry is one of the producers
+	// being refused. Counts only — the events belong to the tenant that sent
+	// them.
+	if refused := len(events) - accepted; refused > 0 {
+		_, droppedTotal, pending := Queue.Stats()
+		telemetry.ErrorCoalesced(r.Context(), "ingest.queue.overflow", "ingest.queue.overflow", nil, map[string]any{
+			"project":        project,
+			"batch_size":     len(events),
+			"refused":        refused,
+			"queue_pending":  pending,
+			"queue_capacity": Queue.Capacity(),
+			"dropped_total":  droppedTotal,
+			"reason":         "queue_full",
+			"outcome":        fmt.Sprintf("dropped %d of %d events; the producer was told %d were accepted", refused, len(events), accepted),
+		})
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"accepted": accepted,
 	})
+}
+
+// ingestRejection is why an ingest body was refused.
+//
+// Error() is what the PRODUCER is told, and may quote its own body back to it.
+// The telemetry event gets only the classification (Reason, Line, Detail): an
+// ingest body is another service's data — every Trailblaze service ingests
+// through this path — and a JSON or timestamp parse error quotes it. Copying
+// that into a self-telemetry event would move one zone's data into another.
+type ingestRejection struct {
+	Line    int
+	Reason  string // invalid_json | validation_failed | body_too_large | line_too_long | body_read_failed | gzip_invalid
+	Detail  string // a rule or a JSON error class — never a value
+	Service string // the failing line's service, when it parsed that far
+	Err     error
+	message string
+}
+
+func (e *ingestRejection) Error() string { return e.message }
+func (e *ingestRejection) Unwrap() error { return e.Err }
+
+// reportIngestRejection records a refused ingest body, coalesced per reason: a
+// producer with a bug sends the same bad line on every retry.
+func reportIngestRejection(r *http.Request, err error) {
+	ingestRejected.Add(1)
+
+	data := map[string]any{
+		"reason":      "invalid_body",
+		"status_code": http.StatusBadRequest,
+		"client_ip":   middleware.GetClientIPFromContext(r.Context()),
+		"outcome":     "returned 400; nothing from the body was enqueued",
+	}
+	var rej *ingestRejection
+	if errors.As(err, &rej) {
+		data["reason"] = rej.Reason
+		if rej.Line > 0 {
+			data["line"] = rej.Line
+		}
+		if rej.Detail != "" {
+			data["detail"] = rej.Detail
+		}
+		if rej.Service != "" {
+			data["service"] = truncateString(rej.Service, 100)
+		}
+		if rej.Err != nil {
+			data["error_type"] = telemetry.ErrorType(rej.Err)
+		}
+	}
+	if project, ok := middleware.GetProject(r.Context()); ok {
+		data["project"] = project
+	}
+	telemetry.WarnCoalesced(r.Context(), "ingest.request.rejected:"+data["reason"].(string), "ingest.request.rejected", nil, data)
+}
+
+// jsonErrorClass describes a JSON decode failure without quoting the input. A
+// SyntaxError is safe (an offset), an UnmarshalTypeError names the field and
+// the KIND of value, a time.ParseError would quote the timestamp and is named
+// instead.
+func jsonErrorClass(err error) string {
+	var syntaxErr *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	var timeErr *time.ParseError
+	switch {
+	case errors.As(err, &syntaxErr):
+		return fmt.Sprintf("syntax error at offset %d", syntaxErr.Offset)
+	case errors.As(err, &typeErr):
+		return fmt.Sprintf("field %q expects %s, got a JSON %s", typeErr.Field, typeErr.Type, typeErr.Value)
+	case errors.As(err, &timeErr):
+		return "timestamp is not RFC 3339"
+	}
+	return "malformed JSON"
+}
+
+func truncateString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 func getBodyReader(r *http.Request) (io.ReadCloser, error) {
@@ -234,18 +359,46 @@ func parseEvents(reader io.Reader) ([]*structs.Event, error) {
 
 		var event structs.Event
 		if err := json.Unmarshal(line, &event); err != nil {
-			return nil, fmt.Errorf("line %d: invalid JSON: %w", lineNum, err)
+			return nil, &ingestRejection{
+				Line:    lineNum,
+				Reason:  "invalid_json",
+				Detail:  jsonErrorClass(err),
+				Err:     err,
+				message: fmt.Sprintf("line %d: invalid JSON: %v", lineNum, err),
+			}
 		}
 
 		if err := event.Validate(); err != nil {
-			return nil, fmt.Errorf("line %d: %w", lineNum, err)
+			// Validate's messages name the rule and never the value, so they
+			// are safe to report as the detail.
+			return nil, &ingestRejection{
+				Line:    lineNum,
+				Reason:  "validation_failed",
+				Detail:  err.Error(),
+				Service: event.Service,
+				Err:     err,
+				message: fmt.Sprintf("line %d: %v", lineNum, err),
+			}
 		}
 
 		events = append(events, &event)
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading body: %w", err)
+		reason := "body_read_failed"
+		var tooLarge *http.MaxBytesError
+		switch {
+		case errors.As(err, &tooLarge):
+			reason = "body_too_large"
+		case errors.Is(err, bufio.ErrTooLong):
+			reason = "line_too_long"
+		}
+		return nil, &ingestRejection{
+			Line:    lineNum + 1,
+			Reason:  reason,
+			Err:     err,
+			message: fmt.Sprintf("error reading body: %v", err),
+		}
 	}
 
 	return events, nil

@@ -5,12 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/query"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 // THE CUTOVER HAS AN ORDER, AND NOTHING ELSE ENFORCES IT.
@@ -124,7 +124,11 @@ func RequireConfigBackfill(ctx context.Context) error {
 	if done, err := configBackfillMarked(); err != nil {
 		// Not fatal: an unreadable marker only costs the short circuit. The row
 		// counts below answer the same question, less cheaply.
-		log.Printf("WARNING: could not read the %s marker, falling back to row counts: %v", CONFIG_BACKFILL_MARKER, err)
+		telemetry.WarnErr(ctx, "cutover.marker.read.failed", err, map[string]any{
+			"marker":     CONFIG_BACKFILL_MARKER,
+			"dependency": "mariadb",
+			"outcome":    "falling back to row counts",
+		})
 	} else if done {
 		return nil
 	}
@@ -199,7 +203,7 @@ func legacyRowCount(ctx context.Context, table string) (uint64, bool) {
 		"SELECT count() FROM system.tables WHERE database = ? AND name = ?",
 		db.Database, table,
 	).Scan(&exists); err != nil {
-		log.Printf("WARNING: could not check whether %s.%s still exists, skipping its cutover check: %v", db.Database, table, err)
+		reportLegacyProbeFailure(ctx, table, "exists", err)
 		return 0, false
 	}
 	if exists == 0 {
@@ -208,10 +212,22 @@ func legacyRowCount(ctx context.Context, table string) (uint64, bool) {
 
 	var count uint64
 	if err := db.Conn.QueryRow(ctx, fmt.Sprintf("SELECT count() FROM %s.%s", db.Database, table)).Scan(&count); err != nil {
-		log.Printf("WARNING: could not count %s.%s, skipping its cutover check: %v", db.Database, table, err)
+		reportLegacyProbeFailure(ctx, table, "count", err)
 		return 0, false
 	}
 	return count, true
+}
+
+// reportLegacyProbeFailure records the guard failing OPEN on one table — the
+// line AGENTS.md §8 tells an operator to look for when alerting is silent and
+// the guard did not refuse.
+func reportLegacyProbeFailure(ctx context.Context, table, stage string, err error) {
+	telemetry.WarnErr(ctx, "cutover.probe.failed", err, map[string]any{
+		"table":    table,
+		"database": db.Database,
+		"stage":    stage,
+		"outcome":  "failed open: this table's cutover check was skipped",
+	})
 }
 
 // mariadbRowCount counts the destination table. The table name is a constant

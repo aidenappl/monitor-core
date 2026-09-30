@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -125,6 +126,22 @@ var (
 	// another org means adding another token and a lookup by owner.
 	GitHubToken         string
 	GitHubWebhookSecret string
+
+	// Self-telemetry: where monitor-core reports its OWN errors and activity (the
+	// appleby zone). Read by LoadTelemetry, never by Load — see there.
+	//
+	// ⚠️ MON_TELEMETRY_*, NOT MONITOR_*. MONITOR_API_KEY is this service's
+	// ingest MASTER key (IngestKey above), and on Lattice stack 30 it is a
+	// stack-level variable holding the trailblaze zone's master key. The
+	// convention the rest of the estate uses for its telemetry client
+	// (MONITOR_INGEST_URL/MONITOR_API_KEY) would collide with it outright.
+	TelemetryIngestURL string
+	TelemetryAPIKey    string
+	TelemetryEnv       string
+	TelemetryZone      string
+	TelemetrySpoolDir  string
+	TelemetryDebug     bool
+	TelemetryStdout    bool
 )
 
 // Load reads all configuration from environment variables.
@@ -204,6 +221,25 @@ func Load() {
 	// means the GitHub features are simply inactive.
 	GitHubToken = getEnv("MON_GITHUB_TOKEN_TRAILBLAZE", "")
 	GitHubWebhookSecret = getEnv("MON_GITHUB_WEBHOOK_SECRET_TRAILBLAZE", "")
+}
+
+// LoadTelemetry reads the self-telemetry configuration from the PLAIN
+// environment. main calls it before Keyring injects anything, and that ordering
+// is the point: a Keyring failure is one of the things telemetry has to be able
+// to report, so its configuration can never come from Keyring. A value Keyring
+// later injects under one of these names is ignored (and reported by
+// preflight.KeyringOverrides like any other override).
+//
+// Nothing here is required. An unset MON_TELEMETRY_INGEST_URL means nothing is
+// shipped and the service runs normally.
+func LoadTelemetry() {
+	TelemetryIngestURL = strings.TrimSpace(getEnv("MON_TELEMETRY_INGEST_URL", ""))
+	TelemetryAPIKey = strings.TrimSpace(getEnv("MON_TELEMETRY_API_KEY", ""))
+	TelemetryEnv = getEnv("MON_TELEMETRY_ENV", "production")
+	TelemetryZone = getEnv("MON_TELEMETRY_ZONE", "")
+	TelemetrySpoolDir = getEnv("MON_TELEMETRY_SPOOL_DIR", "")
+	TelemetryDebug = getEnv("MON_TELEMETRY_DEBUG", "false") == "true"
+	TelemetryStdout = getEnv("MON_TELEMETRY_STDOUT", "false") == "true"
 }
 
 // RequireProductionSecrets returns an error if the process is running in a

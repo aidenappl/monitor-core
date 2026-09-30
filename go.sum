@@ -12,6 +12,8 @@ github.com/aidenappl/go-forta v1.11.0 h1:ZWIU7iTGMzupMO0KYUHF0sX+2T94KGxD6PZKB6I
 github.com/aidenappl/go-forta v1.11.0/go.mod h1:rWBBthu4VVez71aY2odJQ3290Z/bCL8jsWOwJcah48A=
 github.com/aidenappl/go-keyring v1.0.2 h1:rD5qbs9T4Pyu1vmCYAgSzGdlzxeB2Ac+whycn6hD0LA=
 github.com/aidenappl/go-keyring v1.0.2/go.mod h1:QNxilp2a8ttZ2aR+qwa9j/NCma7GdTqkmJh2vKcYzRE=
+github.com/aidenappl/go-monitor v0.0.9-0.20260912224748-17017e52efeb h1:dSJO3WsMx6hU+0OOP5FfuyLAxSzV6GZYX6b553BlS1k=
+github.com/aidenappl/go-monitor v0.0.9-0.20260912224748-17017e52efeb/go.mod h1:oa9BLzq+hdIRTjg2q4P6SSgsRlDypYEga5zcbekCto8=
 github.com/andybalholm/brotli v1.2.0 h1:ukwgCxwYrmACq68yiUqwIWnGY0cTPox/M94sVwToPjQ=
 github.com/andybalholm/brotli v1.2.0/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=

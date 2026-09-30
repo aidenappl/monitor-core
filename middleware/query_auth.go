@@ -53,6 +53,7 @@ func QueryAuthMiddleware(next http.Handler) http.Handler {
 			// ANDed onto the mandatory predicate and can therefore only ever
 			// narrow the result, never widen it.
 			if matchesEnvMasterKey(key) {
+				Annotate(w, map[string]any{"auth": "master_key", "project": env.DefaultProjectSlug})
 				ctx := WithActor(r.Context(), structs.SystemActor(EnvMasterKeyLabel))
 				ctx = scope.WithProject(ctx, env.DefaultProjectSlug)
 				next.ServeHTTP(w, r.WithContext(ctx))
@@ -68,12 +69,16 @@ func QueryAuthMiddleware(next http.Handler) http.Handler {
 			// and a request-supplied slug must never be able to move it.
 			identity, ok := apikeys.ValidateWithIdentity(key)
 			if ok && identity.Scope == apikeys.ScopeAdmin {
+				Annotate(w, map[string]any{"auth": "api_key", "key_id": identity.ID, "project": identity.ProjectSlug})
 				ctx := WithActor(r.Context(), structs.APIKeyActor(identity.ID, identity.Name))
 				ctx = scope.WithProject(ctx, identity.ProjectSlug)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
 			if ok && identity.Scope == apikeys.ScopeIngest {
+				RecordFailure(w, http.StatusForbidden, "ingest keys cannot access query endpoints", nil, map[string]any{
+					"auth": "api_key", "key_id": identity.ID, "reason": "wrong_scope",
+				})
 				http.Error(w, "Forbidden: ingest keys cannot access query endpoints", http.StatusForbidden)
 				return
 			}
@@ -178,6 +183,7 @@ func withSessionProject(next http.Handler) http.Handler {
 		if !ok {
 			return
 		}
+		Annotate(w, map[string]any{"auth": "session", "project": selected})
 		next.ServeHTTP(w, r.WithContext(scope.WithProject(r.Context(), selected)))
 	})
 }

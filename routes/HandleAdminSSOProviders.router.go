@@ -3,7 +3,6 @@ package routes
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 
 	sso "github.com/aidenappl/go-forta/sso"
@@ -11,6 +10,7 @@ import (
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/aidenappl/monitor-core/tools"
 	"github.com/gorilla/mux"
 )
@@ -201,23 +201,33 @@ func refreshProviderIcon(ctx context.Context, slug string, iconURL *string) {
 		// Cleared, or never set. Drop any cached bytes so removing the URL actually
 		// removes the icon rather than leaving a stale one served forever.
 		if err := query.SetProviderIcon(db.SQL, slug, "", nil, ""); err != nil {
-			log.Printf("sso: failed to clear icon for %q: %v", slug, err)
+			reportIconFailure(ctx, slug, "clear", err, "the provider was saved; a stale icon is still served")
 		}
 		return
 	}
 
 	icon, err := sso.FetchIcon(ctx, *iconURL)
 	if err != nil {
-		log.Printf("sso: icon fetch failed for %q: %v", slug, err)
+		// The admin sees this on the provider row (icon_error); the warning is
+		// for a fetch that keeps failing unnoticed.
+		reportIconFailure(ctx, slug, "fetch", err, "the provider was saved; the login page shows a text button")
 		if setErr := query.SetProviderIcon(db.SQL, slug, "", nil, err.Error()); setErr != nil {
-			log.Printf("sso: failed to record icon error for %q: %v", slug, setErr)
+			reportIconFailure(ctx, slug, "record_error", setErr, "the fetch failure was not recorded on the provider row")
 		}
 		return
 	}
 
 	if err := query.SetProviderIcon(db.SQL, slug, icon.ContentType, icon.Data, ""); err != nil {
-		log.Printf("sso: failed to cache icon for %q: %v", slug, err)
+		reportIconFailure(ctx, slug, "cache", err, "the provider was saved; the icon was fetched but not cached")
 	}
+}
+
+func reportIconFailure(ctx context.Context, slug, stage string, err error, outcome string) {
+	telemetry.WarnErr(ctx, "sso.provider.icon.failed", err, map[string]any{
+		"provider": slug,
+		"stage":    stage,
+		"outcome":  outcome,
+	})
 }
 
 // validateProviderURLs runs the SSRF guard over every provider URL present in
@@ -319,6 +329,11 @@ func HandleCreateSSOProvider(w http.ResponseWriter, r *http.Request) {
 	if fresh, ferr := query.GetProviderBySlug(db.SQL, provider.Slug); ferr == nil && fresh != nil {
 		provider = fresh
 	}
+	telemetry.Info(r.Context(), "sso.provider.created", map[string]any{
+		"provider": provider.Slug,
+		"kind":     provider.Kind,
+		"enabled":  provider.Enabled,
+	})
 	responder.New(w, toAdminView(provider), "sso provider created")
 }
 
@@ -409,6 +424,10 @@ func HandleUpdateSSOProvider(w http.ResponseWriter, r *http.Request) {
 			provider = fresh
 		}
 	}
+	telemetry.Info(r.Context(), "sso.provider.updated", map[string]any{
+		"provider": slug,
+		"enabled":  provider.Enabled,
+	})
 	responder.New(w, toAdminView(provider), "sso provider updated")
 }
 
@@ -424,5 +443,6 @@ func HandleDeleteSSOProvider(w http.ResponseWriter, r *http.Request) {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to delete sso provider", err)
 		return
 	}
+	telemetry.Info(r.Context(), "sso.provider.deleted", map[string]any{"provider": slug})
 	responder.New(w, nil, "sso provider deleted")
 }

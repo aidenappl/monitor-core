@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"sort"
 	"time"
 
@@ -13,6 +12,7 @@ import (
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 // CLOSED — TIMER-DRIVEN alert evaluation used to be ZONE-WIDE. Recorded
@@ -210,7 +210,13 @@ type Evaluator struct {
 	// publish performs a notification's side effects: history, the SSE hub and
 	// the router. It is called only for the transition a tick notifies.
 	publish func(ctx context.Context, rule *structs.AlertRule, state *State, status, msg string)
-	logf    func(format string, args ...any)
+	// logf carries the evaluator's schedule narrative — which windows were
+	// skipped, which rule is holding, which catch-up fired and cleared. In
+	// production it goes to telemetry at DEBUG (see evaluatorTrace): every line
+	// here accompanies a structured event that carries the same failure with
+	// fields, and printing both would report one failure twice. Tests replace it
+	// to assert on the narrative directly.
+	logf func(format string, args ...any)
 
 	// lastEnd is the end of the last window evaluated per rule — where that
 	// rule's next window starts.
@@ -243,7 +249,7 @@ func NewEvaluator(alertHub *AlertHub) *Evaluator {
 		listStates:   ListAllStates,
 		upsertStates: UpsertStates,
 		aggregate:    queryAggForRange,
-		logf:         log.Printf,
+		logf:         evaluatorTrace,
 		lastEnd:      make(map[string]time.Time),
 		pendingSince: make(map[string]time.Time),
 		retryAt:      make(map[string]time.Time),
@@ -278,6 +284,12 @@ func (e *Evaluator) evaluateAll(ctx context.Context) {
 	rules, err := e.listRules()
 	if err != nil {
 		e.logf("alert evaluator: failed to list rules: %v", err)
+		// Coalesced: a MariaDB outage fails every tick the same way.
+		telemetry.ErrorCoalesced(ctx, "alert.rules.list.failed", "alert.rules.list.failed", err, map[string]any{
+			"dependency": "mariadb",
+			"reason":     "mariadb_read_failed",
+			"outcome":    "no rule was evaluated this tick",
+		})
 		return
 	}
 
@@ -323,6 +335,14 @@ func (e *Evaluator) evaluateAll(ctx context.Context) {
 				// a fresh ok state and fire again. The windows are held, so the
 				// next tick evaluates them.
 				e.logf("alert evaluator: failed to read alert states for project %q; skipping its rules this tick: %v", rule.Project, err)
+				// Coalesced per project: every rule in it is skipped for the
+				// same reason, and the next tick fails the same way.
+				telemetry.WarnCoalesced(ctx, "alert.state.read.failed:"+rule.Project, "alert.state.read.failed", err, map[string]any{
+					"project":    rule.Project,
+					"dependency": "clickhouse",
+					"reason":     "state_read_failed",
+					"outcome":    "the project's rules were held unevaluated; their windows are evaluated on a later tick",
+				})
 				unreadable[rule.Project] = true
 				continue
 			}
@@ -395,6 +415,15 @@ func (e *Evaluator) saveStates(ctx context.Context, evaluated []*State) {
 
 	if err := e.upsertStates(ctx, batch); err != nil {
 		e.logf("alert evaluator: failed to write %d alert states; keeping them in memory and retrying with the next tick: %v", len(batch), err)
+		// An error, not a warning: until this lands, a restart re-reads the
+		// stored rows and re-evaluates from where they say, so a firing rule can
+		// notify again.
+		telemetry.ErrorCoalesced(ctx, "alert.state.write.failed", "alert.state.write.failed", err, map[string]any{
+			"states":     len(batch),
+			"dependency": "clickhouse",
+			"reason":     "state_write_failed",
+			"outcome":    "held in memory and written again with the next tick; a restart before then re-notifies",
+		})
 		e.unsaved = make(map[string]*State, len(batch))
 		for _, s := range batch {
 			e.unsaved[s.RuleID] = s
@@ -514,6 +543,18 @@ func (e *Evaluator) dueWindows(rule *structs.AlertRule, now time.Time) []window 
 		latest := last.Add(time.Duration(due-1) * interval)
 		e.logf("alert evaluator: rule %s (%s) is %d windows behind; skipping [%s, %s) unevaluated and resuming at the latest complete window",
 			rule.ID, rule.Name, due, last.Format(time.RFC3339), latest.Format(time.RFC3339))
+		// A span of this rule's history is being abandoned, so it is a warning
+		// even though nothing failed here: an alert that should have fired in it
+		// never will. Coalesced per rule — a long outage skips on many ticks.
+		telemetry.WarnCoalesced(context.Background(), "alert.schedule.windows.skipped:"+rule.ID, "alert.schedule.windows.skipped", nil, map[string]any{
+			"rule_id":      rule.ID,
+			"project":      rule.Project,
+			"windows":      due,
+			"skipped_from": last.Format(time.RFC3339),
+			"skipped_to":   latest.Format(time.RFC3339),
+			"reason":       "beyond_catch_up_limit",
+			"outcome":      "the span was never evaluated; evaluation resumed at the latest complete window",
+		})
 		// Recorded now, not after the window succeeds: the span is abandoned
 		// either way, and holding it would log the same skip every tick.
 		last = latest
@@ -596,6 +637,19 @@ func (e *Evaluator) evaluateRule(ctx context.Context, rule *structs.AlertRule, w
 			e.retryAt[rule.ID] = now.Add(interval - e.tick/2)
 			e.logf("alert evaluator: failed to query rule %s (%s) over [%s, %s); holding its schedule and retrying in %s: %v",
 				rule.ID, rule.Name, w.from.Format(time.RFC3339), w.to.Format(time.RFC3339), interval, err)
+			// Coalesced per rule: a broken rule — or a ClickHouse outage — fails
+			// the same way every interval. The error carries the query kind and
+			// ClickHouse's code (db.QueryError), never the statement.
+			telemetry.ErrorCoalesced(ctx, "alert.evaluate.failed:"+rule.ID, "alert.evaluate.failed", err, map[string]any{
+				"rule_id":     rule.ID,
+				"project":     rule.Project,
+				"rule_type":   rule.Type,
+				"window_from": w.from.Format(time.RFC3339),
+				"window_to":   w.to.Format(time.RFC3339),
+				"retry_in_s":  int(interval / time.Second),
+				"reason":      "rule_query_failed",
+				"outcome":     "the rule's schedule is held at this window and retried; its state is unchanged",
+			})
 			break
 		}
 		e.applyWindow(rule, state, value, isFiring, w.to)
@@ -698,25 +752,67 @@ func (e *Evaluator) onResolved(ctx context.Context, rule *structs.AlertRule, sta
 // publishTransition is the production publish: history, the alert SSE hub, and
 // the notification router.
 func (e *Evaluator) publishTransition(ctx context.Context, rule *structs.AlertRule, state *State, status, msg string) {
-	_ = RecordHistory(ctx, HistoryEntry{
+	// The alert itself. Lean by policy: what fired, for which rule, at what
+	// value — the rule's own definition is in MariaDB, not in every event.
+	data := map[string]any{
+		"rule_id":   rule.ID,
+		"project":   rule.Project,
+		"rule_type": rule.Type,
+		"value":     state.Value,
+		"priority":  rule.Priority,
+	}
+	if status == "firing" {
+		telemetry.Info(ctx, "alert.fired", data)
+	} else {
+		telemetry.Info(ctx, "alert.resolved", data)
+	}
+
+	if err := RecordHistory(ctx, HistoryEntry{
 		Project:  rule.Project,
 		RuleID:   rule.ID,
 		RuleName: rule.Name,
 		Status:   status,
 		Value:    state.Value,
 		Message:  msg,
-	})
+	}); err != nil {
+		// The notification still goes out; only the audit row is missing, which
+		// is why this is not a failed transition.
+		telemetry.ErrorCoalesced(ctx, "alert.history.write.failed", "alert.history.write.failed", err, map[string]any{
+			"rule_id":    rule.ID,
+			"project":    rule.Project,
+			"status":     status,
+			"dependency": "clickhouse",
+			"outcome":    "the alert was notified but its history row is missing",
+		})
+	}
 
 	if e.alertHub != nil {
 		e.alertHub.PublishStateChange(rule.Project, rule.ID, rule.Name, status, msg, state.Value)
 	}
 
 	alertCtx := BuildAlertContext(ctx, rule, status, state.Value, msg)
-	// The destination count is Route's own business to log — it emits the WARN
-	// when it is zero, where it knows which channels resolved and which did not.
+	// The destination count is Route's own business to report — it emits the
+	// warning when it is zero, where it knows which channels resolved and which
+	// did not.
 	if _, err := e.router.Route(ctx, alertCtx, rule); err != nil {
-		log.Printf("alert evaluator: routing failed for rule %s: %v", rule.ID, err)
+		// Coalesced per rule. This is the alert not reaching anyone.
+		telemetry.ErrorCoalesced(ctx, "alert.route.failed:"+rule.ID, "alert.route.failed", err, map[string]any{
+			"rule_id":      rule.ID,
+			"project":      rule.Project,
+			"alert_status": status,
+			"reason":       "routing_failed",
+			"outcome":      "the alert was recorded but not delivered to any channel",
+		})
 	}
+}
+
+// evaluatorTrace is the production logf: the schedule narrative at debug, off
+// unless MON_TELEMETRY_DEBUG is set. The failures it accompanies are reported as
+// their own structured events at warn or error, so nothing is lost with it off.
+func evaluatorTrace(format string, args ...any) {
+	telemetry.Debug(context.Background(), "alert.evaluator.trace", map[string]any{
+		"message": fmt.Sprintf(format, args...),
+	})
 }
 
 // evaluateRuleState computes a rule's value over the half-open window

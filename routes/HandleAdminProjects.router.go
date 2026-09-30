@@ -9,6 +9,7 @@ import (
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/aidenappl/monitor-core/tools"
 )
 
@@ -99,6 +100,9 @@ func HandleCreateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	telemetry.Info(r.Context(), "tenancy.project.created", map[string]any{
+		"project": project.Slug, "project_id": project.ID, "zone": zone.Slug, "via": "admin",
+	})
 	responder.New(w, project, "project created")
 }
 
@@ -180,6 +184,7 @@ func HandleUpdateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	telemetry.Info(r.Context(), "tenancy.project.updated", map[string]any{"project": existing.Slug, "project_id": id})
 	responder.New(w, project, "project updated")
 }
 
@@ -211,5 +216,6 @@ func HandleRetireProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	telemetry.Info(r.Context(), "tenancy.project.retired", map[string]any{"project": project.Slug, "project_id": id})
 	responder.New(w, project, "project retired")
 }

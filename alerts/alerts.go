@@ -11,6 +11,7 @@ import (
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/google/uuid"
 )
 
@@ -285,9 +286,17 @@ func DeleteRule(ctx context.Context, project, id string) error {
 	if err != nil {
 		return nil
 	}
-	_ = db.Conn.Exec(ctx, fmt.Sprintf(
+	if err := db.Conn.Exec(ctx, fmt.Sprintf(
 		"ALTER TABLE %s.alert_states DELETE WHERE rule_id = ? AND %s", db.Database, predicate,
-	), append([]interface{}{id}, args...)...)
+	), append([]interface{}{id}, args...)...); err != nil {
+		// Still best-effort — the rule is gone, which is what the caller asked
+		// for — but no longer silent.
+		telemetry.WarnErr(ctx, "alert_rule.state.cleanup.failed", err, map[string]any{
+			"rule_id": id,
+			"project": project,
+			"outcome": "the rule was deleted; its alert_states row is left behind, orphaned and unread",
+		})
+	}
 
 	return nil
 }

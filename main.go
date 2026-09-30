@@ -27,6 +27,7 @@ import (
 	"github.com/aidenappl/monitor-core/routes"
 	"github.com/aidenappl/monitor-core/services"
 	"github.com/aidenappl/monitor-core/sso"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/rs/cors"
 )
 
@@ -73,6 +74,34 @@ func main() {
 		log.Fatalf("❌ %v", err)
 	}
 
+	// TELEMETRY COMES UP FIRST — before Keyring, config, or any connection — so
+	// that every one of those can be reported when it fails. Its configuration is
+	// read from the plain environment for the same reason (env.LoadTelemetry):
+	// Keyring cannot be the source of the thing that reports Keyring failing.
+	//
+	// Serving only. The subcommands are operator tools whose output belongs to the
+	// terminal they were run in; with telemetry never initialised, every event
+	// they trigger prints there exactly as the log line it replaced.
+	//
+	// Nothing here can fail or delay the boot, and that includes an ingest URL
+	// pointing back at THIS process while it is still starting (appleby-core
+	// reports into itself): events queue, and the spool — or, without one, the
+	// SDK's short retry window — carries them until the listener is up.
+	serving := len(os.Args) < 2
+	env.LoadTelemetry()
+	if serving {
+		telemetry.Init(telemetry.Settings{
+			IngestURL: env.TelemetryIngestURL,
+			APIKey:    env.TelemetryAPIKey,
+			Env:       env.TelemetryEnv,
+			Zone:      env.TelemetryZone,
+			SpoolDir:  env.TelemetrySpoolDir,
+			Debug:     env.TelemetryDebug,
+			Stdout:    env.TelemetryStdout,
+		})
+		preflight.Sink = reportPreflight
+	}
+
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -90,7 +119,10 @@ func main() {
 	envBeforeKeyring := preflight.Snapshot()
 	if client, err := keyring.New(); err == nil {
 		if err := client.InjectEnv(ctx); err != nil {
-			log.Printf("keyring: failed to inject secrets: %v", err)
+			telemetry.Error(ctx, "keyring.inject.failed", err, map[string]any{
+				"reason":  "keyring_unavailable",
+				"outcome": "booting on the container's plain environment; any secret only Keyring holds is missing",
+			})
 		}
 	}
 
@@ -133,7 +165,10 @@ func main() {
 	}
 
 	if preflightFatal {
-		log.Fatal("FATAL: preflight found a configuration error that would misdiagnose itself later — see above")
+		telemetry.Fatal("config.preflight.failed", "preflight found a configuration error that would misdiagnose itself later — see above", nil, map[string]any{
+			"reason":        "preflight_failed",
+			"failed_checks": fatalCheckNames(preflightChecks),
+		})
 	}
 
 	// Settle which plane this process is before anything reads the answer. An
@@ -141,7 +176,7 @@ func main() {
 	// see env.RequireValidRole for why a silent fallback here would quietly stand
 	// up a second control plane on a machine meant to be a zone.
 	if err := env.RequireValidRole(); err != nil {
-		log.Fatalf("FATAL: %v", err)
+		telemetry.Fatal("config.role.invalid", "MON_ROLE is not a recognised role", err, map[string]any{"reason": "invalid_role"})
 	}
 
 	// Announce the role once, at the very top of the boot log, for the same
@@ -154,17 +189,32 @@ func main() {
 	log.Printf("monitor-core role: %s (control plane: %t, data plane: %t)",
 		env.MonRole, env.MonRole.RunsControlPlane(), env.MonRole.RunsDataPlane())
 
+	// Every event from here on says which plane and zone produced it: the control
+	// plane and appleby-core are the same binary under one service name.
+	telemetry.SetIdentity(string(env.MonRole), env.ZoneSlug)
+
 	// Say which zone this process believes it is, and — the load-bearing half —
 	// whether anyone chose. A defaulted slug is the one configuration mistake
 	// that produces a working process serving the wrong tenant's name, so it is
 	// announced next to the role rather than left to be inferred from /health.
-	if env.ZoneSlugExplicit {
-		log.Printf("monitor-core zone: %s", env.ZoneSlug)
-	} else {
-		log.Printf("monitor-core zone: %s ⚠️ MON_ZONE_SLUG is unset — this is the fallback, not a choice", env.ZoneSlug)
+	build := buildinfo.Get()
+	telemetry.Info(ctx, "service.startup", map[string]any{
+		"role":            string(env.MonRole),
+		"zone":            env.ZoneSlug,
+		"version":         build.Version,
+		"commit":          build.Commit,
+		"port":            env.Port,
+		"telemetry_spool": env.TelemetrySpoolDir != "",
+	})
+	if !env.ZoneSlugExplicit {
+		telemetry.Warn(ctx, "config.zone.defaulted", map[string]any{
+			"zone":    env.ZoneSlug,
+			"reason":  "mon_zone_slug_unset",
+			"outcome": "serving under the fallback zone name — this is the default, not a choice",
+		})
 	}
 	if err := env.RequireZoneIdentity(); err != nil {
-		log.Fatalf("FATAL: %v", err)
+		telemetry.Fatal("config.zone.unset", "a data plane must name its own zone", err, map[string]any{"reason": "zone_identity_required"})
 	}
 
 	// MON_PUBLIC_URL lost its default because that default was the control
@@ -174,18 +224,21 @@ func main() {
 	// control plane builds SSO redirect_uris that are relative paths rather than
 	// origins — which the IdP rejects with an error naming neither.
 	if strings.TrimSpace(env.PublicBaseURL) == "" {
-		log.Printf("⚠️ MON_PUBLIC_URL is unset — a new zone cannot record its ingest/query endpoints, and SSO redirect_uris will be malformed")
+		telemetry.Warn(ctx, "config.public_url.unset", map[string]any{
+			"reason":  "mon_public_url_unset",
+			"outcome": "a new zone cannot record its ingest/query endpoints, and SSO redirect_uris will be malformed",
+		})
 	}
 
 	if env.IngestKey == "" {
-		log.Fatal("FATAL: MONITOR_API_KEY must be set — refusing to start without ingest authentication")
+		telemetry.Fatal("config.ingest_key.missing", "MONITOR_API_KEY must be set — refusing to start without ingest authentication", nil, map[string]any{"reason": "ingest_key_missing"})
 	}
 
 	// Refuse to start in production on the committed dev-default JWT/crypto keys
 	// (would allow forged admin sessions / decryptable SSO secrets). Set
 	// MON_COOKIE_INSECURE=true for local dev to permit the fallbacks.
 	if err := env.RequireProductionSecrets(); err != nil {
-		log.Fatalf("FATAL: %v", err)
+		telemetry.Fatal("config.secrets.insecure", "refusing to start on development secrets", err, map[string]any{"reason": "production_secrets_required"})
 	}
 
 	// Handle shutdown signals
@@ -213,7 +266,11 @@ func main() {
 	if env.MonRole.RunsDataPlane() {
 		// Connect to ClickHouse
 		if err := db.Connect(ctx, env.ClickHouseAddr, env.ClickHouseDatabase, env.ClickHouseUsername, env.ClickHousePassword, env.ClickHouseMaxMemoryUsage); err != nil {
-			log.Fatalf("❌ failed to connect to ClickHouse: %v", err)
+			telemetry.Fatal("clickhouse.connect.failed", "failed to connect to ClickHouse", err, map[string]any{
+				"reason":   "clickhouse_unreachable",
+				"addr":     env.ClickHouseAddr,
+				"database": env.ClickHouseDatabase,
+			})
 		}
 		defer db.Close()
 
@@ -223,7 +280,10 @@ func main() {
 		// The runner rewrites the DDL to env.ClickHouseDatabase, so it migrates the
 		// same database the serving path reads and writes.
 		if err := migrations.RunMigrations(ctx); err != nil {
-			log.Fatalf("❌ failed to run ClickHouse migrations: %v", err)
+			telemetry.Fatal("clickhouse.migrate.failed", "failed to run ClickHouse migrations", err, map[string]any{
+				"reason":   "clickhouse_migration_failed",
+				"database": db.Database,
+			})
 		}
 
 		// Then prove it. Every failure mode of the above — a half-applied file, a
@@ -244,32 +304,45 @@ func main() {
 			if probeErr = db.Conn.Exec(ctx, probeQuery); probeErr == nil {
 				break
 			}
-			log.Printf("attempt %d/3: %s.events not readable yet: %v", attempt, db.Database, probeErr)
+			telemetry.WarnErr(ctx, "clickhouse.schema.probe.retrying", probeErr, map[string]any{
+				"database":     db.Database,
+				"attempt":      attempt,
+				"max_attempts": 3,
+				"outcome":      fmt.Sprintf("retrying in %ds", attempt),
+			})
 			time.Sleep(time.Duration(attempt) * time.Second)
 		}
 		if probeErr != nil {
-			log.Fatalf("❌ ClickHouse table %s.events is not readable after migrations — refusing to start and silently drop events: %v", db.Database, probeErr)
+			telemetry.Fatal("clickhouse.schema.unreadable", "the events table is not readable after migrations — refusing to start and silently drop events", probeErr, map[string]any{
+				"reason":   "events_table_unreadable",
+				"database": db.Database,
+				"attempts": 3,
+			})
 		}
 	}
 
 	// Connect to MariaDB (relational auth data layer: users, identities,
 	// refresh_tokens, sso_providers, sso_sessions, settings, api_keys).
 	if err := db.InitSQL(); err != nil {
-		log.Fatalf("❌ failed to connect to MariaDB: %v", err)
+		telemetry.Fatal("mariadb.connect.failed", "failed to connect to MariaDB", err, map[string]any{"reason": "mariadb_unreachable"})
 	}
-	defer db.CloseSQL()
+	// Closed on the way out; an error closing a pool at exit changes nothing.
+	defer func() { _ = db.CloseSQL() }()
 
 	// Diagnose the `monitor` schema grant BEFORE the migration runner needs it,
 	// so the missing GRANT is reported as a missing GRANT rather than as an
 	// Error 1044 from inside migration 110 that names neither the grant nor the
 	// fix. That misdiagnosis cost hours on the second zone.
 	if schemaChecks := preflight.MonitorSchema(db.SQL); preflight.Report(schemaChecks) {
-		log.Fatal("FATAL: the database is not usable by this service — see the remedy above")
+		telemetry.Fatal("mariadb.schema.unusable", "the database is not usable by this service — see the remedy above", nil, map[string]any{
+			"reason":        "monitor_schema_unusable",
+			"failed_checks": fatalCheckNames(schemaChecks),
+		})
 	}
 
 	// Apply the MariaDB auth-schema migrations at startup.
 	if err := db.RunMigrations(); err != nil {
-		log.Fatalf("❌ failed to run MariaDB migrations: %v", err)
+		telemetry.Fatal("mariadb.migrate.failed", "failed to run MariaDB migrations", err, map[string]any{"reason": "mariadb_migration_failed"})
 	}
 
 	// Establish this install's identity and record what schema it is on, both
@@ -284,13 +357,19 @@ func main() {
 	// by a probe — and refusing to boot over a diagnostic would trade a real
 	// outage for a missing label.
 	if installID, err := bootstrap.EnsureInstallID(db.SQL); err != nil {
-		log.Printf("⚠️ could not establish an install id (GET /version will omit it): %v", err)
+		telemetry.WarnErr(ctx, "install_id.ensure.failed", err, map[string]any{
+			"reason":  "mariadb_write_failed",
+			"outcome": "GET /version omits the install id",
+		})
 	} else {
 		routes.InstallID = installID
 	}
 
 	if applied, latest, err := query.AppliedMigrations(db.SQL); err != nil {
-		log.Printf("⚠️ could not read the MariaDB migration ledger: %v", err)
+		telemetry.WarnErr(ctx, "migrations.ledger.read.failed", err, map[string]any{
+			"reason":  "mariadb_read_failed",
+			"outcome": "GET /version omits the MariaDB schema counts",
+		})
 	} else {
 		routes.Schema.MariaDBApplied = applied
 		routes.Schema.MariaDBLatest = latest
@@ -403,7 +482,11 @@ func main() {
 	// would ingest happily with a null tenant on every row — the state that is
 	// hardest to notice and impossible to reattribute afterwards.
 	if err := bootstrap.EnsureZoneAndProject(db.SQL); err != nil {
-		log.Fatalf("❌ failed to bootstrap the tenancy registry: %v", err)
+		telemetry.Fatal("tenancy.bootstrap.failed", "failed to bootstrap the tenancy registry", err, map[string]any{
+			"reason":  "tenancy_seed_failed",
+			"zone":    env.ZoneSlug,
+			"project": env.DefaultProjectSlug,
+		})
 	}
 
 	// Report rows filed under a project this zone does not have. A diagnostic,
@@ -423,7 +506,7 @@ func main() {
 	if env.MonRole.RunsControlPlane() {
 		// Seed the first admin user on a fresh database (no-op once any user exists).
 		if err := bootstrap.EnsureAdminUser(db.SQL); err != nil {
-			log.Fatalf("❌ failed to bootstrap admin user: %v", err)
+			telemetry.Fatal("admin.bootstrap.failed", "failed to bootstrap the admin user", err, map[string]any{"reason": "admin_seed_failed"})
 		}
 
 		// Wire the SSO revocation checkpoint into SessionMiddleware. Until this runs
@@ -440,7 +523,10 @@ func main() {
 	// EVERY role. A zone authenticates ingest against this cache, and the control
 	// plane serves the management surface from it, so neither can go without.
 	if err := apikeys.Init(ctx); err != nil {
-		log.Printf("WARNING: failed to initialize api keys: %v", err)
+		telemetry.Error(ctx, "apikeys.cache.load.failed", err, map[string]any{
+			"reason":  "mariadb_read_failed",
+			"outcome": "database-stored API keys do not authenticate until the refresher's next successful load (every 30s); the env master key still works",
+		})
 	}
 
 	// Load the tenancy registry cache (the zone + its projects). This is what
@@ -453,7 +539,10 @@ func main() {
 	// when it names none — keeps working. Failing the boot would take the whole
 	// dashboard down to protect a selector.
 	if err := registry.Init(ctx); err != nil {
-		log.Printf("WARNING: failed to initialize the tenancy registry cache: %v", err)
+		telemetry.WarnErr(ctx, "registry.cache.load.failed", err, map[string]any{
+			"reason":  "mariadb_read_failed",
+			"outcome": "an explicit ?project selector is refused until the next successful refresh; the default project keeps working",
+		})
 	}
 
 	// ---- Event machinery: DATA PLANE ONLY ------------------------------------
@@ -506,8 +595,10 @@ func main() {
 		// balancer and an operator both see that it is not fully functional.
 		if err := cutover.RequireConfigBackfill(ctx); err != nil {
 			configCutoverPending = err
-			log.Printf("⚠️  ALERTING IS DISABLED: %v", err)
-			log.Printf("⚠️  Ingest, queries and issues are unaffected. Run `monitor-core backfill-config`, then restart this process.")
+			telemetry.WarnErr(ctx, "alerting.cutover.pending", err, map[string]any{
+				"reason":  "config_backfill_pending",
+				"outcome": "ALERTING IS DISABLED — ingest, queries and issues are unaffected. Run `monitor-core backfill-config`, then restart this process",
+			})
 			routes.AlertingDisabledReason = err.Error()
 		}
 
@@ -528,12 +619,19 @@ func main() {
 		// every route. The ClickHouse table creation still runs; only the seed is
 		// held back.
 		if err := alerts.Init(ctx, configCutoverPending == nil); err != nil {
-			log.Printf("WARNING: failed to initialize alerts: %v", err)
+			telemetry.Error(ctx, "alerts.init.failed", err, map[string]any{
+				"reason":  "policy_seed_failed",
+				"project": env.DefaultProjectSlug,
+				"outcome": "the default notification policies were not seeded; evaluation still starts",
+			})
 		}
 
 		// Initialize issues
 		if err := issues.Init(ctx); err != nil {
-			log.Printf("WARNING: failed to initialize issues: %v", err)
+			telemetry.Error(ctx, "issues.init.failed", err, map[string]any{
+				"reason":  "tracker_init_failed",
+				"outcome": "error events are ingested but not grouped into issues",
+			})
 		}
 
 		// Create SSE hub
@@ -549,13 +647,13 @@ func main() {
 		batcher := services.NewBatcher(queue, writer, env.BatchSize, env.FlushInterval)
 		routes.Batcher = batcher
 		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("PANIC in batcher: %v", r)
-				}
-			}()
+			defer telemetry.Recover(ctx, "batcher", "batcher stopped: ingest keeps accepting until QUEUE_SIZE, then refuses every event, until the process restarts")
 			batcher.Run(ctx)
 		}()
+
+		// The periodic ingest summary — the ONLY way healthy ingest shows up in
+		// Monitor, since a successful POST /v1/events emits no request event.
+		telemetry.Go(ctx, "ingest-summary", routes.RunIngestSummary)
 
 		// Create alert notification hub for SSE streaming
 		alertHub := alerts.NewAlertHub(env.MaxSSESubscribers)
@@ -569,11 +667,7 @@ func main() {
 		if configCutoverPending == nil {
 			evaluator := alerts.NewEvaluator(alertHub)
 			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("PANIC in alert evaluator: %v", r)
-					}
-				}()
+				defer telemetry.Recover(ctx, "alert-evaluator", "alert evaluation stopped: no rule fires or resolves until the process restarts")
 				evaluator.Run(ctx)
 			}()
 		}
@@ -603,10 +697,6 @@ func main() {
 		MaxAge: 7200,
 	})
 
-	// Launch Server
-	fmt.Printf("✅ monitor-core running on port %s (role: %s)\n", env.Port, env.MonRole)
-	fmt.Println()
-
 	server := &http.Server{
 		Addr:         ":" + env.Port,
 		Handler:      corsMiddleware.Handler(r),
@@ -615,22 +705,44 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	// Called as Shutdown begins. An SSE stream ends only when its client goes
+	// away, so without this one open live-tail tab holds every deploy for the
+	// full shutdown timeout — long enough, with the drain and flush below, to be
+	// SIGKILLed past Docker's stop grace. See routes/draining.go.
+	server.RegisterOnShutdown(routes.StartDraining)
+
 	go func() {
+		defer telemetry.Recover(ctx, "http-server", "the HTTP server stopped serving")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server error: %v", err)
+			telemetry.Fatal("http.listen.failed", "the HTTP server could not serve", err, map[string]any{
+				"reason": "listen_failed",
+				"port":   env.Port,
+			})
 		}
 	}()
 
+	// The last line of the boot phase. From here on info events are shipped but
+	// no longer printed — a request event per dashboard call would otherwise be a
+	// stdout line per dashboard call.
+	telemetry.Info(ctx, "http.listen.started", map[string]any{"port": env.Port, "role": string(env.MonRole)})
+	telemetry.MarkServing()
+
 	// Wait for shutdown signal
-	<-sigChan
-	log.Println("shutting down...")
+	sig := <-sigChan
+	telemetry.MarkStopping()
+	telemetry.Info(ctx, "service.stopping", map[string]any{"signal": sig.String()})
+	// Before the listener closes — appleby-core ships to itself. See telemetry.Flush.
+	telemetry.Flush(2 * time.Second)
 
 	// Graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTP server shutdown error: %v", err)
+		telemetry.WarnErr(ctx, "http.shutdown.failed", err, map[string]any{
+			"reason":  "shutdown_timeout",
+			"outcome": "open connections were cut rather than drained",
+		})
 	}
 
 	cancel()
@@ -643,5 +755,36 @@ func main() {
 	}
 	time.Sleep(2 * time.Second)
 
-	log.Println("shutdown complete")
+	// Last: the batcher has drained, so anything it reported is in the buffer.
+	telemetry.Shutdown(sig.String())
+}
+
+// reportPreflight turns a preflight finding into an event while serving. A Fatal
+// finding is a warning here because the boot's own fatal event (which names it)
+// is the one failure; `check-env` never sets the sink and prints for a terminal.
+func reportPreflight(check preflight.Check) {
+	data := map[string]any{
+		"check":  check.Name,
+		"detail": check.Detail,
+		"remedy": check.Remedy,
+	}
+	switch check.Severity {
+	case preflight.Fatal:
+		telemetry.Warn(context.Background(), "preflight.check.failed", data)
+	case preflight.Warn:
+		telemetry.Warn(context.Background(), "preflight.check.warned", data)
+	default:
+		telemetry.Info(context.Background(), "preflight.check.noted", data)
+	}
+}
+
+// fatalCheckNames names the findings that stopped the boot.
+func fatalCheckNames(checks []preflight.Check) []string {
+	var names []string
+	for _, check := range checks {
+		if check.Severity == preflight.Fatal {
+			names = append(names, check.Name)
+		}
+	}
+	return names
 }

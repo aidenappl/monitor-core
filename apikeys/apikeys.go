@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 )
@@ -127,11 +127,7 @@ func Init(ctx context.Context) error {
 	err := refreshCache()
 
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("PANIC in api key cache refresher: %v", r)
-			}
-		}()
+		defer telemetry.Recover(ctx, "apikeys-refresher", "the API-key cache stops refreshing: revoked keys keep authenticating until the process restarts")
 		runCacheRefresher(ctx)
 	}()
 
@@ -159,7 +155,13 @@ func runCacheRefresher(ctx context.Context) {
 			// previous keys. That is the right failure mode: a transient
 			// MariaDB outage must not revoke every key at once.
 			if err := refreshCache(); err != nil {
-				log.Printf("apikeys: cache refresh failed, keeping previous cache: %v", err)
+				// Coalesced: a MariaDB outage fails every 30s tick the same way.
+				// Degraded, not broken — but a revoked key keeps working for as
+				// long as this lasts, which is why it is not merely debug.
+				telemetry.WarnCoalesced(ctx, "apikeys.cache.refresh.failed", "apikeys.cache.refresh.failed", err, map[string]any{
+					"dependency": "mariadb",
+					"outcome":    "serving the previous key cache; keys revoked since the last good load still authenticate",
+				})
 			}
 		}
 	}

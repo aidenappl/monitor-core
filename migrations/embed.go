@@ -4,11 +4,11 @@ import (
 	"context"
 	"embed"
 	"fmt"
-	"log"
 	"sort"
 	"strings"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 //go:embed *.sql
@@ -113,6 +113,10 @@ func RunMigrations(ctx context.Context) error {
 
 	// Naming the database is the point: it is the one line that tells an operator
 	// which database was migrated, and so whether it is the one being served.
-	log.Printf("clickhouse migrations: applied %d statement(s) across %d file(s) in database %q", total, len(names), db.Database)
+	telemetry.Info(ctx, "clickhouse.migrations.applied", map[string]any{
+		"statements": total,
+		"files":      len(names),
+		"database":   db.Database,
+	})
 	return nil
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/aidenappl/monitor-core/tools"
 )
 
@@ -101,5 +102,6 @@ func HandleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	telemetry.Info(r.Context(), "auth.register.succeeded", map[string]any{"user_id": user.ID, "role": "pending"})
 	responder.New(w, user, "registration successful — your account is pending admin approval")
 }

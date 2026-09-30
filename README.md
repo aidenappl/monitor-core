@@ -127,6 +127,11 @@ curl http://localhost:8080/health
 
 Response:
 
+`status` is `ok`, or `degraded` with a `failing` array naming what this role needs and is
+not getting. The HTTP code stays 200 either way — the container HEALTHCHECK polls this path,
+and restarting the process cannot repair a datastore. `GET /ready` is the endpoint that
+answers 503.
+
 ```json
 {
   "status": "ok",
@@ -137,9 +142,23 @@ Response:
   "mariadb_ok": true,
   "last_flush_at": "2026-09-06T12:00:00Z",
   "role": "both",
-  "zone": "trailblaze"
+  "zone": "trailblaze",
+  "alerting_ok": true,
+  "telemetry": {
+    "shipping": true,
+    "enqueued": 412,
+    "flushed": 410,
+    "dropped": 0,
+    "quarantined": 0,
+    "pending": 0,
+    "last_drop_at": null
+  }
 }
 ```
+
+`telemetry` is monitor-core's **own** telemetry shipper — the events it reports about itself
+to the appleby zone (see [Self-telemetry](#self-telemetry)). `flushed` rising is healthy;
+`pending` rising with `flushed` still means the destination is down; `dropped` is loss.
 
 `/health` is **liveness** — it always returns `200 / "ok"`, even with a store down (the
 container healthcheck points here, and a restart cannot repair ClickHouse). The
@@ -635,6 +654,23 @@ verified. Full details in [AGENTS.md](./AGENTS.md) §6.
 | `MON_ALLOW_REGISTRATION` | `false`       | Gates `POST /auth/register` (self-registration) |
 | `MON_ZONE_SLUG`       | `trailblaze`     | The zone this process **is**. Required on `MON_ROLE=zone`: a data plane that inherits the fallback seeds a second zone under the control plane's name and reports it on `/health`. Slugs are immutable — changing it later seeds a new zone, it does not rename the first |
 | `MON_DEFAULT_PROJECT` | `default`        | Slug of the project seeded inside that zone; every API key binds to it, the env master key stamps events with it, and it is the project the master key and dashboard sessions **read**. Also the only project whose reads still match pre-006 events (see Tenancy). **Not boot-only — do not change it on a running install:** it is read on every request, query, streamed event and error fingerprint, and repointing it hides every event the manual backfill has not stamped |
+| `MON_TELEMETRY_INGEST_URL` | *(none)*   | Where monitor-core reports its **own** errors and activity — the appleby zone's full ingest endpoint. Unset = nothing shipped; warnings and errors still print to stdout |
+| `MON_TELEMETRY_API_KEY` | *(none)*      | Ingest-scope key minted on that zone. ⚠️ Not `MONITOR_API_KEY`, which is this service's own master key |
+| `MON_TELEMETRY_ENV` / `MON_TELEMETRY_ZONE` | `production` / *(none)* | Event env; expected destination zone (`appleby`), asserted at boot, never sent |
+| `MON_TELEMETRY_SPOOL_DIR` | *(none)*    | Durable telemetry spool (a volume) so events survive the destination being down or the process restarting |
+| `MON_TELEMETRY_DEBUG` / `MON_TELEMETRY_STDOUT` | `false` / `false` | Debug events; print every event as NDJSON (local verification) |
+
+### Self-telemetry
+
+Both monitor-core processes — the control plane and `appleby-core` — report their own
+errors, warnings and activity to Monitor's **appleby** zone as service `monitor-core`. The
+`MON_TELEMETRY_*` variables are read from the plain environment, before Keyring, and none of
+them is required: telemetry never blocks or fails the boot. appleby-core reports **into
+itself**, so a successful ingest emits nothing and every self-feeding failure is coalesced to
+one event a minute; warnings and errors always print to stdout, which is the only place the
+appleby zone's own datastore failures are visible while they last. Destination, loop guards,
+level policy and the full event catalogue: [AGENTS.md](./AGENTS.md) §6 *Monitor
+self-telemetry*.
 
 ### Roles — the two planes
 
@@ -817,6 +853,7 @@ monitor-core/
   docker-compose.dev.yml      # Local development stack
   db/
     clickhouse.go             # ClickHouse connection and batch writer (events)
+    observe.go                # ClickHouse chokepoint: query kind + slow-query warning on every call; errors safe to report
     sql.go                    # MariaDB connection (db.SQL), db.Queryable, db.RunMigrations
     migrations/               # MariaDB DDL: identity + tenancy + issues + alert/dashboard config (100_users … 133_service_repos_project)
   env/env.go                  # Environment configuration + RequireProductionSecrets guard
@@ -834,10 +871,11 @@ monitor-core/
     csrf.go                   # Double-submit CSRF (mon-csrf ↔ X-CSRF-Token)
     ingest_auth.go            # X-Api-Key auth for POST /v1/events (env master key OR ingest-scope key)
     query_auth.go             # X-Api-Key (admin) OR Monitor session for /v1/* reads; injects the project (credential-derived for keys, a validated ?project selector for sessions)
-    logging.go header.go      # Request logging (SSE-safe) + Server header
+    logging.go header.go      # One http.request.end event per request + failure recorder + panic recovery (SSE-safe); Server header
     timeout.go                # 25s request-context deadline on /v1 (SSE streams skipped)
     gzip.go                   # gzip for /v1 JSON responses >= 1 KB (SSE, HEAD, POST /v1/api-keys skipped)
-  responder/responder.go      # Standardized JSON response utilities
+  responder/responder.go      # Standardized JSON response utilities (hands a failure's cause to the request event)
+  telemetry/                  # Self-telemetry to the appleby zone — the only importer of go-monitor (see Self-telemetry)
   routes/                     # HTTP handlers (thin) — auth + SSO + events/query/analytics/… (see routes/AGENTS.md)
   services/                   # queue.go batcher.go hub.go query.go analytics.go (ingestion + query engines)
   registry/                   # Tenancy-registry cache (zone + active projects, 30s refresher) — validates a session's ?project selector

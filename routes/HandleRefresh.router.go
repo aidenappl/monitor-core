@@ -4,15 +4,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"log"
 	"net/http"
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/jwt"
+	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
+	gojwt "github.com/golang-jwt/jwt/v5"
 )
 
 // HandleRefresh implements the rotating-refresh-token flow with reuse detection,
@@ -34,9 +36,16 @@ import (
 //     and set fresh cookies.
 //
 // Public + CSRF-exempt (POST /auth/refresh).
+//
+// TELEMETRY: a session that simply ended — no cookie, an expired token — is
+// routine and reported only by the (info) request event. A token that is
+// forged, unknown, reused or belongs to a disabled account is a warning
+// (auth.refresh.failed), and a family that could not be revoked after reuse is
+// an error: the leaked token's siblings are still live.
 func HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	cookie, err := r.Cookie(cookieRefreshToken)
 	if err != nil || cookie.Value == "" {
+		middleware.ExpectedClientError(w)
 		responder.Error(w, http.StatusUnauthorized, "no refresh token")
 		return
 	}
@@ -44,6 +53,11 @@ func HandleRefresh(w http.ResponseWriter, r *http.Request) {
 
 	userID, err := jwt.ValidateRefreshToken(raw)
 	if err != nil {
+		if errors.Is(err, gojwt.ErrTokenExpired) {
+			middleware.ExpectedClientError(w)
+		} else {
+			refreshFailed(w, r, "invalid_token", 0, err)
+		}
 		responder.Error(w, http.StatusUnauthorized, "invalid refresh token")
 		return
 	}
@@ -56,6 +70,7 @@ func HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	if row == nil {
 		// Validly signed but never stored (or already pruned). Treat as invalid.
+		refreshFailed(w, r, "unknown_token", userID, nil)
 		responder.Error(w, http.StatusUnauthorized, "unknown refresh token")
 		return
 	}
@@ -64,15 +79,18 @@ func HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	outcome := classifyRefresh(row, now)
 	switch outcome {
 	case refreshRevoked, refreshReuse:
-		rejectRefreshReuse(w, row, outcome)
+		rejectRefreshReuse(w, r, row, outcome)
 		return
 	case refreshExpired:
+		// A refresh token reaching its own expiry is a session ending normally.
+		middleware.ExpectedClientError(w)
 		responder.Error(w, http.StatusUnauthorized, "refresh token expired")
 		return
 	}
 
 	user, err := query.GetUserByID(db.SQL, userID)
 	if err != nil || user == nil || !user.Active {
+		refreshFailed(w, r, "user_inactive", userID, err)
 		responder.Error(w, http.StatusUnauthorized, "user not found or inactive")
 		return
 	}
@@ -104,6 +122,8 @@ func HandleRefresh(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt: minted.refreshExp,
 		UserAgent: &ua,
 	}); err != nil {
+		// The rotation's own error is what is reported; a rollback failure after
+		// it changes nothing about the outcome.
 		_ = tx.Rollback()
 		if errors.Is(err, query.ErrTokenAlreadyRotated) {
 			// A concurrent rotation spent this token between our read and our
@@ -123,9 +143,10 @@ func HandleRefresh(w http.ResponseWriter, r *http.Request) {
 			case refreshGrace:
 				issueGraceSibling(w, r, fresh, user, minted)
 			case refreshExpired:
+				middleware.ExpectedClientError(w)
 				responder.Error(w, http.StatusUnauthorized, "refresh token expired")
 			default:
-				rejectRefreshReuse(w, fresh, raced)
+				rejectRefreshReuse(w, r, fresh, raced)
 			}
 			return
 		}
@@ -199,26 +220,60 @@ func issueGraceSibling(w http.ResponseWriter, r *http.Request, parent *structs.R
 		return
 	}
 	if current == nil || current.RevokedAt != nil {
-		rejectRefreshReuse(w, parent, refreshRevoked)
+		rejectRefreshReuse(w, r, parent, refreshRevoked)
 		return
 	}
 
-	log.Printf("MON_REFRESH_GRACE: refresh token re-presented within %s of rotation; issued sibling (outcome=%s user_id=%d family_id=%x)",
-		refreshGraceWindow, refreshGrace, user.ID, parent.FamilyID)
+	// Info, not a warning: this is the grace window doing its job — a concurrent
+	// tab or a retried lost response, answered with a sibling instead of a
+	// logout. It is worth seeing, because a rate that climbs means clients are
+	// racing far more than expected.
+	telemetry.Info(r.Context(), "auth.refresh.grace.sibling", map[string]any{
+		"user_id":        user.ID,
+		"grace_window_s": int(refreshGraceWindow / time.Second),
+		"outcome":        "issued a sibling in the same family; no row was touched",
+	})
 
 	writeAuthCookies(w, minted.access, minted.refresh, minted.accessExp, minted.refreshExp)
 	responder.New(w, user, "token refreshed")
 }
 
 // rejectRefreshReuse is the reuse-detection response: revoke the whole family,
-// clear the client's cookies, and reject. outcome (reuse or revoked) is logged so
-// an operator can tell a replayed token from a presentation after logout.
-func rejectRefreshReuse(w http.ResponseWriter, row *structs.RefreshToken, outcome refreshOutcome) {
-	log.Printf("MON_REFRESH_REJECT: revoking refresh family (outcome=%s user_id=%d family_id=%x)",
-		outcome, row.UserID, row.FamilyID)
+// clear the client's cookies, and reject. The outcome (reuse or revoked) is the
+// reported reason, so an operator can tell a replayed token from a presentation
+// after logout.
+func rejectRefreshReuse(w http.ResponseWriter, r *http.Request, row *structs.RefreshToken, outcome refreshOutcome) {
+	refreshFailed(w, r, "reuse_detected_"+outcome.String(), row.UserID, nil)
 	if revErr := query.RevokeFamily(db.SQL, row.FamilyID); revErr != nil {
-		log.Printf("HandleRefresh: failed to revoke family (outcome=%s): %v", outcome, revErr)
+		reportFamilyNotRevoked(r, row.UserID, outcome.String(), revErr)
 	}
 	clearTokenCookies(w)
 	responder.Error(w, http.StatusUnauthorized, "refresh token reuse detected")
+}
+
+// refreshFailed reports a refused refresh that is NOT a session ending normally.
+// Coalesced per client IP and reason; the request event drops to info.
+func refreshFailed(w http.ResponseWriter, r *http.Request, reason string, userID int64, err error) {
+	middleware.ExpectedClientError(w)
+	clientIP := middleware.GetClientIPFromContext(r.Context())
+	data := map[string]any{
+		"reason":    reason,
+		"client_ip": clientIP,
+		"outcome":   "returned 401",
+	}
+	if userID != 0 {
+		data["user_id"] = userID
+	}
+	telemetry.WarnCoalesced(r.Context(), "auth.refresh.failed:"+reason+":"+clientIP, "auth.refresh.failed", err, data)
+}
+
+// reportFamilyNotRevoked is the one refresh failure that is an error: reuse was
+// detected, and the family it proves compromised is still valid.
+func reportFamilyNotRevoked(r *http.Request, userID int64, reason string, err error) {
+	telemetry.Error(r.Context(), "auth.refresh.revoke.failed", err, map[string]any{
+		"user_id":    userID,
+		"reason":     reason,
+		"dependency": "mariadb",
+		"outcome":    "the compromised refresh-token family was NOT revoked; its other tokens remain valid until they expire",
+	})
 }

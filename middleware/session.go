@@ -129,6 +129,7 @@ func SessionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if token := extractBearerToken(r); token != "" {
 			if user := validateSessionTokenCtx(r.Context(), token); user != nil {
+				SetUser(w, user.ID)
 				next.ServeHTTP(w, r.WithContext(withUser(r.Context(), user)))
 				return
 			}
@@ -136,11 +137,16 @@ func SessionMiddleware(next http.Handler) http.Handler {
 
 		if cookie, err := r.Cookie("mon-access-token"); err == nil && cookie.Value != "" {
 			if user := validateSessionTokenCtx(r.Context(), cookie.Value); user != nil {
+				SetUser(w, user.ID)
 				next.ServeHTTP(w, r.WithContext(withUser(r.Context(), user)))
 				return
 			}
 		}
 
+		// Routine, not a warning: the 15-minute access token expiring is how
+		// every session reaches its next refresh, and a logged-out browser
+		// polling an API looks the same. Recorded by the (info) request event.
+		ExpectedClientError(w)
 		responder.Error(w, http.StatusUnauthorized, "authentication required")
 	})
 }

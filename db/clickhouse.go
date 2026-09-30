@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"fmt"
-	"log"
 	"regexp"
 	"strings"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 // Conn is the global ClickHouse connection
@@ -89,20 +89,31 @@ func Connect(ctx context.Context, addr, database, username, password string, max
 			ConnMaxLifetime: time.Hour,
 		})
 		if err != nil {
-			log.Printf("attempt %d: failed to open clickhouse connection: %v", attempt, err)
+			telemetry.WarnErr(ctx, "clickhouse.connect.retrying", err, map[string]any{
+				"addr": addr, "database": database, "stage": "open",
+				"attempt": attempt, "max_attempts": 10,
+				"outcome": fmt.Sprintf("retrying in %ds", attempt),
+			})
 			time.Sleep(time.Duration(attempt) * time.Second)
 			continue
 		}
 
 		if err = conn.Ping(ctx); err != nil {
-			log.Printf("attempt %d: failed to ping clickhouse: %v", attempt, err)
+			telemetry.WarnErr(ctx, "clickhouse.connect.retrying", err, map[string]any{
+				"addr": addr, "database": database, "stage": "ping",
+				"attempt": attempt, "max_attempts": 10,
+				"outcome": fmt.Sprintf("retrying in %ds", attempt),
+			})
 			time.Sleep(time.Duration(attempt) * time.Second)
 			continue
 		}
 
-		// Success
-		log.Printf("connected to ClickHouse at %s", addr)
-		Conn = conn
+		// Success. Every read and exec from here on goes through observedConn,
+		// which gives a failure its query kind and reports slow calls.
+		telemetry.Info(ctx, "clickhouse.connect.succeeded", map[string]any{
+			"addr": addr, "database": database, "attempts": attempt,
+		})
+		Conn = observedConn{Conn: conn}
 		Database = database
 		return nil
 	}
@@ -165,23 +176,31 @@ func WriteBatch(ctx context.Context, events []*structs.Event) error {
 		return nil
 	}
 
+	// Failures carry a QueryError so the batcher's event says how long the write
+	// ran and what ClickHouse answered — with any quoted literal elided, since an
+	// insert error can quote a tenant's row.
+	start := time.Now()
+	insertError := func(stage string, err error) error {
+		return &QueryError{Kind: "db.WriteBatch", Duration: time.Since(start), Err: fmt.Errorf("%s: %w", stage, err)}
+	}
+
 	batch, err := Conn.PrepareBatch(ctx, fmt.Sprintf(
 		"INSERT INTO %s.events (%s)",
 		Database,
 		strings.Join(eventInsertColumns, ", "),
 	))
 	if err != nil {
-		return fmt.Errorf("failed to prepare batch: %w", err)
+		return insertError("failed to prepare batch", err)
 	}
 
 	for _, event := range events {
 		if err := batch.Append(eventInsertRow(event)...); err != nil {
-			return fmt.Errorf("failed to append event to batch: %w", err)
+			return insertError("failed to append event to batch", err)
 		}
 	}
 
 	if err := batch.Send(); err != nil {
-		return fmt.Errorf("failed to send batch: %w", err)
+		return insertError("failed to send batch", err)
 	}
 
 	return nil

@@ -2,7 +2,6 @@ package responder
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"strings"
 )
@@ -78,24 +77,62 @@ func New(w http.ResponseWriter, data interface{}, message ...string) {
 }
 
 func Error(w http.ResponseWriter, statusCode int, message string) {
-	writeError(w, statusCode, message, statusCode)
+	writeError(w, statusCode, message, statusCode, nil, nil)
 }
 
 // ErrorWithCode is Error with an explicit application error_code (distinct from
 // the HTTP status). Used for codes the web clients route on — e.g. 4003
 // (forbidden → /unauthorized) and 4004 (pending → /pending).
 func ErrorWithCode(w http.ResponseWriter, statusCode int, message string, errorCode int) {
-	writeError(w, statusCode, message, errorCode)
+	writeError(w, statusCode, message, errorCode, nil, nil)
 }
 
-func ErrorWithCause(w http.ResponseWriter, statusCode int, message string, err error) {
-	log.Printf("[%d] %s: %v", statusCode, message, err)
-	writeError(w, statusCode, message, statusCode)
+// ErrorWithCause is Error with the underlying error, which goes to the request's
+// Monitor event (never to the client). fields is optional context for that event
+// — the ids and dependency detail a 5xx needs to be diagnosed without being
+// reproduced (a rule id, a channel type, a query kind).
+//
+// The handler must NOT report the same failure itself: this is already its one
+// event.
+func ErrorWithCause(w http.ResponseWriter, statusCode int, message string, err error, fields ...map[string]any) {
+	var merged map[string]any
+	for _, f := range fields {
+		if merged == nil {
+			merged = make(map[string]any, len(f))
+		}
+		for k, v := range f {
+			merged[k] = v
+		}
+	}
+	writeError(w, statusCode, message, statusCode, err, merged)
 }
 
-func writeError(w http.ResponseWriter, statusCode int, message string, errorCode int) {
+// failureRecorder is implemented by the request middleware's response writer.
+// Handing it the reason a request failed puts that reason on the request's
+// Monitor event, where it is grouped into an issue by route and cause. It is an
+// interface, not an import, so responder stays a leaf package.
+type failureRecorder interface {
+	RecordFailure(status int, message string, err error, code int, fields map[string]any)
+}
+
+// recordFailure finds the failureRecorder under any wrapping writers.
+func recordFailure(w http.ResponseWriter, status int, message string, err error, code int, fields map[string]any) {
+	for w != nil {
+		if fr, ok := w.(failureRecorder); ok {
+			fr.RecordFailure(status, message, err, code, fields)
+			return
+		}
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return
+		}
+		w = u.Unwrap()
+	}
+}
+
+func writeError(w http.ResponseWriter, statusCode int, message string, errorCode int, cause error, fields map[string]any) {
 	msg := strings.ToLower(message)
-	log.Printf("[%d] %s (code %d)", statusCode, msg, errorCode)
+	recordFailure(w, statusCode, msg, cause, errorCode, fields)
 
 	response := Response{
 		Success:      false,
@@ -108,5 +145,7 @@ func writeError(w http.ResponseWriter, statusCode int, message string, errorCode
 
 	w.Header().Set("Content-Type", ContentTypeJSON)
 	w.WriteHeader(statusCode)
-	json.NewEncoder(w).Encode(response)
+	// The status is already sent; an encode failure here means the client went
+	// away, and there is nothing left to tell it.
+	_ = json.NewEncoder(w).Encode(response)
 }

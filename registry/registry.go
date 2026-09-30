@@ -29,7 +29,6 @@ package registry
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +37,7 @@ import (
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 // CACHE_REFRESH_INTERVAL is how often the registry is re-read from MariaDB, and
@@ -114,11 +114,7 @@ func Init(ctx context.Context) error {
 	err := refreshCache()
 
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("PANIC in registry cache refresher: %v", r)
-			}
-		}()
+		defer telemetry.Recover(ctx, "registry-refresher", "the registry cache stops refreshing: project changes are not seen until the process restarts")
 		runCacheRefresher(ctx)
 	}()
 
@@ -148,7 +144,11 @@ func runCacheRefresher(ctx context.Context) {
 			// MariaDB outage must not make every project unselectable at once
 			// and blank the dashboard for everyone holding a project in their URL.
 			if err := refreshCache(); err != nil {
-				log.Printf("registry: cache refresh failed, keeping previous cache: %v", err)
+				// Coalesced: a MariaDB outage fails every 30s tick the same way.
+				telemetry.WarnCoalesced(ctx, "registry.cache.refresh.failed", "registry.cache.refresh.failed", err, map[string]any{
+					"dependency": "mariadb",
+					"outcome":    "serving the previous registry snapshot",
+				})
 			}
 		}
 	}

@@ -1,14 +1,16 @@
 package routes
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"time"
 
+	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/services"
+	"github.com/aidenappl/monitor-core/telemetry"
 )
 
 // EventHub is the global SSE hub (set from main.go)
@@ -53,21 +55,29 @@ func subscriptionFilters(r *http.Request) (map[string]string, bool) {
 }
 
 // StreamEventsHandler handles GET /v1/events/stream (SSE)
+//
+// TELEMETRY. The connection's request event fires when it closes, carrying how
+// long it was held. Connect and disconnect are debug. A failed write or a
+// subscriber too slow to keep up is a warning, coalesced — the event is about
+// this stream, but the write loop runs per event.
 func StreamEventsHandler(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		middleware.RecordFailure(w, http.StatusInternalServerError, "streaming not supported", nil, map[string]any{"stream": "events", "reason": "writer_cannot_flush"})
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
 
 	filters, ok := subscriptionFilters(r)
 	if !ok {
+		middleware.RecordFailure(w, http.StatusInternalServerError, "no project resolved for this request", nil, map[string]any{"stream": "events", "reason": "no_project"})
 		http.Error(w, "no project resolved for this request", http.StatusInternalServerError)
 		return
 	}
 
 	sub := EventHub.Subscribe(filters)
 	if sub == nil {
+		middleware.RecordFailure(w, http.StatusServiceUnavailable, "too many concurrent subscribers", nil, map[string]any{"stream": "events", "reason": "max_subscribers"})
 		http.Error(w, "too many concurrent subscribers", http.StatusServiceUnavailable)
 		return
 	}
@@ -82,25 +92,55 @@ func StreamEventsHandler(w http.ResponseWriter, r *http.Request) {
 	// Clear the server's WriteTimeout for this connection so the SSE stream is
 	// not severed after WriteTimeout (30s in main.go). Relies on the logging
 	// middleware exposing Unwrap() so the controller can reach the raw conn.
+	// An error here means the writer cannot take deadlines at all, in which case
+	// the stream simply keeps the server's — nothing to report per connection.
 	rc := http.NewResponseController(w)
 	_ = rc.SetWriteDeadline(time.Time{})
 
 	flusher.Flush()
 
-	log.Printf("SSE subscriber connected: %s (filters: %v)", sub.ID, filters)
+	ctx := r.Context()
+	telemetry.Debug(ctx, "stream.subscriber.connected", map[string]any{
+		"stream":        "events",
+		"subscriber_id": sub.ID,
+		"project":       filters["project"],
+		"filters":       len(filters) - 1,
+	})
 
 	keepalive := time.NewTicker(15 * time.Second)
 	defer keepalive.Stop()
 
-	ctx := r.Context()
+	started := time.Now()
+	sent := 0
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("SSE subscriber disconnected: %s", sub.ID)
+			telemetry.Debug(ctx, "stream.subscriber.disconnected", map[string]any{
+				"stream":        "events",
+				"subscriber_id": sub.ID,
+				"events_sent":   sent,
+				"duration_ms":   time.Since(started).Milliseconds(),
+			})
+			return
+		case <-Draining():
+			// Shutdown has begun. Ending here is what lets Shutdown return
+			// instead of waiting out its timeout on a stream that never ends;
+			// see routes/draining.go. The client reconnects to the new process.
+			telemetry.Debug(ctx, "stream.subscriber.disconnected", map[string]any{
+				"stream":        "events",
+				"subscriber_id": sub.ID,
+				"events_sent":   sent,
+				"duration_ms":   time.Since(started).Milliseconds(),
+				"reason":        "server_draining",
+			})
 			return
 		case <-keepalive.C:
-			rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			fmt.Fprintf(w, ": keepalive\n\n")
+			reportLaggingSubscriber(ctx, "events", filters["project"], sub.TakeDropped(), services.SUBSCRIBER_BUFFER)
+			_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			if _, err := fmt.Fprintf(w, ": keepalive\n\n"); err != nil {
+				reportStreamWriteFailure(ctx, "events", sent, err)
+				return
+			}
 			flusher.Flush()
 		case event, ok := <-sub.Events:
 			if !ok {
@@ -108,11 +148,46 @@ func StreamEventsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			data, err := json.Marshal(event)
 			if err != nil {
+				telemetry.WarnCoalesced(ctx, "stream.event.encode.failed", "stream.event.encode.failed", err, map[string]any{
+					"stream":  "events",
+					"outcome": "one event was skipped for this subscriber",
+				})
 				continue
 			}
-			rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				reportStreamWriteFailure(ctx, "events", sent, err)
+				return
+			}
 			flusher.Flush()
+			sent++
 		}
 	}
+}
+
+// reportStreamWriteFailure records a live stream that could not be written to —
+// almost always a client that went away without closing cleanly, occasionally a
+// proxy cutting an idle connection. The stream ends.
+func reportStreamWriteFailure(ctx context.Context, stream string, sent int, err error) {
+	telemetry.WarnCoalesced(ctx, "stream.write.failed:"+stream, "stream.write.failed", err, map[string]any{
+		"stream":      stream,
+		"events_sent": sent,
+		"outcome":     "stream closed",
+	})
+}
+
+// reportLaggingSubscriber records events skipped for a subscriber that read too
+// slowly to keep up with its buffer. Checked on the keepalive tick, not per
+// event: the skip itself happens on the ingest hot path, which only counts it.
+func reportLaggingSubscriber(ctx context.Context, stream, project string, dropped int64, buffer int) {
+	if dropped == 0 {
+		return
+	}
+	telemetry.WarnCoalesced(ctx, "stream.subscriber.lagging:"+stream, "stream.subscriber.lagging", nil, map[string]any{
+		"stream":  stream,
+		"project": project,
+		"dropped": dropped,
+		"buffer":  buffer,
+		"outcome": "events were skipped for this subscriber; the stream stays open",
+	})
 }

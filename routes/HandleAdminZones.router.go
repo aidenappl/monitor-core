@@ -13,6 +13,7 @@ import (
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
 	"github.com/aidenappl/monitor-core/structs"
+	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/aidenappl/monitor-core/tools"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
@@ -193,6 +194,7 @@ func HandleCreateZone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	telemetry.Info(r.Context(), "tenancy.zone.created", map[string]any{"zone": zone.Slug, "zone_id": zone.ID, "via": "admin"})
 	responder.New(w, zone, "zone created")
 }
 
@@ -289,6 +291,11 @@ func HandleUpdateZone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	telemetry.Info(r.Context(), "tenancy.zone.updated", map[string]any{
+		"zone":           existing.Slug,
+		"zone_id":        id,
+		"endpoints_edit": body.IngestURL != nil || body.QueryURL != nil,
+	})
 	responder.New(w, zone, "zone updated")
 }
 
@@ -312,7 +319,43 @@ func HandleRetireZone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	telemetry.Info(r.Context(), "tenancy.zone.retired", map[string]any{"zone": zone.Slug, "zone_id": id})
 	responder.New(w, zone, "zone retired")
+}
+
+// reportProbeTransition reports a probe verdict ON A STATE CHANGE ONLY — the
+// request's own event already records every probe, and a verdict repeated on
+// every click is noise. Compared against the verdict the row held BEFORE this
+// probe was recorded.
+//
+// A zone becoming unhealthy — unreachable, mismatched, degraded, unverified — is a
+// warning carrying the whole verdict. For the appleby zone this probe (and the
+// zone's own stdout) is the only place its datastore failures show while they
+// last: its self-telemetry is exactly what such a failure drops. A return to
+// healthy from any unhealthy state is info. The very first probe of a zone that
+// is healthy says nothing new and emits nothing.
+func reportProbeTransition(r *http.Request, zone *structs.Zone, result probe.Result) {
+	previous := zone.Reachability
+	if previous == result.Reachability {
+		return
+	}
+	data := map[string]any{
+		"zone":          zone.Slug,
+		"zone_id":       zone.ID,
+		"reachability":  string(result.Reachability),
+		"previous":      string(previous),
+		"detail":        result.Detail,
+		"reported_zone": result.ReportedZone,
+	}
+	if result.Reachability == structs.ZoneReachabilityHealthy {
+		if previous == "" || previous == structs.ZoneReachabilityUnknown {
+			return
+		}
+		telemetry.Info(r.Context(), "zone.probe.recovered", data)
+		return
+	}
+	data["outcome"] = "reads routed to this zone may fail or return another tenant's data until it is healthy again"
+	telemetry.Warn(r.Context(), "zone.probe.unhealthy", data)
 }
 
 // probeZoneResponse is what POST /admin/zones/{id}/probe returns: the verdict,
@@ -377,6 +420,8 @@ func HandleProbeZone(w http.ResponseWriter, r *http.Request) {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to record the probe result", err)
 		return
 	}
+
+	reportProbeTransition(r, zone, result)
 
 	// Re-read so the caller gets the row as it now stands, last_probe_at included —
 	// the field that makes the reachability readable rather than an undated claim.

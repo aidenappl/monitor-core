@@ -2,6 +2,7 @@ package alerts
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aidenappl/monitor-core/scope"
@@ -32,6 +33,20 @@ type AlertSubscriber struct {
 	// routes/stream.go states for the event stream.
 	Project string
 	Events  chan *AlertEvent
+
+	// dropped counts alert events skipped because Events was full. Publish only
+	// bumps it; the stream handler reports it.
+	dropped atomic.Int64
+}
+
+// ALERT_SUBSCRIBER_BUFFER is how many alert events a subscriber may fall behind
+// by before events are skipped for it.
+const ALERT_SUBSCRIBER_BUFFER = 64
+
+// TakeDropped returns the alert events skipped since the last call, and resets
+// the count.
+func (s *AlertSubscriber) TakeDropped() int64 {
+	return s.dropped.Swap(0)
 }
 
 // AlertHub is a fan-out pub/sub hub for alert state changes
@@ -73,7 +88,7 @@ func (h *AlertHub) Subscribe(project string) *AlertSubscriber {
 	sub := &AlertSubscriber{
 		ID:      uuid.New().String(),
 		Project: project,
-		Events:  make(chan *AlertEvent, 64),
+		Events:  make(chan *AlertEvent, ALERT_SUBSCRIBER_BUFFER),
 	}
 	h.subscribers[sub.ID] = sub
 	return sub
@@ -107,6 +122,7 @@ func (h *AlertHub) Publish(event *AlertEvent) {
 		select {
 		case sub.Events <- event:
 		default:
+			sub.dropped.Add(1)
 		}
 	}
 }
