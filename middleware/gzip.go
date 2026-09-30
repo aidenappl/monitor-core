@@ -63,11 +63,16 @@ func isStreamPath(path string) bool {
 // Vary: Accept-Encoding so no cache can hand the gzip variant to a client that
 // did not ask for it.
 //
-// The wrapper implements http.Flusher and Unwrap(). Unwrap is load-bearing:
-// routes/stream.go and routes/alerts.go clear the server's 30s WriteTimeout with
-// http.NewResponseController(w).SetWriteDeadline and DISCARD the error, so a
-// wrapper that hid the real writer would leave the deadline armed with nothing
-// to say so.
+// The wrapper implements http.Flusher and Unwrap(). Unwrap is load-bearing
+// twice over. The responder's failure recorder and middleware.RecordFailure /
+// Annotate / ExpectedClientError find the request event's writer
+// (statusResponseWriter, logging.go) by walking Unwrap, so without it every /v1
+// failure's cause would silently drop off its http.request.end event. And
+// http.NewResponseController walks it to reach the connection: a handler that
+// clears the server's 30s WriteTimeout with SetWriteDeadline, as
+// routes/stream.go and routes/alerts.go do (those two are skipped by path and
+// never see this wrapper), discards the error, so a wrapper that hid the real
+// writer would leave the deadline armed with nothing to say so.
 func GzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !gzipRequestEligible(r) {
@@ -77,9 +82,12 @@ func GzipMiddleware(next http.Handler) http.Handler {
 
 		gw := &gzipResponseWriter{ResponseWriter: w}
 		next.ServeHTTP(gw, r)
-		// Deliberately not deferred: if the handler panics, net/http aborts the
-		// connection, and finishing a half-written response here would dress a
-		// crash up as a complete 200.
+		// Deliberately not deferred. A panic unwinds past this to
+		// RecoverMiddleware (root router, outside /v1), which writes the 500 to
+		// the writer beneath this one. Finishing here first would send a
+		// buffered sub-threshold body as a 200 ahead of that 500, or write the
+		// gzip trailer that lets a half-written compressed body decode as a
+		// complete response.
 		gw.finish()
 	})
 }

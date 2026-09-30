@@ -9,6 +9,12 @@ import (
 	"github.com/gorilla/mux"
 )
 
+// v1RequestTimeout is the deadline RequestTimeout puts on every non-streaming
+// /v1 request. It is always middleware.REQUEST_TIMEOUT outside tests; it is a
+// variable only so router tests can prove cancellation through the real stack
+// without waiting 25 seconds.
+var v1RequestTimeout = middleware.REQUEST_TIMEOUT
+
 // buildRouter constructs the HTTP surface for one role.
 //
 // ROUTE REGISTRATION IS THE GATE — not a check inside the handler, and not a
@@ -191,7 +197,7 @@ func buildRouter(role env.Role) *mux.Router {
 	// ClickHouse query is cancelled while there is still time to answer; gzip
 	// compresses only application/json bodies of 1 KB or more. See
 	// middleware/timeout.go and middleware/gzip.go for the full rule sets.
-	v1.Use(middleware.RequestTimeout(middleware.REQUEST_TIMEOUT))
+	v1.Use(middleware.RequestTimeout(v1RequestTimeout))
 	v1.Use(middleware.GzipMiddleware)
 
 	// Tenancy registry reads. These are what the project switcher in monitor-web

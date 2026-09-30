@@ -1840,7 +1840,8 @@ listener, which is not up yet at boot and is gone near the end of a stop.
 
 **The request event.** One `http.request.end` per request: `method`, `path` (the mux
 template — issues group by it), `request_path`, `status_code`, `duration_ms`,
-`response_bytes`, `client_ip`, `user_agent`, `user_id` once authenticated, and annotations
+`response_bytes` (as sent — the compressed size when `/v1` gzips), `client_ip`, `user_agent`,
+`user_id` once authenticated, and annotations
 (`auth`, `project`, `key_id`). 5xx is error, 4xx warn, else info. The cause arrives through
 the failure recorder (`responder.writeError` → `RecordFailure`): `error_message`, `error`,
 `error_type`, `error_code`, the handler's fields and — for a 5xx — the stack inside the
@@ -2353,7 +2354,13 @@ are listed in §4.
   Moving either onto the root router would wrap `/auth/*` and the SSO icon (which sets its own
   `Content-Length`); `router_http_test.go` fails if that happens. Any wrapper added around the
   `ResponseWriter` must implement `Flush` and `Unwrap` — the SSE handlers clear `WriteTimeout`
-  through `http.ResponseController` and discard the error.
+  through `http.ResponseController` and discard the error, and the responder's failure recorder
+  (and `middleware.RecordFailure`/`Annotate`/`ExpectedClientError`) reach the request event's
+  writer only by walking `Unwrap`, so a wrapper without it silently strips the cause off every
+  `http.request.end` beneath it. `router_stack_test.go` drives the combined stack
+  (RequestID → Logging → Recover → … → QueryAuth → RequestTimeout → Gzip) through
+  `buildRouter` and pins how the layers compose; `v1RequestTimeout` (router.go) exists only so
+  it can inject a short deadline.
 - **Keep `/health` returning 200.** It is liveness, the container HEALTHCHECK points at it,
   and a dependency verdict belongs in `/ready` (§5).
 - **Never create a table from an `Init()`.** Eight tables in this repo were created by
