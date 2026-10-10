@@ -20,6 +20,7 @@ func issueRouter() *mux.Router {
 	v1 := r.PathPrefix("/v1").Subrouter()
 
 	v1.HandleFunc("/issues", HandleListIssues).Methods(http.MethodGet)
+	v1.HandleFunc("/issues/bulk", HandleBulkUpdateIssues).Methods(http.MethodPost)
 	v1.HandleFunc("/issues/{id}", HandleGetIssue).Methods(http.MethodGet)
 	v1.HandleFunc("/issues/{id}", HandleUpdateIssue).Methods(http.MethodPut)
 	v1.HandleFunc("/issues/{id}/events", HandleGetIssueEvents).Methods(http.MethodGet)
@@ -49,6 +50,7 @@ func TestIssueRoutesAreMounted(t *testing.T) {
 		path   string
 	}{
 		{http.MethodGet, "/v1/issues"},
+		{http.MethodPost, "/v1/issues/bulk"},
 		{http.MethodGet, "/v1/issues/abc"},
 		{http.MethodPut, "/v1/issues/abc"},
 		{http.MethodGet, "/v1/issues/abc/events"},

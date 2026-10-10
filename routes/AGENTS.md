@@ -23,7 +23,8 @@ service layer the repo's rules say not to build.
 | `dashboards.go` | `GET/POST /v1/dashboards`, `GET/PUT/DELETE /v1/dashboards/{id}` — straight to `query.*` since migration 123 moved the table to MariaDB; the `dashboards` package is now empty |
 | `views.go` | `GET/POST /v1/views`, `DELETE /v1/views/{id}` — straight to `query.*` since migration 124; the `views` package is now empty |
 | `alerts.go` | alert-rules, alert-history, notification-channels, service-groups, notification-policies CRUD + `/v1/alerts/stream` (SSE). **Two layers on purpose:** `query.*` for the pure-MariaDB CRUD (migrations 119-122), `alerts.*` only for the operations that span both stores — `ListRules`/`GetRule`/`DeleteRule`, which join or remove a MariaDB rule alongside its ClickHouse `alert_states` row, plus `ListHistory`, which is ClickHouse-only |
-| `issues.go` | `GET /v1/issues`, `GET/PUT /v1/issues/{id}`, `GET /v1/issues/{id}/events` + `requireProject` |
+| `issues.go` | `GET /v1/issues`, `GET/PUT /v1/issues/{id}`, `GET /v1/issues/{id}/events` + `requireProject` and `parseIssueFilters` (the list filter parser, shared with bulk) |
+| `issues_bulk.go` | `POST /v1/issues/bulk` — status change over `ids` or a list `filter`; see `issues/AGENTS.md` |
 | `issue_timeline.go` | `GET /v1/issues/{id}/timeline`, `/history`, the three `comments` verbs and the three `links` verbs — all behind `requireIssue` |
 | `service_repos.go` | `GET /v1/service-repos`, `GET/PUT/DELETE /v1/service-repos/{service}` |
 | `HandleListZones.router.go` | `GET /v1/zones` (active zones, or all with `?include_deleted=true`) + `registryListPage` and `registryIncludeDeleted`, the query parsers both registry routes share |

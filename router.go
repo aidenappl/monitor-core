@@ -303,6 +303,7 @@ func buildRouter(role env.Role) *mux.Router {
 		// panic on a nil db.Conn; and issues are zone-owned by decision, so an app
 		// process has no issue rows to serve even for the routes that would run.
 		v1.HandleFunc("/issues", routes.HandleListIssues).Methods(http.MethodGet)
+		v1.HandleFunc("/issues/bulk", routes.HandleBulkUpdateIssues).Methods(http.MethodPost)
 		v1.HandleFunc("/issues/{id}", routes.HandleGetIssue).Methods(http.MethodGet)
 		v1.HandleFunc("/issues/{id}", routes.HandleUpdateIssue).Methods(http.MethodPut)
 		v1.HandleFunc("/issues/{id}/events", routes.HandleGetIssueEvents).Methods(http.MethodGet)

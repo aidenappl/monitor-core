@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,7 +29,13 @@ import (
 // value — `assignee=0` must not silently mean "unassigned", and `service=` must
 // not filter to the empty string.
 func issueQueryParams(r *http.Request) (query.ListIssuesRequest, error) {
-	q := r.URL.Query()
+	return parseIssueFilters(r.URL.Query())
+}
+
+// parseIssueFilters is issueQueryParams over plain values, so the bulk endpoint's
+// JSON filter selects through exactly the same parsing — and the same
+// validation — as the list it was copied from.
+func parseIssueFilters(q url.Values) (query.ListIssuesRequest, error) {
 	req := query.ListIssuesRequest{
 		Sort:       query.IssueSort(q.Get("sort")),
 		Descending: !strings.EqualFold(q.Get("order"), "asc"),

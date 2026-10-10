@@ -147,6 +147,7 @@ var deployedSurface = []string{
 	"POST /v1/dashboards",
 	"POST /v1/events",
 	"POST /v1/gauge",
+	"POST /v1/issues/bulk",
 	"POST /v1/issues/{id}/comments",
 	"POST /v1/issues/{id}/links",
 	"POST /v1/notification-channels",

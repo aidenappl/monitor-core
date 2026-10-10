@@ -655,6 +655,7 @@ POST   /admin/projects/{id}/retire          soft-delete                         
 POST   /webhooks/github                     GitHub pull_request deliveries        [public — HMAC signature IS the auth]
 GET    /v1/issues?status=&service=&assignee=&has_pr=&q=&from=&to=&sort=&order=&history=  filtered list  [QueryAuthMiddleware]
 GET    /v1/issues/{id}                      verbose detail (+links, assignee, repo, history)  [QueryAuthMiddleware]
+POST   /v1/issues/bulk                      one status over ids or a list filter  [QueryAuthMiddleware]
 PUT    /v1/issues/{id}                      status / priority / title / assignee  [QueryAuthMiddleware]
 GET    /v1/issues/{id}/timeline             the activity feed, oldest first       [QueryAuthMiddleware]
 GET    /v1/issues/{id}/history              per-day occurrence sparkline          [QueryAuthMiddleware]
