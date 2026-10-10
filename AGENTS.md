@@ -1971,7 +1971,9 @@ are listed in §4.
   stays active. When a run looks green but nothing changed, compare each zone's `/version` with
   the pushed commit and read the automation's run history (`lattice_list_automation_runs`,
   automation 1): every firing is a row, skipped ones included, with the failing step named.
-- Do **not** deploy by hand from here (repo guardrails).
+- Deploys go through CI, not by hand from here. A push/merge that triggers one happens **only after
+  asking Aiden and getting an explicit yes** (see `~/CLAUDE.md` *Ask-first actions*); verify it
+  landed afterward using the signals above.
 
 - **⚠️ CUTOVER DEPLOY — migrations 119-124 (one-time, THE ORDER MATTERS).**
 
