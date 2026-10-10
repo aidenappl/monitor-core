@@ -30,6 +30,15 @@ var (
 	numberRegex = regexp.MustCompile(`\b\d+\b`)
 	urlRegex    = regexp.MustCompile(`https?://[^\s]+`)
 
+	// durationRegex matches a duration written with its unit glued to the digits —
+	// Go's time.Duration form ("20h5m20.340868643s", "150ms") and the protobuf
+	// JSON form ("72320s"). numberRegex cannot see these: \b\d+\b needs a word
+	// boundary after the digits, and there is none between "20" and "h". So a
+	// countdown like "Please retry in 20h5m20s" survived normalization, every
+	// occurrence carried a different one, and each became its own issue — the
+	// Gemini quota failure filed 839 single-occurrence issues in one night.
+	durationRegex = regexp.MustCompile(`\b(?:\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h|d))+\b`)
+
 	// statusCodeSuffix matches text ending in an HTTP status-code introducer, e.g.
 	// "...returned status " or "...with code ". Used to look BEHIND a numeric match
 	// (RE2 has no lookbehind) so status codes survive normalization — see
@@ -582,6 +591,9 @@ func normalizeMessage(message string) string {
 	message = hexRegex.ReplaceAllString(message, "<HEX>")
 	// Strip URLs
 	message = urlRegex.ReplaceAllString(message, "<URL>")
+	// Strip durations — before numbers, which would otherwise eat their digits
+	// piecemeal and leave a different shape per unit combination.
+	message = durationRegex.ReplaceAllString(message, "<DUR>")
 	// Strip numbers — except HTTP status codes, which are a failure CLASS, not an
 	// incidental identifier.
 	message = replaceNumbersPreservingStatusCodes(message)

@@ -282,3 +282,49 @@ func TestIssueNamespaceIsFrozen(t *testing.T) {
 		t.Fatalf("issueNamespace = %q, want %q — changing it orphans every existing issue", got, want)
 	}
 }
+
+func TestNormalizeMessage_Durations(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"go duration", "Please retry in 20h5m20.340868643s.", "Please retry in <DUR>."},
+		{"protobuf seconds", `"retryDelay": "72320s"`, `"retryDelay": "<DUR>"`},
+		{"milliseconds", "timed out after 150ms", "timed out after <DUR>"},
+		{"days", "token expires in 2d", "token expires in <DUR>"},
+		{"hex-like token is not a duration", "chunk 1d4f missing", "chunk 1d4f missing"},
+		{"word with a unit letter is not a duration", "md5 mismatch", "md5 mismatch"},
+		{"plain number still collapses", "failed after 3 retries", "failed after <N> retries"},
+		{"status code still survives", "status 429 retry in 5s", "status 429 retry in <DUR>"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeMessage(tt.in); got != tt.want {
+				t.Errorf("normalizeMessage(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// Regression: Gemini's quota error embeds a live countdown twice, so every
+// occurrence fingerprinted differently and one failure became 839 issues.
+func TestNormalizeMessage_GeminiQuotaCountdownGroups(t *testing.T) {
+	msg := func(countdown, delay string) string {
+		return `gemini combined call failed: api error after retry (429): {"error": {"code": 429, ` +
+			`"message": "Quota exceeded for metric: generate_content_paid_tier_2_requests, limit: 350000, ` +
+			`model: gemini-3.1-flash-lite\nPlease retry in ` + countdown + `.", ` +
+			`"details": [{"retryDelay": "` + delay + `"}]}}`
+	}
+	a := normalizeMessage(msg("20h5m20.340868643s", "72320s"))
+	b := normalizeMessage(msg("23h6m37.477698658s", "83197s"))
+	if a != b {
+		t.Errorf("countdowns must not split the issue:\n%q\n%q", a, b)
+	}
+
+	credits := normalizeMessage(`gemini combined call failed: api error after retry (402): {"error": {"code": 402, ` +
+		`"message": "Your prepayment credits are depleted."}}`)
+	if credits == a {
+		t.Errorf("a credits failure must not merge with a quota failure, both gave %q", a)
+	}
+}

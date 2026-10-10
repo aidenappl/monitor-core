@@ -22,7 +22,8 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
   `normalizeMessage`, `FingerprintForEvent` separating tenants that share an event
   name), plus the project dimension: two projects with identical service, name and
   message must derive **different issue ids**, an unstamped project resolves to the
-  default, and `issueNamespace` is pinned to its literal.
+  default, and `issueNamespace` is pinned to its literal. Also pins duration
+  normalization against a real Gemini quota message (countdowns must not split it).
 
 ## How it works
 
@@ -35,7 +36,8 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
   detached goroutine per error on `context.Background()`). The actual create/update
   logic lives in `processError(ctx, event)`.
 - **Fingerprint** = `sha256(project | service | name | path | normalizeMessage(message))`.
-  `normalizeMessage` strips UUIDs → `<UUID>`, hex → `<HEX>`, URLs → `<URL>`, numbers →
+  `normalizeMessage` strips UUIDs → `<UUID>`, hex → `<HEX>`, URLs → `<URL>`, unit-suffixed
+  durations (`20h5m20.34s`, `150ms`, `72320s`) → `<DUR>`, numbers →
   `<N>` so structurally-identical errors collapse into one issue. **Exception: a
   3-digit number introduced as an HTTP status (`status 502`, `code 404`,
   `status_code=503`, `HTTP 418`) is preserved.** A status code is the failure
@@ -44,6 +46,13 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
   occurrence arrived last. Offsets, retry counts and durations still collapse. See
   `replaceNumbersPreservingStatusCodes` (RE2 has no lookbehind, so matches are
   located by index and the preceding text inspected directly).
+- **Durations are their own rule, run before numbers.** `\b\d+\b` cannot see a
+  number glued to a unit letter, so until Oct 2026 "Please retry in 20h5m20.34s"
+  survived normalization and every occurrence of Gemini's quota error got its own
+  fingerprint — 839 single-occurrence issues in one night. `durationRegex` needs a
+  word boundary on both sides, so hex-ish tokens (`1d4f`) and words (`md5`) are left
+  alone. Changing normalization re-keys any message it touches: the next occurrence
+  files under a new issue and the old one stops receiving events.
 - **Issue id is derived from the fingerprint**, not random —
   `issueIDFor(fingerprint)` returns a UUIDv5 under a fixed namespace. This is what
   makes identity correct: the table is `ORDER BY (id)`, so ClickHouse only collapses
@@ -129,12 +138,26 @@ exposes resolve/ignore. Read the root `../AGENTS.md` first.
 |---|---|---|
 | GET | `/v1/issues?status=&service=&assignee=&has_pr=&q=&from=&to=&sort=&order=&history=&limit=&offset=` | limit default 50, max 500; returns the total count |
 | GET | `/v1/issues/{id}` | verbose detail — links, assignee, repository, comment count, sparkline |
+| POST | `/v1/issues/bulk` | `{status, ids \| filter, dry_run}` — move many issues to one status; see below |
 | PUT | `/v1/issues/{id}` | status / priority / title / assignee |
 | GET | `/v1/issues/{id}/events?limit=` | the issue's own events (indexed on `issue_id`, legacy scan as fallback) |
 | GET | `/v1/issues/{id}/timeline` | the activity feed, oldest first |
 | GET | `/v1/issues/{id}/history` | per-day occurrence sparkline |
 | POST/PATCH/DELETE | `/v1/issues/{id}/comments[/{commentID}]` | add / edit / soft-delete a note |
 | GET/POST/DELETE | `/v1/issues/{id}/links[/{linkID}]` | linked PRs, issues and commits |
+
+**Bulk status changes** (`routes/issues_bulk.go` → `query.BulkUpdateIssueStatus`). Body
+takes `status` plus exactly one of `ids` (≤ `query.MAX_BULK_ISSUES` = 1000, else 400) or
+`filter` — an object with the list endpoint's filter keys (`status`, `service`, `q`,
+`assignee`, `has_pr`, `from`, `to`), parsed by the same `parseIssueFilters`. `sort`,
+`order`, `limit` and `offset` are refused, as is a filter that narrows nothing. Issues
+already at the target status are never selected. One transaction: `COUNT` → locking
+`SELECT … FOR UPDATE` (newest `last_seen` first, capped at 1000) → one `UPDATE … WHERE id
+IN (…) AND project = ?`; `resolved_at` follows status exactly as in `UpdateIssue`. After
+commit, each changed issue gets the same `status_changed` timeline entry the single PUT
+writes. Response: `{matched, updated, remaining}` — a filter matching more than 1000 is
+drained by repeating the same call until `remaining` is 0. `dry_run: true` runs only the
+count.
 
 This is the primary error-investigation surface (mirrored by
 `mcp__monitor__monitor_list_issues` / `monitor_get_issue`).
