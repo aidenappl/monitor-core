@@ -26,7 +26,6 @@ import (
 	"github.com/aidenappl/monitor-core/registry"
 	"github.com/aidenappl/monitor-core/routes"
 	"github.com/aidenappl/monitor-core/services"
-	"github.com/aidenappl/monitor-core/sso"
 	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/rs/cors"
 )
@@ -509,13 +508,6 @@ func main() {
 			telemetry.Fatal("admin.bootstrap.failed", "failed to bootstrap the admin user", err, map[string]any{"reason": "admin_seed_failed"})
 		}
 
-		// Wire the SSO revocation checkpoint into SessionMiddleware. Until this runs
-		// the hook is nil and the checkpoint is skipped.
-		//
-		// Skipped on a zone because a zone serves no SSO surface at all — no
-		// provider CRUD, no callback, no back-channel logout. The checkpoint is an
-		// outbound introspection against a provider row this plane does not own.
-		sso.Install()
 	}
 
 	// Initialize API key management (loads the key cache from MariaDB).

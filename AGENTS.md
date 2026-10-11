@@ -60,7 +60,7 @@ what is deliberately **not** built yet.
     `db/clickhouse.go`.
   - **MariaDB** (`github.com/go-sql-driver/mysql`) — everything that is a **row** rather
     than an event, across two schemas on one connection: `monitor_auth` (identity and
-    tenancy — users, identities, refresh_tokens, sso_providers, sso_sessions, settings,
+    tenancy — users, identities, refresh_tokens, sso_providers, oidc_sessions, settings,
     api_keys, zones, projects) and `monitor` (issue tracking, service_repos, and since
     migrations 119-124 the whole alerting/dashboard **configuration**). Accessed via
     `db.SQL` (`db/sql.go`); this is the standard-shape `db.Queryable` +
@@ -70,9 +70,10 @@ what is deliberately **not** built yet.
   (Chromium's cap) so monitor-js does not pay one before nearly every ingest flush; the cost is
   that an `AllowedHeaders`/`AllowedMethods` change takes up to 2h to reach an open browser.
 - **Sessions/JWT:** `github.com/golang-jwt/jwt/v5` (Monitor-owned HS512 tokens).
-- **SSO:** `github.com/aidenappl/go-forta/sso` **v1.11.0** — the shared SSO module. It brings
-  `coreos/go-oidc/v3` and `golang.org/x/oauth2` transitively; this repo no longer imports
-  either directly.
+- **SSO:** `github.com/aidenappl/go-oidc-session` — the shared, provider-agnostic OIDC client
+  (adapters, PKCE, state, back-channel logout, and the server-side SSO session `Manager` +
+  `sqlstore`). It brings `coreos/go-oidc/v3` and `golang.org/x/oauth2` transitively.
+  Pinned at **v0.1.0**; upgrade with `go get github.com/aidenappl/go-oidc-session@vX.Y.Z`.
 - **Passwords/crypto:** `golang.org/x/crypto/bcrypt` (cost 12) + AES-256-GCM (`tools/Crypto.go`).
 - **Secrets:** `github.com/aidenappl/go-keyring` (optional at startup — see §4).
 - **IDs:** `github.com/google/uuid`.
@@ -89,7 +90,7 @@ Flat, package-per-concern layout (no `cmd/`/`internal/`/`pkg/`).
 
 ```
 monitor-core/
-  main.go                  # Entry: config, MON_ROLE validation, both DB connects + migrations, bootstrap, sso.Install(), router, goroutines, shutdown
+  main.go                  # Entry: config, MON_ROLE validation, both DB connects + migrations, bootstrap, router, goroutines, shutdown
   router.go                # buildRouter(role) — the whole HTTP surface, with each route gated on the plane that can serve it (§6 Roles)
   env/env.go               # Env config (getEnv/getEnvInt/getEnvDuration) + RequireProductionSecrets fail-fast guard
   env/role.go              # MON_ROLE: the Role type (app/zone/both), ParseRole, RunsControlPlane/RunsDataPlane, RequireValidRole
@@ -101,8 +102,8 @@ monitor-core/
   jwt/jwt.go               # Monitor-owned HS512 access/refresh JWTs (mint + validate, alg-pinned)
   tools/                   # Password.tool.go (bcrypt 12), Crypto.go (AES-256-GCM), Validate.tool.go (SSRF guard), Slug.tool.go (zone/project slug rule + reserved names)
   bootstrap/               # First-run seeding: admin.go (first admin user), registry.go (the single zone + default project)
-  sso/                     # Thin wiring onto go-forta/sso — see §6
-  query/                   # MariaDB query layer (squirrel): users, identities, refresh_tokens, sso_providers, sso_sessions, settings, api_keys, zones, projects, issues, service_repos, alert_rules, notification_channels, notification_policies, service_groups, dashboards, saved_views
+  sso/                     # Thin wiring onto go-oidc-session — see §6
+  query/                   # MariaDB query layer (squirrel): users, identities, refresh_tokens, sso_providers, settings, api_keys, zones, projects, issues, service_repos, alert_rules, notification_channels, notification_policies, service_groups, dashboards, saved_views
   scope/scope.go           # The request's project: context key + WithProject/GetProject, ProjectPredicate (the SQL every event read must carry) and Matches (its in-memory twin for the SSE hub)
   structs/                 # User/Identity/SSOProvider/SSOSession/RefreshToken/APIKey/Zone/Project/Issue/AlertRule/NotificationChannel/NotificationPolicy/ServiceGroup/Dashboard/SavedView (.struct.go) + event.go + analytics.go + columns.go (shared identifier regex & column allowlists)
   middleware/
@@ -551,7 +552,7 @@ into `access_logs` was RESTRICT and a secret that had ever been read could never
 | `identities` | One sign-in method per row, `UNIQUE(provider, provider_user_id)`. `provider="password"` stores a bcrypt hash in `password_hash`; SSO rows store the claim envelope in `identity_data`. **`(provider, provider_user_id)` is the ONLY identity key — never email.** `FK → users ON DELETE CASCADE`. |
 | `refresh_tokens` | Rotating-refresh store. Only the SHA-256 `token_hash` (`BINARY(32)`) is persisted; tokens minted from one login share a `family_id`; rotation stamps `replaced_by` and `used_at` (migration 134 — the clock for the 30s reuse grace window). |
 | `sso_providers` | One configured IdP per row (see below). |
-| `sso_sessions` | One row per SSO-backed user (`user_id` PK) caching the AES-256-GCM-encrypted IdP tokens so the checkpoint can re-introspect the upstream grant. Also carries `subject` and `sid` (migration 109) — the two things a back-channel logout token can name. **Neither can be backfilled**: `sid` exists only in the id_token of the login that created the row, so a session written without one is unreachable by a session-scoped logout for its whole life. |
+| `oidc_sessions` | One row per signed-in browser for SSO (migration 135, go-oidc-session `sqlstore` shape), keyed by the SHA-256 of the `mon_sso_session` cookie, holding the provider's tokens AES-256-GCM-encrypted (`MON_CRYPTO_KEY`) plus `subject` and `sid` for back-channel logout. `/auth/refresh` refreshes them against the provider and deletes the row when the provider refuses. Replaces `sso_sessions` (one row per user, never refreshed, read only by the removed checkpoint), which is left in place unused. |
 | `settings` | Key/value app settings. |
 | `api_keys` | Ingest/admin API keys (`scope` = `admin`\|`ingest`). Moved here from ClickHouse. `project_id` is **`NOT NULL`, `FK → projects`** (migration 117) — the tenant binding ingestion derives an event's project from, so there is no such thing as a key that authenticates into no tenant. `UNIQUE(project_id, name)`, so each project may own a key literally called `ingest`. **`uq_api_keys_key_hash` stays GLOBALLY unique** and must never be made composite — see below. |
 
@@ -575,8 +576,8 @@ HS512** via `WithValidMethods` and the keyfunc re-checks the method (defeats
 | Middleware | Applies to | Accepts |
 |---|---|---|
 | `IngestAuthMiddleware` | `POST /v1/events` | env master key (`MONITOR_API_KEY`) **or** a DB **ingest-scope** key. Admin keys → `401`: they are query credentials that live in dashboards and MCP configs, and reading events does not imply permission to forge them. |
-| `QueryAuthMiddleware` | all other `/v1/*` | env master key **or** DB **admin-scope** key **or** a valid Monitor session (`mon-access-token`/Bearer, incl. SSO checkpoint). Ingest keys → `403`. Injects the project every read is scoped to: **credential-derived** for the two key branches, a validated **`?project=` selector** (defaulting to `MON_DEFAULT_PROJECT`) for a session — see §6 *The project asymmetry*. |
-| `SessionMiddleware` (`Protected`) | `/auth/*`, `/admin/*` | a valid access JWT (Bearer or `mon-access-token`) → puts the user in context. `RequireAdmin`/`RequireEditor`/`RejectPending` gate on `role`. **Resolves the user two ways** — control plane reads the live row (`Active` + SSO checkpoint); a zone builds it from the token's claims. See *Zone session trust* below. |
+| `QueryAuthMiddleware` | all other `/v1/*` | env master key **or** DB **admin-scope** key **or** a valid Monitor session (`mon-access-token`/Bearer). Ingest keys → `403`. Injects the project every read is scoped to: **credential-derived** for the two key branches, a validated **`?project=` selector** (defaulting to `MON_DEFAULT_PROJECT`) for a session — see §6 *The project asymmetry*. |
+| `SessionMiddleware` (`Protected`) | `/auth/*`, `/admin/*` | a valid access JWT (Bearer or `mon-access-token`) → puts the user in context. `RequireAdmin`/`RequireEditor`/`RejectPending` gate on `role`. **Resolves the user two ways** — control plane reads the live row (`Active`); a zone builds it from the token's claims. SSO liveness is enforced at `/auth/refresh` (the refresh gate), not per request. See *Zone session trust* below. |
 | `CSRFMiddleware` (global) | all unsafe methods | `mon-csrf` cookie == `X-CSRF-Token` header (constant-time). Safe methods, Bearer clients, `X-Api-Key` clients, and `/auth/{login,register,refresh}` + SSO callbacks are exempt. |
 | `RequestTimeout(REQUEST_TIMEOUT)` | `/v1` subrouter, after `QueryAuthMiddleware` | not auth — derives the request context with a **25s** deadline, so a ClickHouse query started from `r.Context()` is cancelled before the server's 30s `WriteTimeout` gives up on the response. **Skips `/v1/events/stream` and `/v1/alerts/stream` by path.** A context deadline, never `http.TimeoutHandler` (which buffers and hides `http.Flusher`). |
 | `GzipMiddleware` | `/v1` subrouter, innermost | not auth — gzips a response only when the request accepts gzip, the method is not `HEAD`, the path is not one of the two SSE streams and not `POST /v1/api-keys` (freshly minted secret — BREACH), the handler set `Content-Type: application/json` and no `Content-Encoding`, the status is not 204/304/206, and the body reaches **1 KB** (`GZIP_MIN_SIZE`). When it compresses it deletes any handler `Content-Length` and adds `Vary: Accept-Encoding`. The wrapper implements `Flush` (an early flush of a sub-1 KB body abandons compression) and `Unwrap`. **Never on the root router** — `/auth/*`, the SSO icon, ingest, probes and the webhook are deliberately outside it. |
@@ -640,7 +641,7 @@ DELETE /auth/self/identities/{slug}         unlink (refuses the last identity)  
 GET    /auth/sso/config                     enabled providers for the login page  [public] → [{slug,button_label,login_url}]
 GET    /auth/sso/{slug}/login               302 to the IdP                        [public]
 GET    /auth/sso/{slug}/callback            IdP redirect target → session         [public, CSRF-exempt]
-POST   /auth/sso/forta/backchannel-logout   OIDC Back-Channel Logout 1.0 §2.5     [public — signature IS the auth]
+POST   /auth/sso/{slug}/backchannel-logout  OIDC Back-Channel Logout 1.0 §2.5     [public — signature IS the auth]
 GET    /admin/sso-providers                 list providers (secrets never returned)  [Protected + RequireAdmin]
 POST   /admin/sso-providers                 create a provider                     [Protected + RequireAdmin]
 PUT    /admin/sso-providers/{slug}          update a provider                     [Protected + RequireAdmin]
@@ -687,12 +688,17 @@ the access token's `fid` claim (the browser never sends the path-scoped refresh 
 `/auth/logout`), falling back to all of the user's tokens only for pre-`fid` access tokens. `HandleUpdateSelf` can create a `password` identity for an
 SSO-only account.
 
-**Back-channel logout (`POST /auth/sso/forta/backchannel-logout`).** Forta pushes a signed
-`logout_token` the instant a grant is revoked, closing the checkpoint's 5-minute window.
+**Back-channel logout (`POST /auth/sso/{slug}/backchannel-logout`).** The provider pushes a
+signed `logout_token` the instant a grant or session ends; `sso.Manager().BackchannelHandler`
+verifies it and deletes the matching `oidc_sessions` rows (by `sid`, else `sub`). The browser's
+next `/auth/refresh` then finds no SSO session and the Monitor family is revoked — so a
+back-channel logout takes effect within one access-token lifetime (15 min), zones included. The
+path registered with Forta, `/auth/sso/forta/backchannel-logout`, is this route with
+`slug=forta`.
 
 ⚠️ **It is public on purpose and must never move under `SessionMiddleware`.** The caller is
 Forta, which holds no Monitor session and no cookie; its only authentication is the signature on
-the token, verified against Forta's JWKS and against this `client_id` inside go-forta's handler.
+the token, verified against the provider's JWKS and against this `client_id` inside the library.
 Session-gating it would reject every genuine notification — invisibly, and indistinguishably from
 "nothing has been revoked yet". `routes/backchannel_route_test.go` pins both that failure mode and
 the not-mounted-at-all one (a 404 that Forta retries to exhaustion while nothing here logs a thing).
@@ -712,9 +718,10 @@ middleware stack — every one of its assertions passed while production returne
 `middleware/csrf_test.go` covers that half. **Changing this endpoint's path means changing both**,
 or one of them silently tests a URL that no longer exists.
 
-⚠️ **It does NOT replace the checkpoint.** Back-channel logout is best-effort *by specification* —
-notifications can be lost and retries can be exhausted — so the 5-minute poll stays the guarantee
-and this is the fast path. Do not relax `CheckpointInterval` because this exists.
+Back-channel logout is best-effort *by specification* — notifications can be lost and retries
+exhausted. The guarantee is the refresh gate (below): every Monitor refresh refreshes the
+provider's tokens, so a revoked grant fails the next refresh even if the notification never
+arrived.
 
 **GitHub webhook (`POST /webhooks/github`) — the same shape, and the precedent above is why it
 works.** Deliveries are server-to-server POSTs with no cookie, no Bearer token and no `X-Api-Key`,
@@ -787,31 +794,27 @@ not a path, which would be an admin-controlled string the page turns into a URL.
 **`GET /auth/sso/icon/{slug}`** serves the cached bytes with `X-Content-Type-Options:
 nosniff`, `Content-Disposition: inline`, and a 24h `Cache-Control` (not
 `immutable` — the URL carries no content hash, so the bytes genuinely can change).
-The fetch, SSRF defence and SVG rejection all live in `go-forta/sso`'s
+The fetch, SSRF defence and SVG rejection all live in `go-oidc-session`'s
 `FetchIcon`; this repo only stores and serves.
 
-**SSO subsystem (`sso/`) — thin wiring onto `go-forta/sso`:**
+**SSO subsystem (`sso/`) — thin wiring onto `go-oidc-session`:**
 
-⚠️ **THE PROTOCOL NO LONGER LIVES HERE.** Discovery, PKCE, state, nonce, id_token
-verification, UserInfo, introspection and the revocation checkpoint are all in
-`github.com/aidenappl/go-forta/sso`. This code was where they were written, and it was lifted
-out because `lattice-api` and `openbucket-api` had forked thinner copies that drifted into real
-vulnerabilities. `sso/adapter.go`, `oidc.go`, `oauth2.go`, `introspect.go` and `state.go` were
-**deleted** — do not re-add a local copy.
+⚠️ **THE PROTOCOL DOES NOT LIVE HERE.** Discovery, PKCE, state, nonce, id_token verification,
+UserInfo, token refresh and back-channel logout are all in `github.com/aidenappl/go-oidc-session`
+(which began as this repo's code, lifted out because `lattice-api` and `openbucket-api` had
+forked thinner copies that drifted into real vulnerabilities). Do not re-add a local copy.
 
 What remains is everything the library refuses to know:
 
 | File | Role |
 |------|------|
-| `sso/config.go` | Maps an `sso_providers` row → `ssolib.Provider`; resolves the client secret (Keyring ref → env of the same name → AES-GCM column). |
-| `sso/statestore.go` | `ssolib.StateStore` over the settings KV. ⚠️ Its `ConsumeState` atomicity is the replay defence — the DELETE decides the winner, not the read. |
-| `sso/sessionstore.go` | `ssolib.SessionStore` over `sso_sessions`, with AES-256-GCM at rest. Returns `(nil, nil)` for a native login, which is what stops the checkpoint denying every password user. Also implements `ssolib.BackchannelLogoutTarget` (`DeleteSessionsBySID`/`BySubject`) — the same store the checkpoint uses, so push and poll end sessions through one code path. |
-| `sso/backchannel.go` | Builds the OIDC Back-Channel Logout 1.0 receiver. Mounted at `POST /auth/sso/forta/backchannel-logout`. |
-| `sso/resolve.go` | `ssolib.UserResolver` — the link/provision decision matrix, plus `LinkIdentity`. **The most security-sensitive file here.** |
-| `sso/checkpoint.go` | Installs the library `Checkpointer` into the session middleware, with `Correlation` (forwards `middleware.RequestIDKey` as `X-Request-ID` on the introspection) and `LogfCtx` (appends `request_id=`). |
+| `sso/config.go` | Maps an `sso_providers` row → `oidcsession.Provider`; resolves the client secret (Keyring ref → env of the same name → AES-GCM column). |
+| `sso/statestore.go` | `oidcsession.StateStore` over the settings KV. ⚠️ Its `ConsumeState` atomicity is the replay defence — the DELETE decides the winner, not the read. |
+| `sso/session.go` | The `Manager` (sessions in `oidc_sessions` via `sqlstore`, tokens sealed with `tools.Encrypt`, cookie `mon_sso_session` on `MON_COOKIE_DOMAIN`), `loadLibProvider`, and `Store()`. |
+| `sso/resolve.go` | `oidcsession.UserResolver` — the link/provision decision matrix, plus `LinkIdentity`. **The most security-sensitive file here.** |
 
 - An `sso_providers` row still fully describes an IdP; `kind` selects the library's OIDC or
-  OAuth2 adapter. A login normalizes to `ssolib.Identity{Provider, Subject, Email,
+  OAuth2 adapter. A login normalizes to `oidcsession.Identity{Provider, Subject, Email,
   EmailVerified, …}`. **Subject (the OIDC `sub`), paired with Provider, is the identity —
   email is only a linking hint.**
 - **What the migration fixed for free:** the old local `oauth2` adapter accepted a PKCE
@@ -819,18 +822,16 @@ What remains is everything the library refuses to know:
   configured, appeared in logs, and defended nothing — and every login performed a failing
   request first. The library sends the verifier on one standard request, asserted end-to-end by
   a test against a fake IdP that enforces PKCE.
-- ⚠️ **A known gap, recorded rather than hidden:** `middleware.SSOCheckpoint` is a `bool` hook,
-  so `CheckpointUnavailable` — "the IdP could not be reached and the 30-minute grace window has
-  elapsed" — is mapped to **deny**, surfacing as a 401 where it should be a 503 with
-  `Retry-After`. Denying is the right call of the two available (allowing would be the
-  unbounded fail-open the library exists to prevent), but the status is wrong. Widening the
-  hook to carry a status is the fix, and it belongs with the middleware.
 - **Login flow:** `HandleSSOLogin` mints a single-use server-side `{state, nonce, PKCE
-  verifier}` record (10-min TTL, carries a sanitized same-origin `return_url`) and 302s to
-  the authorize URL. `HandleSSOCallback` single-use-consumes the state (CSRF/replay gate,
-  bound to the slug), exchanges the code (OIDC verifies id_token signature/iss/aud/exp
-  **and nonce**), resolves the identity, caches the encrypted IdP tokens, then issues
-  Monitor's own session and redirects to the sanitized `return_url`.
+  verifier}` record (10-min TTL, carries a sanitized same-origin `return_url`), sets the
+  `mon_sso_login` cookie binding the login to this browser (login CSRF), and 302s to the
+  authorize URL, forwarding `prompt` (`none`/`login`/`select_account`). `HandleSSOCallback`
+  requires that cookie, single-use-consumes the state, exchanges the code (OIDC verifies id_token
+  signature/iss/aud/exp **and nonce**), resolves the identity, opens the SSO session
+  (`sso.Manager().IssueSession`), issues Monitor's own token family and redirects to the
+  sanitized `return_url`. A provider `login_required` (the answer to a silent `prompt=none`
+  attempt) redirects to `/login?error=login_required&next=<return_url>`, which monitor-web treats
+  as "show the form", not an error.
 - **Identity resolution (`sso/resolve.go`) — the nOAuth / pre-account-takeover defense:**
   1. **Known identity** — `(provider, subject)` exists → log in as its user.
   2. **Safe link (link-on-login)** — only if the provider has `allow_auto_link`, the IdP
@@ -846,18 +847,29 @@ What remains is everything the library refuses to know:
   carrying the current user id; the callback attaches the returned identity to that user,
   refusing to steal one already owned by a different account, and redirects to
   `/settings/security`.
-- **Revocation checkpoint (`sso/checkpoint.go`, wired by `sso.Install()`):** for
-  SSO-backed sessions, `SessionMiddleware` periodically (5-min TTL) re-introspects the
-  cached IdP token; `active=false` kills the local session, network/DB errors fail **open**.
-- **Checkpoint request correlation (go-forta v1.11.0).** `sso.Install` sets
-  `middleware.SSOCheckpointCtx` (preferred) as well as the legacy `middleware.SSOCheckpoint`
-  (kept, decides identically with `context.Background()`). `SessionMiddleware` passes the
-  request context through `validateSessionTokenCtx` → `passesSSOCheckpoint`, so the
-  introspection call to forta-api carries this request's `X-Request-ID` and each checkpoint log
-  line ends `request_id=…`. Concurrent checks for one user share one introspection, which
-  carries the first caller's id. **Always pass the request ctx into `Checkpointer.Check`** — a
-  `context.Background()` forwards nothing. Pinned by `middleware/session_checkpoint_test.go`
-  (hook precedence + fallback) and `sso/checkpoint_test.go` (the id arrives at an httptest IdP).
+- **SSO refresh gate — the session lives as long as the provider session
+  (`routes/refresh_sso.go`).** Monitor keeps its own 15-minute access JWT because zones verify it
+  statelessly; what binds it to the provider is `POST /auth/refresh`. It first runs the
+  `mon_sso_session` cookie through `sso.Manager().Authenticate`, which refreshes the provider's
+  tokens when due (single-flight per session) and deletes the session on `invalid_grant`:
+
+  | SSO session | Refresh outcome |
+  |---|---|
+  | live, refresh cookie present | the family rotates as before (grace window, reuse detection unchanged) |
+  | live, no refresh cookie / family expired | a fresh family is minted — this is how a silent SSO sign-in gets its JWTs, and why the 7-day family expiry no longer signs anyone out |
+  | live but for a different user | family revoked, 401 |
+  | ended (refused / back-channel / expired) | family revoked, cookies cleared, 401 → monitor-web re-authenticates silently |
+  | provider unreachable past its grace | **503**, not 401 |
+  | no SSO cookie, account has no `password` identity | family revoked, 401 (an SSO family from before the gate) |
+  | no SSO cookie, password-capable account | unchanged password-session behaviour |
+
+  There is **no introspection checkpoint** any more and no separate 7-day clock for SSO
+  sessions. Revocation reaches the control plane and every zone within one access-token
+  lifetime. The SSO cookie is set on `MON_COOKIE_DOMAIN` because the browser reaches
+  `/auth/refresh` through monitor-web's proxy, which forwards the `Cookie` header.
+- **Logout** (`POST /auth/logout`) also ends the SSO session and returns `data.redirect_url`: the
+  provider's end-session URL (RP-initiated logout). Register
+  `{MON_WEB_URL}/login?signed_out=1` as a logout redirect URI with the provider.
 - **Client secrets** are never stored/echoed in the clear: either a Keyring reference
   (`client_secret_ref`, resolved Keyring→env at login) or an AES-256-GCM value
   (`client_secret_enc`). The admin API exposes only a `has_secret` boolean.
@@ -878,7 +890,6 @@ registration, cannot drift that way.
 | MariaDB + its migrations | yes | yes | yes |
 | `bootstrap.EnsureAdminUser` | yes | **no** | yes |
 | `bootstrap.EnsureZoneAndProject` | yes | yes | yes |
-| `sso.Install()` (revocation checkpoint) | yes | **no** | yes |
 | `apikeys.Init` (key cache + refresher) | yes | yes | yes |
 | `registry.Init` (zone/project cache) | yes | yes | yes |
 | `alerts`/`issues` `Init` | **no** | yes | yes |
@@ -915,7 +926,8 @@ registration, cannot drift that way.
   `bootstrap.EnsureAdminUser` runs on the control plane only, so a zone's `monitor_auth.users`
   is empty by design. `middleware.validateSessionToken` therefore branches on
   `env.MonRole.RunsControlPlane()`:
-  - **Control plane** — unchanged: `GetUserByID`, require `Active`, run the SSO checkpoint.
+  - **Control plane** — `GetUserByID`, require `Active`. (SSO liveness is checked at
+    `/auth/refresh`, so it bounds both planes equally.)
   - **Zone** — build `structs.User` from the access token's claims. The signature is the
     check: both planes share `MON_JWT_SIGNING_KEY`, the parser is HS512- and issuer-pinned,
     and only the control plane can mint. The zone is not deciding who the caller is; it is
@@ -925,7 +937,7 @@ registration, cannot drift that way.
   redeemed at the control plane, which reads the live row). Without it every write in a zone
   403s on `RequireEditor`, which reads exactly that field.
 
-  ⚠️ **What it costs:** no `Active` check and no SSO checkpoint at a zone, and the role is a
+  ⚠️ **What it costs:** no `Active` check at a zone, and the role is a
   mint-time snapshot — so a disabled or demoted user keeps their old access at a zone until
   the token expires, **bounded at 15 minutes** (`jwt.accessTokenExpiry`). Login, refresh and
   revocation stay control-plane-only, so no new way in is created; an already-issued token
@@ -1787,7 +1799,7 @@ is for the terminal, and every event they trigger prints there.
    recovery, queue overflow, ingest body rejections (per reason) and credential rejections
    (per reason), slow ClickHouse calls (per kind), issue-tracker drops and upserts, alert
    evaluation / state / history / routing / delivery, cache refreshes, SSE writes and lag,
-   the SSO checkpoint, failed logins (per client IP — a password spray is one event a minute
+   SSO session refreshes, failed logins (per client IP — a password spray is one event a minute
    whose `suppressed` is the attempt rate) and refresh failures, GitHub webhook rejections.
 3. **Stdout is the channel of last resort.** The SDK's own stdout is off (unless
    `MON_TELEMETRY_STDOUT`); telemetry prints every **warn, error and fatal** as one line with
@@ -1935,7 +1947,7 @@ past-tense verb (`issue.created`, `alert.fired`).
 | `auth.sso.callback.failed` | warn, coalesced per reason | callback refused (denied, stale state, disabled account) | provider, reason, client_ip |
 | `auth.sso.callback.broken` | error, coalesced | this side or the IdP failed (adapter, exchange, session) | provider, reason, dependency |
 | `sso.provider.created`/`.updated`/`.deleted`, `sso.provider.icon.failed` | info / warn | provider config changed | provider, kind, enabled, stage |
-| `sso.checkpoint.denied`/`.failed`/`.unavailable`, `sso.session.revoked`, `sso.backchannel.*`, `sso.state.sweep.failed` | warn / info | go-forta/sso checkpoint and back-channel lines, mapped by code | user_id, message |
+| `auth.sso.session.refreshed` / `.refresh_refused` / `.refresh_unavailable` / `.refresh_store_failed` / `.expired`, `auth.sso.logout`, `sso.backchannel.*`, `sso.state.sweep.failed` | info / warn | `sso.Manager().OnEvent` (session lifecycle) and the library's back-channel lines, mapped by code | provider, user_id |
 | `github.webhook.rejected` | warn, coalesced | a delivery failed signature verification | reason, github_event, client_ip |
 | `github.webhook.processed` / `.state.updated` | info / debug | PR state applied to linked issues | owner, repo, number, entry_type, issues_updated |
 | `github.webhook.timeline.append.failed` | error, coalesced | an issue's timeline missed a PR change | issue_id, owner, repo, number |
@@ -2273,8 +2285,12 @@ are listed in §4.
     `.sql`; both runners are fail-fast.
   - *Login works but SSO fails at the IdP* → `MON_PUBLIC_URL` / the provider's redirect_uri
     don't match, or `client_secret_ref` can't resolve via Keyring/env.
-  - *Everyone logged out at once* → the SSO checkpoint fails **open** on IdP blips, so this
-    points at the JWT signing key changing or MariaDB being down, not the checkpoint.
+  - *Everyone logged out at once* → an IdP blip yields **503** from `/auth/refresh`, not a
+    sign-out, so this points at the JWT signing key changing, `MON_CRYPTO_KEY` changing (SSO
+    session tokens can no longer be decrypted) or MariaDB being down.
+  - *SSO users bounce back to `/login` every 15 minutes* → `/auth/refresh` is not seeing the
+    `mon_sso_session` cookie: check it was set on `MON_COOKIE_DOMAIN` and that monitor-web's
+    proxy forwards the `Cookie` header.
   - *One analytics query 500s with `MEMORY_LIMIT_EXCEEDED` (code 241)* → it hit
     `CLICKHOUSE_MAX_MEMORY_USAGE`. That is the limit working: before it, that query would
     have climbed until the node OOM-killed ClickHouse. Narrow the group-by/time range first;

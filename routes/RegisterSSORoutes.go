@@ -48,8 +48,11 @@ func RegisterSSORoutes(r *mux.Router) {
 	// Registered per slug rather than with a {slug} variable: the handler is built
 	// around one provider's verifier, and a path variable would invite pointing a
 	// notification at a provider that did not send it.
-	r.Handle("/auth/sso/forta/backchannel-logout",
-		sso.BackchannelLogoutHandler("forta")).Methods(http.MethodPost)
+	// OIDC Back-Channel Logout 1.0, one endpoint per provider slug. Register
+	// {MON_PUBLIC_URL}/auth/sso/{slug}/backchannel-logout with the provider.
+	r.HandleFunc("/auth/sso/{slug}/backchannel-logout", func(w http.ResponseWriter, r *http.Request) {
+		sso.Manager().BackchannelHandler(mux.Vars(r)["slug"]).ServeHTTP(w, r)
+	}).Methods(http.MethodPost)
 
 	// Admin SSO provider CRUD — authenticated as an active user, then gated to
 	// role=admin. RequireAdmin reads the user SessionMiddleware puts in context.

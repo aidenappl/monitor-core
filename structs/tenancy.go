@@ -65,7 +65,7 @@ var TableTenancy = map[string]Tenancy{
 	"identities":         TenancyInstall,
 	"refresh_tokens":     TenancyInstall,
 	"sso_providers":      TenancyInstall,
-	"sso_sessions":       TenancyInstall,
+	"oidc_sessions":      TenancyInstall,
 	"settings":           TenancyInstall,
 	"migrations_applied": TenancyInstall,
 

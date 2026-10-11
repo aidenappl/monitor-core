@@ -43,10 +43,25 @@ import (
 // (auth.refresh.failed), and a family that could not be revoked after reuse is
 // an error: the leaked token's siblings are still live.
 func HandleRefresh(w http.ResponseWriter, r *http.Request) {
+	// The SSO gate runs first: an SSO-backed session lives exactly as long as
+	// the provider session behind it (see refresh_sso.go).
+	ssoSession, gate := refreshSSOGate(w, r)
+	if gate == ssoGateUnavailable {
+		refuseRefreshSSOUnavailable(w)
+		return
+	}
+
 	cookie, err := r.Cookie(cookieRefreshToken)
 	if err != nil || cookie.Value == "" {
-		middleware.ExpectedClientError(w)
-		responder.Error(w, http.StatusUnauthorized, "no refresh token")
+		switch gate {
+		case ssoGateLive:
+			issueFromSSOSession(w, r, ssoSession)
+		case ssoGateEnded:
+			refuseRefreshSSOEnded(w, r, nil)
+		default:
+			middleware.ExpectedClientError(w)
+			responder.Error(w, http.StatusUnauthorized, "no refresh token")
+		}
 		return
 	}
 	raw := cookie.Value
@@ -82,6 +97,12 @@ func HandleRefresh(w http.ResponseWriter, r *http.Request) {
 		rejectRefreshReuse(w, r, row, outcome)
 		return
 	case refreshExpired:
+		// The family's own expiry is not the end of an SSO-backed session: the
+		// provider session decides, so a live one gets a fresh family.
+		if gate == ssoGateLive && ssoSession.UserID == row.UserID {
+			issueFromSSOSession(w, r, ssoSession)
+			return
+		}
 		// A refresh token reaching its own expiry is a session ending normally.
 		middleware.ExpectedClientError(w)
 		responder.Error(w, http.StatusUnauthorized, "refresh token expired")
@@ -92,6 +113,22 @@ func HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	if err != nil || user == nil || !user.Active {
 		refreshFailed(w, r, "user_inactive", userID, err)
 		responder.Error(w, http.StatusUnauthorized, "user not found or inactive")
+		return
+	}
+
+	switch {
+	case gate == ssoGateEnded:
+		refuseRefreshSSOEnded(w, r, row)
+		return
+	case gate == ssoGateLive && ssoSession.UserID != user.ID:
+		// The browser's SSO session belongs to someone else, so it does not
+		// back this family. Refuse rather than mix two identities.
+		refuseRefreshSSOEnded(w, r, row)
+		return
+	case gate == ssoGateAbsent && requiresSSOSession(r, user.ID):
+		// An SSO-only account's family from before the gate: refuse, so the
+		// browser re-authenticates and gets an SSO-backed one.
+		refuseRefreshSSOEnded(w, r, row)
 		return
 	}
 

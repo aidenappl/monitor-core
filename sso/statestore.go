@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	ssolib "github.com/aidenappl/go-forta/sso"
+	oidcsession "github.com/aidenappl/go-oidc-session"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/telemetry"
@@ -15,7 +15,7 @@ import (
 // statePrefix namespaces in-flight login records in the settings KV table.
 const statePrefix = "sso_state:"
 
-// StateStore implements ssolib.StateStore over Monitor's settings table.
+// StateStore implements oidcsession.StateStore over Monitor's settings table.
 //
 // The settings KV is used rather than a dedicated table because these records
 // live for ten minutes and are deleted on read — a table, an index and a
@@ -67,7 +67,7 @@ func (s *StateStore) ConsumeState(_ context.Context, state string) ([]byte, erro
 
 	raw, err := query.GetSetting(s.Engine, key)
 	if err != nil || raw == "" {
-		return nil, ssolib.ErrNoState
+		return nil, oidcsession.ErrNoState
 	}
 
 	deleted, err := query.DeleteSettingExisted(s.Engine, key)
@@ -77,7 +77,7 @@ func (s *StateStore) ConsumeState(_ context.Context, state string) ([]byte, erro
 	if !deleted {
 		// Someone else won, or it was consumed between the read and here. Either way
 		// this caller is not authorised to use it.
-		return nil, ssolib.ErrNoState
+		return nil, oidcsession.ErrNoState
 	}
 
 	return []byte(raw), nil
@@ -106,7 +106,7 @@ func (s *StateStore) sweepExpired() {
 	failed := 0
 	var lastErr error
 	for k, v := range states {
-		var sd ssolib.StateData
+		var sd oidcsession.StateData
 		expired := json.Unmarshal([]byte(v), &sd) != nil || time.Now().After(sd.ExpiresAt)
 		if !expired {
 			continue

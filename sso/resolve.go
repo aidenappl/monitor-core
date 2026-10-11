@@ -5,14 +5,14 @@ import (
 	"database/sql"
 	"fmt"
 
-	ssolib "github.com/aidenappl/go-forta/sso"
+	oidcsession "github.com/aidenappl/go-oidc-session"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/structs"
 	"github.com/aidenappl/monitor-core/telemetry"
 )
 
-// Resolver implements ssolib.UserResolver for Monitor.
+// Resolver implements oidcsession.UserResolver for Monitor.
 //
 // ⚠️ THE LIBRARY DOES NOT CALL THIS INTERFACE — the application does, from its
 // callback handler. The interface exists to give the decision matrix a stable name
@@ -27,13 +27,13 @@ type Resolver struct {
 // NewResolver returns a Resolver over the given engine.
 func NewResolver(engine db.Queryable) *Resolver { return &Resolver{Engine: engine} }
 
-// ResolveUser satisfies ssolib.UserResolver.
+// ResolveUser satisfies oidcsession.UserResolver.
 //
 // Monitor's own callback uses ResolveIdentity directly, because it needs the full
 // user row to check user.Active before issuing a session — a user id alone cannot
 // answer that. This method is the interface-shaped view of the same logic, so the
 // two can never diverge.
-func (r *Resolver) ResolveUser(ctx context.Context, p *ssolib.Provider, id ssolib.Identity) (int64, error) {
+func (r *Resolver) ResolveUser(ctx context.Context, p *oidcsession.Provider, id oidcsession.Identity) (int64, error) {
 	user, err := ResolveIdentity(ctx, r.Engine, p, id)
 	if err != nil {
 		return 0, err
@@ -41,8 +41,8 @@ func (r *Resolver) ResolveUser(ctx context.Context, p *ssolib.Provider, id ssoli
 	return user.ID, nil
 }
 
-// LinkIdentity satisfies ssolib.UserResolver.
-func (r *Resolver) LinkIdentity(_ context.Context, p *ssolib.Provider, userID int64, id ssolib.Identity) error {
+// LinkIdentity satisfies oidcsession.UserResolver.
+func (r *Resolver) LinkIdentity(_ context.Context, p *oidcsession.Provider, userID int64, id oidcsession.Identity) error {
 	return LinkIdentity(r.Engine, userID, id)
 }
 
@@ -55,7 +55,7 @@ func (r *Resolver) LinkIdentity(_ context.Context, p *ssolib.Provider, userID in
 //
 // Re-linking the same identity to the same user is a no-op success, because a user
 // double-clicking "connect" is not an error worth showing them.
-func LinkIdentity(engine db.Queryable, userID int64, ni ssolib.Identity) error {
+func LinkIdentity(engine db.Queryable, userID int64, ni oidcsession.Identity) error {
 	existing, err := query.GetIdentityByProviderSubject(engine, ni.Provider, ni.Subject)
 	if err != nil {
 		return fmt.Errorf("sso: lookup identity: %w", err)
@@ -93,7 +93,7 @@ func LinkIdentity(engine db.Queryable, userID int64, ni ssolib.Identity) error {
 //     provisioning is disabled, the login is rejected.
 //
 // engine is a db.Queryable so this is unit-testable against a mocked DB.
-func ResolveIdentity(ctx context.Context, engine db.Queryable, p *ssolib.Provider, ni ssolib.Identity) (*structs.User, error) {
+func ResolveIdentity(ctx context.Context, engine db.Queryable, p *oidcsession.Provider, ni oidcsession.Identity) (*structs.User, error) {
 	if ni.Subject == "" {
 		return nil, fmt.Errorf("sso: cannot resolve identity with empty subject")
 	}
@@ -171,7 +171,7 @@ type txBeginner interface {
 // (which could log in via nothing and block re-registration), so when engine is a
 // real *sql.DB the two inserts run in one transaction. When it isn't (unit tests
 // with a mocked Queryable), it falls back to sequential inserts.
-func provisionUserWithIdentity(engine db.Queryable, ni ssolib.Identity) (*structs.User, error) {
+func provisionUserWithIdentity(engine db.Queryable, ni oidcsession.Identity) (*structs.User, error) {
 	req := query.CreateUserRequest{
 		Email:         ni.Email,
 		EmailVerified: ni.EmailVerified,
@@ -211,7 +211,7 @@ func provisionUserWithIdentity(engine db.Queryable, ni ssolib.Identity) (*struct
 }
 
 // createIdentityFor attaches ni as a new identity of userID.
-func createIdentityFor(engine db.Queryable, userID int64, ni ssolib.Identity) (*structs.Identity, error) {
+func createIdentityFor(engine db.Queryable, userID int64, ni oidcsession.Identity) (*structs.Identity, error) {
 	var providerEmail *string
 	if ni.Email != "" {
 		e := ni.Email

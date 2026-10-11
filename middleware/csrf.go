@@ -63,6 +63,18 @@ func isSSOCallbackPath(path string) bool {
 // strictly stronger than a double-submit cookie. The CSRF check can only ever
 // reject the legitimate caller.
 // ─────────────────────────────────────────────────────────────────────────────
+// hasSessionCookie reports whether r carries a browser session cookie: the
+// Monitor access token or the SSO session (sso.SessionCookie, named here to
+// avoid an import cycle).
+func hasSessionCookie(r *http.Request) bool {
+	for _, name := range []string{"mon-access-token", "mon_sso_session"} {
+		if c, err := r.Cookie(name); err == nil && c.Value != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func isBackchannelLogoutPath(path string) bool {
 	return strings.HasPrefix(path, "/auth/sso/") && strings.HasSuffix(path, "/backchannel-logout")
 }
@@ -87,7 +99,13 @@ func CSRFMiddleware(next http.Handler) http.Handler {
 
 		// Bearer-token clients are stateless API callers, not cookie-bearing
 		// browsers, so they are not subject to CSRF.
-		if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+		// Header-authenticated clients are stateless and not subject to CSRF —
+		// unless the request also carries a session cookie, in which case a
+		// forged request could add a junk header and ride the cookie. CORS
+		// preflight already stops that cross-origin; this keeps it stopped if
+		// an origin is ever allowlisted too broadly.
+		headerAuth := strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || r.Header.Get("X-Api-Key") != ""
+		if headerAuth && !hasSessionCookie(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -97,11 +115,6 @@ func CSRFMiddleware(next http.Handler) http.Handler {
 		// so — like Bearer — they are not subject to CSRF. This keeps the
 		// X-Api-Key → POST /v1/events ingest path working under the global CSRF
 		// middleware.
-		if r.Header.Get("X-Api-Key") != "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
 		if csrfExemptPaths[r.URL.Path] || isSSOCallbackPath(r.URL.Path) || isBackchannelLogoutPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
