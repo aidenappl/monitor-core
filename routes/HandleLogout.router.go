@@ -26,9 +26,9 @@ import (
 //     minted before the fid claim existed. Logging out then ends every device,
 //     the pre-fid behaviour, for at most one access lifetime.
 //
-// An SSO session in the browser is ended too, through RP-initiated logout:
-// redirect_url in the response is the provider's end-session endpoint, which
-// signs the user out there and — by back-channel logout — of every other app.
+// An SSO session in the browser is ended too — Monitor's only. redirect_url is
+// monitor-web's /login?signed_out=1; the provider session and other apps stay
+// signed in (go-oidc-session ≥ v0.1.2 does local logout by default).
 func HandleLogout(w http.ResponseWriter, r *http.Request) {
 	redirectURL := ""
 	if c, err := r.Cookie(sso.SessionCookie); err == nil && c.Value != "" {
