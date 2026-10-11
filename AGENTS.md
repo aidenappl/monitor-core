@@ -867,9 +867,9 @@ What remains is everything the library refuses to know:
   sessions. Revocation reaches the control plane and every zone within one access-token
   lifetime. The SSO cookie is set on `MON_COOKIE_DOMAIN` because the browser reaches
   `/auth/refresh` through monitor-web's proxy, which forwards the `Cookie` header.
-- **Logout** (`POST /auth/logout`) also ends the SSO session and returns `data.redirect_url`: the
-  provider's end-session URL (RP-initiated logout). Register
-  `{MON_WEB_URL}/login?signed_out=1` as a logout redirect URI with the provider.
+- **Logout** (`POST /auth/logout`) also ends Monitor's SSO session — **only Monitor's**
+  (go-oidc-session ≥ v0.1.2 is local by default) — and returns `data.redirect_url` =
+  `{MON_WEB_URL}/login?signed_out=1`. Forta and other apps stay signed in.
 - **Client secrets** are never stored/echoed in the clear: either a Keyring reference
   (`client_secret_ref`, resolved Keyring→env at login) or an AES-256-GCM value
   (`client_secret_enc`). The admin API exposes only a `has_secret` boolean.

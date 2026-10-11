@@ -12,8 +12,8 @@ github.com/aidenappl/go-keyring v1.0.2 h1:rD5qbs9T4Pyu1vmCYAgSzGdlzxeB2Ac+whycn6
 github.com/aidenappl/go-keyring v1.0.2/go.mod h1:QNxilp2a8ttZ2aR+qwa9j/NCma7GdTqkmJh2vKcYzRE=
 github.com/aidenappl/go-monitor v0.0.9-0.20260912224748-17017e52efeb h1:dSJO3WsMx6hU+0OOP5FfuyLAxSzV6GZYX6b553BlS1k=
 github.com/aidenappl/go-monitor v0.0.9-0.20260912224748-17017e52efeb/go.mod h1:oa9BLzq+hdIRTjg2q4P6SSgsRlDypYEga5zcbekCto8=
-github.com/aidenappl/go-oidc-session v0.1.0 h1:5W+4M5NW5oGvzB0ujJag+QJYu+A7Owp0ZfzRHW3QluE=
-github.com/aidenappl/go-oidc-session v0.1.0/go.mod h1:FLpgL2KLmSbRs1RnfFa4YKpdyN8Oia72ZtHLVHwOtFI=
+github.com/aidenappl/go-oidc-session v0.1.2 h1:ZgTWSALwYWfCYrwMcY57HaiM+HC2ttg/w+Yl45Pke9Y=
+github.com/aidenappl/go-oidc-session v0.1.2/go.mod h1:FLpgL2KLmSbRs1RnfFa4YKpdyN8Oia72ZtHLVHwOtFI=
 github.com/andybalholm/brotli v1.2.0 h1:ukwgCxwYrmACq68yiUqwIWnGY0cTPox/M94sVwToPjQ=
 github.com/andybalholm/brotli v1.2.0/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
