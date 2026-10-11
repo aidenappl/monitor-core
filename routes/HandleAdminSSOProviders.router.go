@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	sso "github.com/aidenappl/go-forta/sso"
+	sso "github.com/aidenappl/go-oidc-session"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"

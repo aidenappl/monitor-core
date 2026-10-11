@@ -7,7 +7,7 @@ import (
 	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
-	ssolib "github.com/aidenappl/go-forta/sso"
+	oidcsession "github.com/aidenappl/go-oidc-session"
 )
 
 // errNoRows is what a QueryRow scan returns for an absent row; the query layer
@@ -33,17 +33,17 @@ var userCols = []string{
 // only four fields of the provider participate in it. Constructing the row and
 // mapping it would couple every case in this file to the mapping's shape without
 // testing anything more.
-func testProvider(allowAutoLink, autoProvision bool) *ssolib.Provider {
-	return &ssolib.Provider{
+func testProvider(allowAutoLink, autoProvision bool) *oidcsession.Provider {
+	return &oidcsession.Provider{
 		Slug:          "google",
-		Kind:          ssolib.KindOIDC,
+		Kind:          oidcsession.KindOIDC,
 		AllowAutoLink: allowAutoLink,
 		AutoProvision: autoProvision,
 	}
 }
 
-func ni(provider, subject, email string, verified bool) ssolib.Identity {
-	return ssolib.Identity{
+func ni(provider, subject, email string, verified bool) oidcsession.Identity {
+	return oidcsession.Identity{
 		Provider:      provider,
 		Subject:       subject,
 		Email:         email,

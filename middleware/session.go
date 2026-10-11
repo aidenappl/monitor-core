@@ -70,40 +70,6 @@ func GetActor(ctx context.Context) (*structs.Actor, bool) {
 	return actor, true
 }
 
-// SSOCheckpoint is an injectable hook for periodic SSO-grant revocation checks.
-// It is nil in Phase 2 (checkpoint skipped). Phase 3.4 assigns it to
-// checkpointSSOGrant, which — for users whose session is backed by an SSO
-// identity — introspects the IdP on a TTL and returns false when the upstream
-// grant has been revoked (fail-open on network errors). When the hook returns
-// false the request is rejected, killing the local session. A nil hook always
-// passes. The hook itself decides whether a given user is SSO-backed; the
-// middleware simply consults it for every JWT-authenticated user.
-var SSOCheckpoint func(userID int64) bool
-
-// SSOCheckpointCtx is the context-aware form of SSOCheckpoint, and is preferred
-// over it whenever it is set. It receives the REQUEST's context, so the
-// introspection the checkpoint makes to the IdP (forta-api) can carry this
-// request's X-Request-ID — without it the IdP-side log line for a revocation
-// check cannot be tied back to the Monitor request that caused it.
-//
-// SSOCheckpoint is kept, unchanged, as the fallback: a nil SSOCheckpointCtx
-// consults SSOCheckpoint exactly as before, and a nil pair always passes.
-var SSOCheckpointCtx func(ctx context.Context, userID int64) bool
-
-// passesSSOCheckpoint runs whichever checkpoint hook is installed, preferring
-// the context-aware one. With neither installed it passes — SSO unconfigured is
-// a legitimate state, not a denial.
-func passesSSOCheckpoint(ctx context.Context, userID int64) bool {
-	if SSOCheckpointCtx != nil {
-		return SSOCheckpointCtx(ctx, userID)
-	}
-	if SSOCheckpoint != nil {
-		return SSOCheckpoint(userID)
-	}
-	return true
-}
-
-// GetUserFromContext returns the user injected by SessionMiddleware.
 func GetUserFromContext(ctx context.Context) (*structs.User, bool) {
 	user, ok := ctx.Value(UserContextKey).(*structs.User)
 	return user, ok
@@ -217,10 +183,6 @@ func validateSessionTokenCtx(ctx context.Context, tokenStr string) *structs.User
 
 	user, err := query.GetUserByID(db.SQL, userID)
 	if err != nil || user == nil || !user.Active {
-		return nil
-	}
-
-	if !passesSSOCheckpoint(ctx, userID) {
 		return nil
 	}
 

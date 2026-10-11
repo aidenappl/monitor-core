@@ -13,13 +13,13 @@
 //
 // What remains here is everything the library deliberately refuses to know:
 //
-//	config.go        — maps an sso_providers ROW onto ssolib.Provider, and
+//	config.go        — maps an sso_providers ROW onto oidcsession.Provider, and
 //	                   resolves the client secret (Keyring ref, then env, then
 //	                   AES-GCM column) — three mechanisms no library should own.
-//	statestore.go    — ssolib.StateStore over Monitor's settings KV table.
-//	sessionstore.go  — ssolib.SessionStore over sso_sessions, with AES-256-GCM
+//	statestore.go    — oidcsession.StateStore over Monitor's settings KV table.
+//	sessionstore.go  — oidcsession.SessionStore over sso_sessions, with AES-256-GCM
 //	                   encryption at rest.
-//	resolve.go       — ssolib.UserResolver: the link/provision decision matrix.
+//	resolve.go       — oidcsession.UserResolver: the link/provision decision matrix.
 //	                   ⚠️ THE MOST SECURITY-SENSITIVE FILE IN THE PACKAGE.
 //	checkpoint.go    — installs the library's Checkpointer into the session
 //	                   middleware.
@@ -36,8 +36,8 @@ import (
 	"strings"
 	"time"
 
-	ssolib "github.com/aidenappl/go-forta/sso"
 	keyring "github.com/aidenappl/go-keyring"
+	oidcsession "github.com/aidenappl/go-oidc-session"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/query"
@@ -56,7 +56,7 @@ const callbackPath = "/auth/sso/callback"
 // no use for — Enabled, ButtonLabel, ID — and because an admin API returns the row
 // shape, not the library's.
 type Provider struct {
-	*ssolib.Provider
+	*oidcsession.Provider
 
 	// Row is the sso_providers record this was built from.
 	Row *structs.SSOProvider
@@ -90,17 +90,16 @@ func (p *Provider) Enabled() bool { return p.Row != nil && p.Row.Enabled }
 // dereference is guarded. A nil IssuerURL reaching the library as "" produces a
 // clear Validate() error naming the field; a nil dereference here produces a
 // panic in the middle of a login.
-func toLibProvider(row *structs.SSOProvider, secret string) *ssolib.Provider {
-	return &ssolib.Provider{
+func toLibProvider(row *structs.SSOProvider, secret string) *oidcsession.Provider {
+	return &oidcsession.Provider{
 		Slug:        row.Slug,
 		DisplayName: row.DisplayName,
-		Kind:        ssolib.Kind(row.Kind),
+		Kind:        oidcsession.Kind(row.Kind),
 
-		IssuerURL:     deref(row.IssuerURL),
-		AuthorizeURL:  deref(row.AuthorizeURL),
-		TokenURL:      deref(row.TokenURL),
-		UserInfoURL:   deref(row.UserInfoURL),
-		IntrospectURL: deref(row.IntrospectURL),
+		IssuerURL:    deref(row.IssuerURL),
+		AuthorizeURL: deref(row.AuthorizeURL),
+		TokenURL:     deref(row.TokenURL),
+		UserInfoURL:  deref(row.UserInfoURL),
 
 		ClientID:     deref(row.ClientID),
 		ClientSecret: secret,

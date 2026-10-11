@@ -3,7 +3,7 @@ package routes
 import (
 	"net/http"
 
-	ssolib "github.com/aidenappl/go-forta/sso"
+	oidcsession "github.com/aidenappl/go-oidc-session"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/query"
@@ -67,24 +67,27 @@ func HandleLinkIdentity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	adapter, err := ssolib.NewAdapter(r.Context(), provider.Provider)
+	adapter, err := oidcsession.NewAdapter(r.Context(), provider.Provider)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "sso provider misconfigured", err)
 		return
 	}
 
-	state, nonce, verifier, err := ssolib.GenerateLinkState(r.Context(), sso.NewStateStore(db.SQL), slug, linkReturnURL, user.ID)
+	state, nonce, verifier, err := oidcsession.GenerateLinkState(r.Context(), sso.NewStateStore(db.SQL), slug, linkReturnURL, user.ID)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to start link", err)
 		return
 	}
 
-	authURL, err := adapter.AuthCodeURL(state, nonce, verifier)
+	authURL, err := adapter.AuthCodeURL(state, nonce, verifier, oidcsession.AuthOptions{})
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to build authorize url", err)
 		return
 	}
 
+	// The callback requires this cookie (login CSRF). The browser stores it
+	// from this credentialed same-site response before navigating to authURL.
+	setSSOStateCookie(w, state)
 	telemetry.Debug(r.Context(), "auth.identity.link.started", map[string]any{"user_id": user.ID, "provider": slug})
 	responder.New(w, linkIdentityResponse{AuthorizeURL: authURL}, "link started")
 }
@@ -132,14 +135,15 @@ func HandleUnlinkIdentity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If this SSO identity backed a revocation checkpoint session, drop it too.
+	// End the SSO sessions this identity backed: once unlinked, the provider no
+	// longer speaks for this account.
 	if slug != "password" {
-		if delErr := query.DeleteSSOSession(db.SQL, user.ID); delErr != nil {
+		if _, delErr := sso.Store().DeleteSessionsBySubject(r.Context(), slug, identity.ProviderUserID); delErr != nil {
 			telemetry.WarnErr(r.Context(), "auth.identity.unlink.session.failed", delErr, map[string]any{
 				"user_id":    user.ID,
 				"provider":   slug,
 				"dependency": "mariadb",
-				"outcome":    "unlinked, but the cached IdP session remains and the checkpoint keeps consulting it",
+				"outcome":    "unlinked, but SSO sessions from this identity remain until their next refresh",
 			})
 		}
 	}

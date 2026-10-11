@@ -8,6 +8,7 @@ import (
 	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
+	"github.com/aidenappl/monitor-core/sso"
 	"github.com/aidenappl/monitor-core/telemetry"
 )
 
@@ -25,8 +26,15 @@ import (
 //     minted before the fid claim existed. Logging out then ends every device,
 //     the pre-fid behaviour, for at most one access lifetime.
 //
-// (SSO-session cleanup — dropping cached IdP tokens — is Phase 3.)
+// An SSO session in the browser is ended too, through RP-initiated logout:
+// redirect_url in the response is the provider's end-session endpoint, which
+// signs the user out there and — by back-channel logout — of every other app.
 func HandleLogout(w http.ResponseWriter, r *http.Request) {
+	redirectURL := ""
+	if c, err := r.Cookie(sso.SessionCookie); err == nil && c.Value != "" {
+		redirectURL = sso.Manager().Logout(w, r)
+	}
+
 	user, ok := middleware.GetUserFromContext(r.Context())
 	if !ok || user == nil {
 		// SessionMiddleware should guarantee this, but never revoke blindly.
@@ -59,7 +67,7 @@ func HandleLogout(w http.ResponseWriter, r *http.Request) {
 		"revoke_scope": path,
 		"revoked":      rErr == nil,
 	})
-	responder.New(w, nil, "logged out")
+	responder.New(w, map[string]string{"redirect_url": redirectURL}, "logged out")
 }
 
 // logoutFamily resolves the family to revoke and names the path that found it:

@@ -1,11 +1,10 @@
 package routes
 
 import (
-	"context"
 	"net/http"
 	"net/url"
 
-	ssolib "github.com/aidenappl/go-forta/sso"
+	oidcsession "github.com/aidenappl/go-oidc-session"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/sso"
@@ -27,21 +26,40 @@ const loginErrorPath = "/login"
 //     the id_token signature/iss/aud/exp AND the nonce.
 //  4. Resolve the identity to a Monitor user (link/provision rules in
 //     sso.ResolveIdentity); reject inactive accounts.
-//  5. Cache the (encrypted) IdP tokens for the revocation checkpoint, then mint
-//     Monitor's own session and redirect to the sanitized return_url.
+//  5. Open an SSO session (sso.Manager().IssueSession — the provider's tokens,
+//     encrypted, behind the mon_sso_session cookie) and mint Monitor's own
+//     token family, then redirect to the sanitized return_url. Every later
+//     /auth/refresh re-confirms the SSO session, so the family lives exactly as
+//     long as the provider session.
 //
 // All failures redirect to /login?error=<code> rather than rendering an error,
 // since this endpoint is reached by a top-level browser navigation.
 func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
+	state := r.URL.Query().Get("state")
+
+	// The login must finish in the browser that started it (login CSRF): the
+	// state is only accepted alongside the cookie HandleSSOLogin set.
+	bound := ssoStateCookieMatches(r, state)
+	clearSSOStateCookie(w)
+
 	if errCode := r.URL.Query().Get("error"); errCode != "" {
+		// The provider's "not signed in" answer to a silent (prompt=none)
+		// attempt: the login page shows the form, with no error.
+		if ssoInteractionRequired(errCode) {
+			returnURL := "/"
+			if sd, err := oidcsession.ConsumeState(r.Context(), sso.NewStateStore(db.SQL), state); err == nil {
+				returnURL = safeReturnURL(sd.ReturnURL)
+			}
+			redirectLoginRequired(w, r, returnURL)
+			return
+		}
 		ssoCallbackFailed(r, "", "sso_denied", nil, nil)
 		redirectLoginError(w, r, "sso_denied")
 		return
 	}
 
 	code := r.URL.Query().Get("code")
-	state := r.URL.Query().Get("state")
-	if code == "" || state == "" {
+	if code == "" || state == "" || !bound {
 		ssoCallbackFailed(r, "", "sso_missing_params", nil, nil)
 		redirectLoginError(w, r, "sso_missing_params")
 		return
@@ -50,7 +68,7 @@ func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
 	// Validate + consume state (single-use). The provider slug is carried in the
 	// state record (set at /login), so the callback path itself is provider-
 	// agnostic.
-	stateData, err := ssolib.ConsumeState(r.Context(), sso.NewStateStore(db.SQL), state)
+	stateData, err := oidcsession.ConsumeState(r.Context(), sso.NewStateStore(db.SQL), state)
 	if err != nil || stateData.Provider == "" {
 		ssoCallbackFailed(r, "", "sso_state_invalid", err, nil)
 		redirectLoginError(w, r, "sso_state_invalid")
@@ -65,7 +83,7 @@ func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	adapter, err := ssolib.NewAdapter(r.Context(), provider.Provider)
+	adapter, err := oidcsession.NewAdapter(r.Context(), provider.Provider)
 	if err != nil {
 		ssoCallbackBroken(r, slug, "sso_adapter_failed", err)
 		redirectLoginError(w, r, "sso_provider_unavailable")
@@ -103,15 +121,10 @@ func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cache the IdP tokens (encrypted at rest) so the checkpoint can introspect
-	// the upstream grant later. A failure here is non-fatal to login — worst
-	// case the session simply isn't checkpointed.
-	if err := cacheSSOSession(r.Context(), user.ID, slug, identity, tokens); err != nil {
-		telemetry.WarnErr(r.Context(), "auth.sso.session.cache.failed", err, map[string]any{
-			"user_id":  user.ID,
-			"provider": slug,
-			"outcome":  "logged in, but this session is not checked against the IdP for revocation",
-		})
+	if _, err := sso.Manager().IssueSession(w, r, slug, user.ID, *identity, *tokens); err != nil {
+		ssoCallbackBroken(r, slug, "sso_session_failed", err)
+		redirectLoginError(w, r, "sso_session_failed")
+		return
 	}
 
 	if err := issueSession(w, user.ID, user.Role); err != nil {
@@ -165,7 +178,7 @@ func ssoCallbackBroken(r *http.Request, provider, reason string, err error) {
 // already bound to a DIFFERENT user, treats a re-link of the same user as a
 // no-op success, and redirects back to the settings return_url either way. No
 // new session is issued — the caller was already authenticated.
-func linkSSOIdentity(w http.ResponseWriter, r *http.Request, engine db.Queryable, linkUserID int64, slug string, ni ssolib.Identity, returnURL string) {
+func linkSSOIdentity(w http.ResponseWriter, r *http.Request, engine db.Queryable, linkUserID int64, slug string, ni oidcsession.Identity, returnURL string) {
 	if err := sso.LinkIdentity(engine, linkUserID, ni); err != nil {
 		// sso.LinkIdentity refuses to move an identity already owned by a different
 		// user. That refusal is the security property — without it, linking is a way
@@ -201,30 +214,6 @@ func redirectLinkResult(w http.ResponseWriter, r *http.Request, returnURL, key, 
 	http.Redirect(w, r, u.String(), http.StatusFound)
 }
 
-// cacheSSOSession stores the IdP tokens for the revocation checkpoint.
-//
-// Encryption at rest is the SessionStore's job — see sso/sessionstore.go. This
-// function exists only to build the library's Session shape from what the exchange
-// returned.
-func cacheSSOSession(ctx context.Context, userID int64, slug string, identity *ssolib.Identity, tokens *ssolib.TokenSet) error {
-	return sso.NewSessionStore(db.SQL).SaveSession(ctx, userID, ssolib.Session{
-		Provider: slug,
-		Subject:  identity.Subject,
-
-		// ⚠️ THIS IS THE ONLY MOMENT `sid` IS AVAILABLE. It lives in the id_token
-		// of this exchange and nowhere else — not in the access token, not in
-		// UserInfo, not in any later introspection. A session saved without it is
-		// unreachable by a session-scoped back-channel logout for the rest of its
-		// life, and no migration can repair that.
-		//
-		// Empty is normal: go-forta reads it from the verified id_token only, and
-		// a conforming OIDC provider need not issue one.
-		SID: identity.SID,
-
-		Tokens: *tokens,
-	})
-}
-
 // redirectLoginError sends the browser to the web app's /login?error=<code>.
 func redirectLoginError(w http.ResponseWriter, r *http.Request, code string) {
 	u, _ := url.Parse(webAppURL(loginErrorPath))
@@ -232,4 +221,28 @@ func redirectLoginError(w http.ResponseWriter, r *http.Request, code string) {
 	q.Set("error", code)
 	u.RawQuery = q.Encode()
 	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+// redirectLoginRequired sends the browser to /login?error=login_required,
+// keeping where it was going.
+func redirectLoginRequired(w http.ResponseWriter, r *http.Request, returnURL string) {
+	u, _ := url.Parse(webAppURL(loginErrorPath))
+	q := u.Query()
+	q.Set("error", "login_required")
+	if returnURL != "/" {
+		// monitor-web's login page round-trips its destination as ?next=.
+		q.Set("next", returnURL)
+	}
+	u.RawQuery = q.Encode()
+	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+// ssoInteractionRequired reports the OIDC Core §3.1.2.6 errors that mean the
+// provider would have to show the user something.
+func ssoInteractionRequired(code string) bool {
+	switch code {
+	case "login_required", "interaction_required", "consent_required", "account_selection_required":
+		return true
+	}
+	return false
 }

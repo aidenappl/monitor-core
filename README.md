@@ -602,7 +602,7 @@ credential kinds coexist:
 
 Auth/identity data lives in MariaDB (`monitor_auth`): `users`, `identities`
 (`UNIQUE(provider, provider_user_id)` — true account linking, one user ↔ many sign-in
-methods), `refresh_tokens`, `sso_providers`, `sso_sessions`, `settings`, `api_keys`, plus
+methods), `refresh_tokens`, `sso_providers`, `oidc_sessions`, `settings`, `api_keys`, plus
 the tenancy registry (`zones`, `projects`). The second MariaDB schema, `monitor`, holds
 observability data on the same connection: `issues`, `issue_timeline`, `issue_links`,
 `service_repos`, and the alerting/dashboard configuration (`alert_rules`,
@@ -615,13 +615,17 @@ Endpoint surface (browser/cookie-oriented, outside `/v1`):
 POST   /auth/login | /auth/register | /auth/refresh | /auth/logout
 GET/PUT /auth/self
 GET    /auth/self/identities   POST/DELETE /auth/self/identities/{slug}
-GET    /auth/sso/config | /auth/sso/{slug}/login | /auth/sso/{slug}/callback
+GET    /auth/sso/config | /auth/sso/{slug}/login (?prompt=none&return_url=) | /auth/sso/callback
+POST   /auth/sso/{slug}/backchannel-logout   (OIDC Back-Channel Logout; public)
 GET/POST /admin/sso-providers   PUT/DELETE /admin/sso-providers/{slug}   (admin only)
 ```
 
-The SSO protocol itself lives in [`go-forta/sso`](https://github.com/aidenappl/go-forta/tree/main/sso)
-(v1.6.0) — this repo keeps only the parts that library refuses to know: the provider-row mapping,
-secret resolution, state and session storage, and the identity-resolution rules.
+The SSO protocol itself lives in [`go-oidc-session`](https://github.com/aidenappl/go-oidc-session)
+— this repo keeps only the parts that library refuses to know: the provider-row mapping, secret
+resolution, state storage, and the identity-resolution rules. An SSO sign-in opens a server-side
+SSO session (`mon_sso_session`, provider tokens encrypted in `oidc_sessions`); every
+`/auth/refresh` refreshes it against the provider, so a Monitor session lasts exactly as long as
+the provider session and ends within one access-token lifetime of a revocation.
 
 SSO providers are config rows (OIDC via discovery, or explicit-URL OAuth2). Adding one —
 Google, Okta, Entra, Forta, anything else — is a `POST /admin/sso-providers`, never a
@@ -862,7 +866,7 @@ monitor-core/
   tools/                      # Password.tool.go (bcrypt 12), Crypto.go (AES-256-GCM), Validate.tool.go (+ NormalizeEndpointURL), Slug.tool.go
   probe/zone.go               # Zone reachability probe: calls a zone's /health + /ready and reports healthy/degraded/unverified/MISMATCHED — the check that catches a registry row pointed at the wrong box
   bootstrap/                  # First-run seeding: admin.go (first admin user), registry.go (zone + default project)
-  sso/                        # Pluggable SSO wiring onto go-forta/sso: config.go, resolve.go, checkpoint.go, statestore.go, sessionstore.go, backchannel.go
+  sso/                        # Pluggable SSO wiring onto go-oidc-session: config.go, resolve.go, statestore.go, session.go (Manager)
   query/                      # MariaDB query layer (squirrel): users/identities/refresh_tokens/sso_*/api_keys/zones/projects/issues/service_repos/alert_rules/notification_channels/notification_policies/service_groups/dashboards/saved_views
   scope/                      # The request's project: context plumbing + the predicate every event read must carry
   structs/                    # User/Identity/SSOProvider/SSOSession/RefreshToken/APIKey/Zone/Project/Issue/AlertRule/NotificationChannel/NotificationPolicy/ServiceGroup/Dashboard/SavedView + event/analytics + columns.go (shared identifier regex + column allowlists)

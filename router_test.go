@@ -138,7 +138,7 @@ var deployedSurface = []string{
 	"POST /auth/refresh",
 	"POST /auth/register",
 	"POST /auth/self/identities/{slug}",
-	"POST /auth/sso/forta/backchannel-logout",
+	"POST /auth/sso/{slug}/backchannel-logout", // one per provider; the registered /auth/sso/forta/… still resolves here
 	"POST /v1/alert-rules",
 	"POST /v1/alert-rules/{id}/test",
 	"POST /v1/analytics",
@@ -222,7 +222,7 @@ var controlPlaneOnly = []string{
 	"GET /auth/sso/{slug}/login",
 	"GET /auth/sso/icon/{slug}",
 	"GET /auth/sso/callback",
-	"POST /auth/sso/forta/backchannel-logout",
+	"POST /auth/sso/{slug}/backchannel-logout", // one per provider; the registered /auth/sso/forta/… still resolves here
 	"GET /admin/sso-providers",
 	"POST /admin/sso-providers",
 	"PUT /admin/sso-providers/{slug}",
