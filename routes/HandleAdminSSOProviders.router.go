@@ -28,7 +28,6 @@ type adminProviderView struct {
 	TokenURL           *string `json:"token_url,omitempty"`
 	UserInfoURL        *string `json:"userinfo_url,omitempty"`
 	JWKSURL            *string `json:"jwks_url,omitempty"`
-	IntrospectURL      *string `json:"introspect_url,omitempty"`
 	ClientID           *string `json:"client_id,omitempty"`
 	Scopes             string  `json:"scopes"`
 	EmailClaim         string  `json:"email_claim"`
@@ -64,7 +63,6 @@ func toAdminView(p *structs.SSOProvider) adminProviderView {
 		TokenURL:           p.TokenURL,
 		UserInfoURL:        p.UserInfoURL,
 		JWKSURL:            p.JWKSURL,
-		IntrospectURL:      p.IntrospectURL,
 		ClientID:           p.ClientID,
 		Scopes:             p.Scopes,
 		EmailClaim:         p.EmailClaim,
@@ -114,7 +112,6 @@ type ssoProviderBody struct {
 	TokenURL           *string `json:"token_url"`
 	UserInfoURL        *string `json:"userinfo_url"`
 	JWKSURL            *string `json:"jwks_url"`
-	IntrospectURL      *string `json:"introspect_url"`
 	ClientID           *string `json:"client_id"`
 	ClientSecret       *string `json:"client_secret"`
 	ClientSecretRef    *string `json:"client_secret_ref"`
@@ -242,7 +239,6 @@ func validateProviderURLs(body *ssoProviderBody) (string, bool) {
 		{"token_url", body.TokenURL},
 		{"userinfo_url", body.UserInfoURL},
 		{"jwks_url", body.JWKSURL},
-		{"introspect_url", body.IntrospectURL},
 	}
 	for _, c := range checks {
 		if c.val != nil && *c.val != "" {
@@ -283,7 +279,6 @@ func HandleCreateSSOProvider(w http.ResponseWriter, r *http.Request) {
 		TokenURL:           body.TokenURL,
 		UserInfoURL:        body.UserInfoURL,
 		JWKSURL:            body.JWKSURL,
-		IntrospectURL:      body.IntrospectURL,
 		ClientID:           body.ClientID,
 		ClientSecretRef:    body.ClientSecretRef,
 		Scopes:             body.Scopes,
@@ -368,7 +363,6 @@ func HandleUpdateSSOProvider(w http.ResponseWriter, r *http.Request) {
 		TokenURL:           body.TokenURL,
 		UserInfoURL:        body.UserInfoURL,
 		JWKSURL:            body.JWKSURL,
-		IntrospectURL:      body.IntrospectURL,
 		ClientID:           body.ClientID,
 		ClientSecretRef:    body.ClientSecretRef,
 		Scopes:             body.Scopes,

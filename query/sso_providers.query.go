@@ -12,7 +12,7 @@ import (
 
 var ssoProviderColumns = []string{
 	"id", "slug", "display_name", "kind", "issuer_url", "authorize_url",
-	"token_url", "userinfo_url", "jwks_url", "introspect_url", "client_id",
+	"token_url", "userinfo_url", "jwks_url", "client_id",
 	"client_secret_ref", "client_secret_enc", "scopes", "email_claim",
 	"email_verified_claim", "trust_email_verified", "subject_claim", "button_label",
 	"allow_auto_link", "auto_provision", "enabled", "inserted_at",
@@ -31,7 +31,7 @@ func scanSSOProvider(row ssoProviderScanner) (*structs.SSOProvider, error) {
 	var p structs.SSOProvider
 	err := row.Scan(
 		&p.ID, &p.Slug, &p.DisplayName, &p.Kind, &p.IssuerURL, &p.AuthorizeURL,
-		&p.TokenURL, &p.UserInfoURL, &p.JWKSURL, &p.IntrospectURL, &p.ClientID,
+		&p.TokenURL, &p.UserInfoURL, &p.JWKSURL, &p.ClientID,
 		&p.ClientSecretRef, &p.ClientSecretEnc, &p.Scopes, &p.EmailClaim,
 		&p.EmailVerifiedClaim, &p.TrustEmailVerified, &p.SubjectClaim, &p.ButtonLabel,
 		&p.AllowAutoLink, &p.AutoProvision, &p.Enabled, &p.InsertedAt,
@@ -113,7 +113,6 @@ type CreateProviderRequest struct {
 	TokenURL           *string
 	UserInfoURL        *string
 	JWKSURL            *string
-	IntrospectURL      *string
 	ClientID           *string
 	ClientSecretRef    *string
 	ClientSecretEnc    *string
@@ -150,7 +149,6 @@ func CreateProvider(engine db.Queryable, req CreateProviderRequest) (*structs.SS
 		"token_url":         req.TokenURL,
 		"userinfo_url":      req.UserInfoURL,
 		"jwks_url":          req.JWKSURL,
-		"introspect_url":    req.IntrospectURL,
 		"client_id":         req.ClientID,
 		"client_secret_ref": req.ClientSecretRef,
 		"client_secret_enc": req.ClientSecretEnc,
@@ -217,7 +215,6 @@ type UpdateProviderRequest struct {
 	TokenURL           *string
 	UserInfoURL        *string
 	JWKSURL            *string
-	IntrospectURL      *string
 	ClientID           *string
 	ClientSecretRef    *string
 	ClientSecretEnc    *string
@@ -259,7 +256,6 @@ func UpdateProvider(engine db.Queryable, slug string, req UpdateProviderRequest)
 	apply("token_url", req.TokenURL, req.TokenURL != nil)
 	apply("userinfo_url", req.UserInfoURL, req.UserInfoURL != nil)
 	apply("jwks_url", req.JWKSURL, req.JWKSURL != nil)
-	apply("introspect_url", req.IntrospectURL, req.IntrospectURL != nil)
 	apply("client_id", req.ClientID, req.ClientID != nil)
 	apply("client_secret_ref", req.ClientSecretRef, req.ClientSecretRef != nil)
 	apply("client_secret_enc", req.ClientSecretEnc, req.ClientSecretEnc != nil)

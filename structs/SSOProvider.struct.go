@@ -19,7 +19,6 @@ type SSOProvider struct {
 	TokenURL           *string `json:"token_url,omitempty"`
 	UserInfoURL        *string `json:"userinfo_url,omitempty"`
 	JWKSURL            *string `json:"jwks_url,omitempty"`
-	IntrospectURL      *string `json:"introspect_url,omitempty"`
 	ClientID           *string `json:"client_id,omitempty"`
 	ClientSecretRef    *string `json:"-"`
 	ClientSecretEnc    *string `json:"-"`

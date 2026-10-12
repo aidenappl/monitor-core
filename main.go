@@ -321,7 +321,7 @@ func main() {
 	}
 
 	// Connect to MariaDB (relational auth data layer: users, identities,
-	// refresh_tokens, sso_providers, sso_sessions, settings, api_keys).
+	// refresh_tokens, sso_providers, oidc_sessions, settings, api_keys).
 	if err := db.InitSQL(); err != nil {
 		telemetry.Fatal("mariadb.connect.failed", "failed to connect to MariaDB", err, map[string]any{"reason": "mariadb_unreachable"})
 	}

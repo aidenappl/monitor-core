@@ -22,7 +22,7 @@ const (
 )
 
 // SQL is the global MariaDB connection for the relational auth data layer
-// (users, identities, refresh_tokens, sso_providers, sso_sessions, settings,
+// (users, identities, refresh_tokens, sso_providers, oidc_sessions, settings,
 // api_keys). It lives alongside the ClickHouse connection (Conn), which
 // remains the store for events/analytics.
 var SQL *sql.DB
