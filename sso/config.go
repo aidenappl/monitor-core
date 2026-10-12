@@ -17,8 +17,8 @@
 //	                   resolves the client secret (Keyring ref, then env, then
 //	                   AES-GCM column) — three mechanisms no library should own.
 //	statestore.go    — oidcsession.StateStore over Monitor's settings KV table.
-//	sessionstore.go  — oidcsession.SessionStore over sso_sessions, with AES-256-GCM
-//	                   encryption at rest.
+//	session.go       — the go-oidc-session Manager; sessions in oidc_sessions
+//	                   (sqlstore), tokens sealed with AES-256-GCM.
 //	resolve.go       — oidcsession.UserResolver: the link/provision decision matrix.
 //	                   ⚠️ THE MOST SECURITY-SENSITIVE FILE IN THE PACKAGE.
 //	checkpoint.go    — installs the library's Checkpointer into the session
