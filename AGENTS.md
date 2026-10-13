@@ -1974,6 +1974,14 @@ are listed in §4.
 
 ## 8. Operations
 
+- **CI runners:** every job runs on `[self-hosted, lattice-worker]` — a single-use runner
+  started by `aidenappl/gh-runner-broker` on the CI host (`aplb-actions`, 10.15.10.78), with
+  the toolchain and shared Go caches that `TeamTrailblaze/runner-setup` provisions. Images
+  build through the host's `lattice-builder` BuildKit (`builder: lattice-builder`), never
+  `docker/setup-buildx-action`, which races other runners on the shared Docker daemon.
+  `setup-go` runs with `cache: false`; the runner's `.env` already points at the host caches.
+  Jobs wait in "Queued" if the broker or the host is down — check the `gh-runner-broker`
+  service in Monitor (zone `appleby`) first.
 - **Deploy:** on a push to `main`, `build-and-deploy.yml` builds the image to
   `registry.appleby.cloud/monitor-core` and fires the Lattice automation behind the
   `LATTICE_DEPLOY_URL` secret, which redeploys every zone's container — see the CI notes under
