@@ -38,7 +38,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v7.0.1
 
       - name: Inject Keyring secrets
         id: keyring
@@ -57,7 +57,7 @@ jobs:
           docker buildx inspect lattice-builder
 
       - name: Login to Registry
-        uses: docker/login-action@v3.4.0
+        uses: docker/login-action@v4.6.0
         with:
           registry: ${{ env.REGISTRY_URL }}
           username: ${{ env.REGISTRY_USERNAME }}
@@ -65,7 +65,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5.7.0
+        uses: docker/metadata-action@v6.2.0
         with:
           images: ${{ env.REGISTRY_URL }}/${{ github.event.repository.name }}
           tags: |
@@ -74,7 +74,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           builder: lattice-builder
           context: .
