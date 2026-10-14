@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/aidenappl/monitor-core/env"
 	"html"
 	"net"
 	"net/http"
@@ -225,13 +226,32 @@ type emailConfig struct {
 	To           string `json:"to"`
 }
 
+// withServerSMTP fills a channel that names no SMTP server of its own from the
+// server-wide MON_SMTP_* settings, so a channel can be just {"to": "..."}.
+// A channel that sets smtp_host keeps all of its own settings: the two are
+// never mixed, or a channel's username would be sent to the server's host.
+func withServerSMTP(c emailConfig) emailConfig {
+	if c.SMTPHost != "" || env.SMTPHost == "" {
+		return c
+	}
+	c.SMTPHost = env.SMTPHost
+	c.SMTPPort = env.SMTPPort
+	c.SMTPUsername = env.SMTPUsername
+	c.SMTPPassword = env.SMTPPassword
+	if c.FromEmail == "" {
+		c.FromEmail = env.SMTPFrom
+	}
+	return c
+}
+
 func (n *Notifier) sendEmail(channel *structs.NotificationChannel, alertName, message string, value float64) error {
 	var config emailConfig
 	if err := json.Unmarshal([]byte(channel.Config), &config); err != nil {
 		return notifyError("email", "config", fmt.Errorf("invalid email config: %w", err))
 	}
+	config = withServerSMTP(config)
 	if config.SMTPHost == "" || config.To == "" {
-		return notifyError("email", "config", fmt.Errorf("smtp_host and to are required for email channels"))
+		return notifyError("email", "config", fmt.Errorf("smtp_host and to are required for email channels (set them on the channel, or MON_SMTP_* on the server)"))
 	}
 	if config.SMTPPort == "" {
 		config.SMTPPort = "587"

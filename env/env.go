@@ -34,7 +34,16 @@ var (
 	ClickHouseMaxMemoryUsage int
 
 	// MariaDB (relational auth data layer — users, identities, tokens, api_keys)
-	MonDBDSN      string
+	MonDBDSN string
+
+	// Server-wide SMTP for email notification channels that carry no
+	// smtp_host of their own (alerts/notifier.go). Sourced from Keyring
+	// (MON_SMTP_*); all empty means a channel must configure its own.
+	SMTPHost      string
+	SMTPPort      string
+	SMTPUsername  string
+	SMTPPassword  string
+	SMTPFrom      string
 	FlushInterval time.Duration
 	QueueSize     int
 
@@ -170,6 +179,12 @@ func Load() {
 	// into the environment before Load() runs. The fallback targets the local
 	// docker-compose MariaDB (host port 3336) so build/tests don't require Keyring.
 	MonDBDSN = getEnv("MON_DB_DSN", "monitor:monitor@tcp(127.0.0.1:3336)/monitor_auth")
+
+	SMTPHost = getEnv("MON_SMTP_HOST", "")
+	SMTPPort = getEnv("MON_SMTP_PORT", "")
+	SMTPUsername = getEnv("MON_SMTP_USERNAME", "")
+	SMTPPassword = getEnv("MON_SMTP_PASSWORD", "")
+	SMTPFrom = getEnv("MON_SMTP_FROM", "")
 
 	// Monitor-owned session auth (Phase 2). The dev fallbacks let build/tests run
 	// without Keyring; production sources these from Keyring (MON_JWT_SIGNING_KEY,
