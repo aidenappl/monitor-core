@@ -2,10 +2,16 @@ package structs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 )
+
+// ErrInvalidFilterValue marks a filter whose value cannot be compared the way
+// its operator needs (a non-number for lt/gt/lte/gte). It is the caller's
+// mistake, so routes answer 400 for it, never 500.
+var ErrInvalidFilterValue = errors.New("invalid filter value")
 
 // DataOperand decides how a data.* filter compares — as a number or as text —
 // and returns the argument converted to match. Every data filter site
@@ -32,7 +38,7 @@ func DataOperand(op string, value any) (arg any, numeric bool, raw bool, err err
 	case "lt", "gt", "lte", "gte":
 		f, ok := numberOf(value)
 		if !ok {
-			return nil, false, false, fmt.Errorf("operator %s needs a number, got %v", op, value)
+			return nil, false, false, fmt.Errorf("%w: operator %s needs a number, got %v", ErrInvalidFilterValue, op, value)
 		}
 		return f, true, false, nil
 	case "eq", "", "neq":

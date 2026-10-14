@@ -2,6 +2,7 @@ package structs
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -35,6 +36,9 @@ func TestDataOperand(t *testing.T) {
 			arg, numeric, raw, err := DataOperand(tt.op, tt.value)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && !errors.Is(err, ErrInvalidFilterValue) {
+				t.Fatalf("err = %v, want it to wrap ErrInvalidFilterValue", err)
 			}
 			if tt.wantErr {
 				return

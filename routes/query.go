@@ -1,6 +1,8 @@
 package routes
 
 import (
+	"errors"
+	"github.com/aidenappl/monitor-core/structs"
 	"net/http"
 	"strconv"
 	"strings"
@@ -106,6 +108,9 @@ func GetDataValuesHandler(w http.ResponseWriter, r *http.Request) {
 func isFilterValidationError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, structs.ErrInvalidFilterValue) {
+		return true
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "invalid filter column") ||
