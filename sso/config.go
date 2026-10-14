@@ -115,11 +115,13 @@ func toLibProvider(row *structs.SSOProvider, secret string) *oidcsession.Provide
 		AllowAutoLink: row.AllowAutoLink,
 		AutoProvision: row.AutoProvision,
 
-		// FetchUserInfo stays OFF for kind=oidc. Monitor reads identity from the
-		// id_token, which is signed; UserInfo would be an extra round trip on every
-		// login for claims it already has. The library still enforces the OIDC Core
-		// §5.3.2 sub check whenever it IS enabled.
-		FetchUserInfo: false,
+		// FetchUserInfo is ON for kind=oidc. Forta's id_token carries only
+		// sub/auth_time/sid — no email or name — so reading the id_token alone
+		// provisioned every Forta account with email "" (and the UNIQUE email
+		// then refused the next one). UserInfo is one call per sign-in, never
+		// per request, and the library enforces the OIDC Core §5.3.2 sub match.
+		// keyring-api does the same.
+		FetchUserInfo: true,
 	}
 }
 

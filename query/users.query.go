@@ -109,6 +109,7 @@ func CreateUser(engine db.Queryable, req CreateUserRequest) (*structs.User, erro
 }
 
 type UpdateUserRequest struct {
+	Email         *string
 	Name          *string
 	DisplayName   *string
 	Role          *string
@@ -121,6 +122,10 @@ func UpdateUser(engine db.Queryable, id int64, req UpdateUserRequest) (*structs.
 	q := sq.Update("users").Where(sq.Eq{"id": id})
 
 	hasUpdate := false
+	if req.Email != nil {
+		q = q.Set("email", *req.Email)
+		hasUpdate = true
+	}
 	if req.Name != nil {
 		q = q.Set("name", *req.Name)
 		hasUpdate = true
