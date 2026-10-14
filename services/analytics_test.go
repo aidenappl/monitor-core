@@ -59,7 +59,15 @@ func TestBuildSingleFilterSQL(t *testing.T) {
 		{"data eq escaped", structs.QueryFilter{Field: "data.latency_ms", Operator: "eq", Value: "a&b"},
 			wantGuardedString + " = ?", []any{"a&b"}},
 		{"data eq number", structs.QueryFilter{Field: "data.latency_ms", Operator: "eq", Value: float64(5)},
-			wantGuardedString + " = ?", []any{float64(5)}},
+			wantGuardedNumber + " = ?", []any{float64(5)}},
+		{"data eq bool", structs.QueryFilter{Field: "data.latency_ms", Operator: "eq", Value: false},
+			wantGuardedRaw + " = ?", []any{"false"}},
+		{"data gt numeric string", structs.QueryFilter{Field: "data.latency_ms", Operator: "gt", Value: "250"},
+			wantGuardedNumber + " > ?", []any{float64(250)}},
+		{"data in numbers", structs.QueryFilter{Field: "data.latency_ms", Operator: "in", Value: []any{float64(500), float64(502)}},
+			wantGuardedNumber + " IN (?, ?)", []any{float64(500), float64(502)}},
+		{"data in mixed is text", structs.QueryFilter{Field: "data.latency_ms", Operator: "in", Value: []any{"x", float64(5)}},
+			wantGuardedString + " IN (?, ?)", []any{"x", "5"}},
 		{"data neq", structs.QueryFilter{Field: "data.latency_ms", Operator: "neq", Value: "api"},
 			wantGuardedString + " != ?", []any{"api"}},
 		{"data lt", structs.QueryFilter{Field: "data.latency_ms", Operator: "lt", Value: float64(100)},
@@ -89,6 +97,9 @@ func TestBuildSingleFilterSQL(t *testing.T) {
 
 	if _, _, err := buildSingleFilter(structs.QueryFilter{Field: "data.x')--", Operator: "eq", Value: "v"}); err == nil {
 		t.Error("an invalid data key was accepted")
+	}
+	if _, _, err := buildSingleFilter(structs.QueryFilter{Field: "data.latency_ms", Operator: "gt", Value: "slow"}); err == nil {
+		t.Error("a non-numeric value for gt was accepted")
 	}
 	if _, _, err := buildSingleFilter(structs.QueryFilter{Field: "data.latency_ms", Operator: "bogus", Value: "v"}); err == nil {
 		t.Error("an unsupported operator was accepted")

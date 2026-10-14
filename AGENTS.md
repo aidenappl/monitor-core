@@ -361,6 +361,16 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
   constants `DEFAULT_LIMIT=50`/`MAX_LIMIT=500` in `db/sql.go`. Multi-step writes (register,
   admin bootstrap, SSO provision) run in a transaction so a failed identity insert can't
   orphan a `UNIQUE(email)` user row.
+- **A `data.*` filter's comparison type follows its VALUE** (`structs.DataOperand` /
+  `DataInOperands`, called by all three filter sites: `services/analytics.go`,
+  `services/query.go`, `alerts/evaluator.go`). A number (`500`, not `"500"`) compares
+  against the numeric extract, text against the String extract, a bool against the raw
+  extract (`dataRawExpr` / `guardedDataRaw`); `lt/gt/lte/gte` are always numeric and parse a
+  numeric string, and reject anything else with an error. `in` is numeric only when every
+  value is a number. Before this, every filter compared its value against the String
+  extract, so a numeric value was ClickHouse error 386 ("no supertype for String,
+  UInt16") — and `JSONExtractString` returns `''` for a JSON number, so even the text
+  `"500"` never matched a numeric field.
 - **ClickHouse SQL** is built with squirrel then run via the native driver. **All
   caller-controlled `data.*` field names MUST be validated** against
   `structs.SafeIdentifierRegex` before interpolation (`services/analytics.go`,
