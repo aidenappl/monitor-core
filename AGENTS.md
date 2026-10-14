@@ -366,7 +366,7 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
   `services/query.go`, `alerts/evaluator.go`). A number (`500`, not `"500"`) compares
   against the numeric extract, text against the String extract, a bool against the raw
   extract (`dataRawExpr` / `guardedDataRaw`); `lt/gt/lte/gte` are always numeric and parse a
-  numeric string, and reject anything else with an error. `in` is numeric only when every
+  numeric string, and reject anything else with `structs.ErrInvalidFilterValue` — a **400**, never a 500 (analytics routes match its "invalid" text, event search checks `errors.Is` in `isFilterValidationError`). `in` is numeric only when every
   value is a number. Before this, every filter compared its value against the String
   extract, so a numeric value was ClickHouse error 386 ("no supertype for String,
   UInt16") — and `JSONExtractString` returns `''` for a JSON number, so even the text
