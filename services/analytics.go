@@ -193,15 +193,46 @@ func buildSingleFilter(f structs.QueryFilter) (string, []interface{}, error) {
 		if !structs.SafeIdentifierRegex.MatchString(key) {
 			return "", nil, fmt.Errorf("invalid data field name: %s", key)
 		}
-		// Check if operator suggests numeric comparison
-		switch f.Operator {
-		case "lt", "gt", "lte", "gte":
-			fieldExpr = dataNumberExpr(key)
-		default:
+		// The extract follows the value (structs.DataOperand): a number
+		// compares numerically, text as text, a bool against the raw JSON.
+		// Comparing a number against the String extract is ClickHouse 386.
+		cf := f
+		if f.Operator == "in" {
+			values, ok := f.Value.([]interface{})
+			if !ok {
+				if strs, isStrs := f.Value.([]string); isStrs {
+					for _, v := range strs {
+						values = append(values, v)
+					}
+					ok = true
+				}
+			}
+			if !ok {
+				return "", nil, fmt.Errorf("in operator requires array value")
+			}
+			args, numeric := structs.DataInOperands(values)
 			fieldExpr = dataStringExpr(key)
+			if numeric {
+				fieldExpr = dataNumberExpr(key)
+			}
+			cf.Value = args
+		} else {
+			arg, numeric, raw, err := structs.DataOperand(f.Operator, f.Value)
+			if err != nil {
+				return "", nil, err
+			}
+			switch {
+			case numeric:
+				fieldExpr = dataNumberExpr(key)
+			case raw:
+				fieldExpr = dataRawExpr(key)
+			default:
+				fieldExpr = dataStringExpr(key)
+			}
+			cf.Value = arg
 		}
 
-		cond, args, err := buildComparison(fieldExpr, f)
+		cond, args, err := buildComparison(fieldExpr, cf)
 		if err != nil {
 			return "", nil, err
 		}

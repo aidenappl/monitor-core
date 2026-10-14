@@ -158,7 +158,20 @@ func applyDataFilter(builder sq.SelectBuilder, f Filter) (sq.SelectBuilder, erro
 	}
 
 	extractStr := dataStringExpr(f.Field)
-	extractNum := dataNumberExpr(f.Field)
+
+	// structs.DataOperand picks the extract from the value: a number compares
+	// numerically, text as text, a bool against the raw JSON. Comparing a
+	// number against the String extract is ClickHouse error 386.
+	arg, numeric, raw, err := structs.DataOperand(string(f.Operator), f.Value)
+	if err != nil {
+		return builder, err
+	}
+	extract := extractStr
+	if numeric {
+		extract = dataNumberExpr(f.Field)
+	} else if raw {
+		extract = dataRawExpr(f.Field)
+	}
 
 	// A cheap substring test ahead of the JSON parse. It is ANDed on, never
 	// substituted, so it can only remove rows the comparison would reject anyway
@@ -169,23 +182,23 @@ func applyDataFilter(builder sq.SelectBuilder, f Filter) (sq.SelectBuilder, erro
 
 	switch f.Operator {
 	case OpEq, "":
-		builder = builder.Where(fmt.Sprintf("%s = ?", extractStr), f.Value)
+		builder = builder.Where(fmt.Sprintf("%s = ?", extract), arg)
 	case OpNeq:
-		builder = builder.Where(fmt.Sprintf("%s != ?", extractStr), f.Value)
+		builder = builder.Where(fmt.Sprintf("%s != ?", extract), arg)
 	case OpLt:
-		builder = builder.Where(fmt.Sprintf("%s < ?", extractNum), f.Value)
+		builder = builder.Where(fmt.Sprintf("%s < ?", extract), arg)
 	case OpGt:
-		builder = builder.Where(fmt.Sprintf("%s > ?", extractNum), f.Value)
+		builder = builder.Where(fmt.Sprintf("%s > ?", extract), arg)
 	case OpLte:
-		builder = builder.Where(fmt.Sprintf("%s <= ?", extractNum), f.Value)
+		builder = builder.Where(fmt.Sprintf("%s <= ?", extract), arg)
 	case OpGte:
-		builder = builder.Where(fmt.Sprintf("%s >= ?", extractNum), f.Value)
+		builder = builder.Where(fmt.Sprintf("%s >= ?", extract), arg)
 	case OpContains:
-		builder = builder.Where(fmt.Sprintf("%s LIKE ?", extractStr), fmt.Sprintf("%%%v%%", f.Value))
+		builder = builder.Where(fmt.Sprintf("%s LIKE ?", extractStr), fmt.Sprintf("%%%v%%", arg))
 	case OpStartsWith:
-		builder = builder.Where(fmt.Sprintf("%s LIKE ?", extractStr), fmt.Sprintf("%v%%", f.Value))
+		builder = builder.Where(fmt.Sprintf("%s LIKE ?", extractStr), fmt.Sprintf("%v%%", arg))
 	case OpEndsWith:
-		builder = builder.Where(fmt.Sprintf("%s LIKE ?", extractStr), fmt.Sprintf("%%%v", f.Value))
+		builder = builder.Where(fmt.Sprintf("%s LIKE ?", extractStr), fmt.Sprintf("%%%v", arg))
 	}
 
 	return builder, nil
@@ -212,6 +225,12 @@ func applyDataFilter(builder sq.SelectBuilder, f Filter) (sq.SelectBuilder, erro
 // tests on both sides pin the text.
 func dataStringExpr(key string) string {
 	return fmt.Sprintf("if(position(data, '\"%s\"') > 0, JSONExtractString(data, '%s'), '')", key, key)
+}
+
+// dataRawExpr is the raw JSON text of a data key ("true", "false", "500",
+// "\"text\""), for comparing a bool filter value. Same guard as above.
+func dataRawExpr(key string) string {
+	return fmt.Sprintf("if(position(data, '\"%s\"') > 0, JSONExtractRaw(data, '%s'), '')", key, key)
 }
 
 func dataNumberExpr(key string) string {

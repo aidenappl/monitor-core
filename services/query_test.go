@@ -66,6 +66,7 @@ func TestApplyColumnFilterRejectsUnknownColumn(t *testing.T) {
 const (
 	wantGuardedString = `if(position(data, '"latency_ms"') > 0, JSONExtractString(data, 'latency_ms'), '')`
 	wantGuardedNumber = `toFloat64OrNull(if(position(data, '"latency_ms"') > 0, JSONExtractRaw(data, 'latency_ms'), ''))`
+	wantGuardedRaw    = `if(position(data, '"latency_ms"') > 0, JSONExtractRaw(data, 'latency_ms'), '')`
 )
 
 // TestDataExtractionGuardKeepsMissingKeysNull pins the shape that keeps the
@@ -110,14 +111,21 @@ func TestApplyDataFilterSQL(t *testing.T) {
 		{"startswith", OpStartsWith, "GET", "position(data, ?) > 0 AND " + wantGuardedString + " LIKE ?", []any{"GET", "GET%"}},
 		{"endswith", OpEndsWith, ".go", "position(data, ?) > 0 AND " + wantGuardedString + " LIKE ?", []any{".go", "%.go"}},
 		{"neq never prefilters", OpNeq, "api", wantGuardedString + " != ?", []any{"api"}},
-		{"lt is numeric, no prefilter", OpLt, "100", wantGuardedNumber + " < ?", []any{"100"}},
-		{"lte is numeric, no prefilter", OpLte, "100", wantGuardedNumber + " <= ?", []any{"100"}},
-		{"gt is numeric, no prefilter", OpGt, "100", wantGuardedNumber + " > ?", []any{"100"}},
-		{"gte is numeric, no prefilter", OpGte, "100", wantGuardedNumber + " >= ?", []any{"100"}},
+		{"lt is numeric, no prefilter", OpLt, "100", wantGuardedNumber + " < ?", []any{float64(100)}},
+		{"lte is numeric, no prefilter", OpLte, "100", wantGuardedNumber + " <= ?", []any{float64(100)}},
+		{"gt is numeric, no prefilter", OpGt, "100", wantGuardedNumber + " > ?", []any{float64(100)}},
+		{"gte is numeric, no prefilter", OpGte, "100", wantGuardedNumber + " >= ?", []any{float64(100)}},
 		{"contains skips an underscore wildcard", OpContains, "a_b", wantGuardedString + " LIKE ?", []any{"%a_b%"}},
 		{"contains skips a percent wildcard", OpContains, "50%", wantGuardedString + " LIKE ?", []any{"%50%%"}},
 		{"eq skips an escaped quote", OpEq, `say "hi"`, wantGuardedString + " = ?", []any{`say "hi"`}},
 		{"eq skips the empty string", OpEq, "", wantGuardedString + " = ?", []any{""}},
+		// The extract follows the value (structs.DataOperand); a number against
+		// the String extract was ClickHouse error 386.
+		{"eq with a number compares numerically", OpEq, float64(500), wantGuardedNumber + " = ?", []any{float64(500)}},
+		{"neq with an int compares numerically", OpNeq, 500, wantGuardedNumber + " != ?", []any{float64(500)}},
+		{"eq with a bool compares the raw JSON", OpEq, true, wantGuardedRaw + " = ?", []any{"true"}},
+		{"gte with a number", OpGte, float64(400), wantGuardedNumber + " >= ?", []any{float64(400)}},
+		{"contains with a number is text", OpContains, float64(50), wantGuardedString + " LIKE ?", []any{"%50%"}},
 	}
 
 	for _, tt := range tests {

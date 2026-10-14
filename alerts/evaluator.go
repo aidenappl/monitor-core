@@ -1029,6 +1029,10 @@ func guardedDataString(key string) string {
 	return fmt.Sprintf("if(position(data, '\"%s\"') > 0, JSONExtractString(data, '%s'), '')", key, key)
 }
 
+func guardedDataRaw(key string) string {
+	return fmt.Sprintf("if(position(data, '\"%s\"') > 0, JSONExtractRaw(data, '%s'), '')", key, key)
+}
+
 func guardedDataNumber(key string) string {
 	return fmt.Sprintf("toFloat64OrNull(if(position(data, '\"%s\"') > 0, JSONExtractRaw(data, '%s'), ''))", key, key)
 }
@@ -1041,12 +1045,22 @@ func buildFilterCondition(f structs.QueryFilter) (string, []interface{}, error) 
 		if !structs.SafeIdentifierRegex.MatchString(key) {
 			return "", nil, fmt.Errorf("invalid data field name: %s", key)
 		}
-		switch f.Operator {
-		case "lt", "gt", "lte", "gte":
+		// Same rule as the services filters (structs.DataOperand): the extract
+		// follows the value, so a numeric rule filter compares numerically
+		// instead of hitting ClickHouse 386 against the String extract.
+		arg, numeric, raw, err := structs.DataOperand(f.Operator, f.Value)
+		if err != nil {
+			return "", nil, err
+		}
+		switch {
+		case numeric:
 			fieldExpr = guardedDataNumber(key)
+		case raw:
+			fieldExpr = guardedDataRaw(key)
 		default:
 			fieldExpr = guardedDataString(key)
 		}
+		f.Value = arg
 	} else if structs.FilterColumns[f.Field] {
 		fieldExpr = f.Field
 	} else {
