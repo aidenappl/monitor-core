@@ -850,6 +850,11 @@ What remains is everything the library refuses to know:
      asserts a **verified** email, **and** it matches an existing user whose **own** email
      is verified. Both-sides-verified is mandatory; linking onto an unverified account is
      refused.
+  ⚠️ **OIDC providers fetch UserInfo** (`FetchUserInfo: true`, Oct 2026). Forta's id_token carries
+  only `sub`/`auth_time`/`sid`, so reading it alone provisioned accounts with `email = ""`, and the
+  UNIQUE email then blocked the next one. Provisioning now refuses an identity with no email, and a
+  known identity whose account has an empty email or name is backfilled from the provider on sign-in
+  (`fillMissingProfile`, never overwriting a set value; `auth.sso.profile.backfilled`).
   3. **Provision** — else, if `auto_provision`, create a fresh `role=pending` user + its
      identity; otherwise reject.
 - **`trust_email_verified`** (per-provider, default off) treats a provider's emails as

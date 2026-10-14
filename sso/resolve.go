@@ -111,6 +111,7 @@ func ResolveIdentity(ctx context.Context, engine db.Queryable, p *oidcsession.Pr
 		if user == nil {
 			return nil, fmt.Errorf("sso: identity %d references missing user %d", identity.ID, identity.UserID)
 		}
+		user = fillMissingProfile(ctx, engine, user, ni)
 		if err := query.TouchIdentityLogin(engine, identity.ID); err != nil {
 			telemetry.WarnErr(ctx, "auth.identity.touch.failed", err, map[string]any{
 				"identity_id": identity.ID,
@@ -172,6 +173,12 @@ type txBeginner interface {
 // real *sql.DB the two inserts run in one transaction. When it isn't (unit tests
 // with a mocked Queryable), it falls back to sequential inserts.
 func provisionUserWithIdentity(engine db.Queryable, ni oidcsession.Identity) (*structs.User, error) {
+	// users.email is UNIQUE: a blank one would be accepted once and then refuse
+	// every later provision. A provider that asserts no email is misconfigured
+	// (for OIDC, UserInfo is fetched), so say so instead of storing a blank row.
+	if ni.Email == "" {
+		return nil, fmt.Errorf("sso: provider %s asserted no email for %s; cannot provision an account without one", ni.Provider, ni.Subject)
+	}
 	req := query.CreateUserRequest{
 		Email:         ni.Email,
 		EmailVerified: ni.EmailVerified,
@@ -225,4 +232,34 @@ func createIdentityFor(engine db.Queryable, userID int64, ni oidcsession.Identit
 		EmailVerified:  ni.EmailVerified,
 		IdentityData:   ni.RawClaims,
 	})
+}
+
+// fillMissingProfile backfills an account's email and name from the provider
+// when they are empty — accounts provisioned before UserInfo was fetched have
+// email "". It never overwrites a value the user or an admin set. A failure
+// (e.g. another account already holds the email) is reported and the sign-in
+// continues with the account as it was.
+func fillMissingProfile(ctx context.Context, engine db.Queryable, user *structs.User, ni oidcsession.Identity) *structs.User {
+	req := query.UpdateUserRequest{}
+	if user.Email == "" && ni.Email != "" {
+		req.Email = &ni.Email
+		req.EmailVerified = &ni.EmailVerified
+	}
+	if user.Name == nil && ni.Name != nil && *ni.Name != "" {
+		req.Name = ni.Name
+	}
+	if req.Email == nil && req.Name == nil {
+		return user
+	}
+	updated, err := query.UpdateUser(engine, user.ID, req)
+	if err != nil || updated == nil {
+		telemetry.WarnErr(ctx, "auth.sso.profile.backfill_failed", err, map[string]any{
+			"user_id":  user.ID,
+			"provider": ni.Provider,
+			"outcome":  "signed in; the account's empty email/name were left empty",
+		})
+		return user
+	}
+	telemetry.Info(ctx, "auth.sso.profile.backfilled", map[string]any{"user_id": user.ID, "provider": ni.Provider, "email": req.Email != nil, "name": req.Name != nil})
+	return updated
 }
