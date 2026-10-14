@@ -1550,6 +1550,14 @@ uniqueness and deduplicates only when a background merge happens to run:
 - **Issues (fixed in 324f612, migrations 111-114):** four rows for one fingerprint in
   production, and `occurrence_count` drift under concurrent workers that was only ever
   mitigated process-locally by a 64-way mutex shard.
+- **Email channels can use server-wide SMTP.** `alerts/notifier.go:withServerSMTP` fills a
+  channel that has no `smtp_host` from `env.SMTP*` (`MON_SMTP_HOST/PORT/USERNAME/PASSWORD/FROM`,
+  Keyring secrets granted to each zone's monitor-core token), so a channel can be just
+  `{"to": "..."}`. A channel that sets `smtp_host` keeps ALL of its own settings — they are never
+  mixed. Values are read once at boot (Keyring `InjectEnv` → `env.Load`), so a changed secret
+  needs a restart. Both zones route alerts through policies first: a policy that matches but has
+  an empty channel list swallows the alert before the rule's own channels are consulted
+  (`matchedChannelIDs`), so wire channels into the policies, not only the rules.
 - **Notification policies (fixed by migration 121):** `position` is an evaluation order and
   had no uniqueness at all. `getNextPosition` was a racy `max(position) + 1`, and
   `ReorderPolicies` rewrote rows one at a time with no transaction — ClickHouse has none —
