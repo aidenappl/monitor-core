@@ -558,7 +558,7 @@ into `access_logs` was RESTRICT and a secret that had ever been read could never
 
 | Table | Purpose |
 |---|---|
-| `users` | The account: `email` (`UNIQUE`), `email_verified`, `name`, `display_name`, `role` (`admin`\|`editor`\|`viewer`\|`pending`), `active`. |
+| `users` | **Managed at `/admin/users`** (monitor-web *Admin → Users*): SSO auto-provisioned accounts arrive `pending` and an admin approves them by setting a role; `admin.user.updated` (info) records old/new role and active and who changed it. The account: `email` (`UNIQUE`), `email_verified`, `name`, `display_name`, `role` (`admin`\|`editor`\|`viewer`\|`pending`), `active`. |
 | `identities` | One sign-in method per row, `UNIQUE(provider, provider_user_id)`. `provider="password"` stores a bcrypt hash in `password_hash`; SSO rows store the claim envelope in `identity_data`. **`(provider, provider_user_id)` is the ONLY identity key — never email.** `FK → users ON DELETE CASCADE`. |
 | `refresh_tokens` | Rotating-refresh store. Only the SHA-256 `token_hash` (`BINARY(32)`) is persisted; tokens minted from one login share a `family_id`; rotation stamps `replaced_by` and `used_at` (migration 134 — the clock for the 30s reuse grace window). |
 | `sso_providers` | One configured IdP per row (see below). |
@@ -656,6 +656,8 @@ GET    /admin/sso-providers                 list providers (secrets never return
 POST   /admin/sso-providers                 create a provider                     [Protected + RequireAdmin]
 PUT    /admin/sso-providers/{slug}          update a provider                     [Protected + RequireAdmin]
 DELETE /admin/sso-providers/{slug}          delete a provider                     [Protected + RequireAdmin]
+GET    /admin/users                         list accounts + sign-in providers, pending first; ?role=&q=&limit=&offset=  [Protected + RequireAdmin, control plane only]
+PUT    /admin/users/{id}                    {role?, active?} — approve = set a role; refuses self and the last active admin (409)  [Protected + RequireAdmin, control plane only]
 POST   /admin/zones                         record a zone (both URLs required)    [Protected + RequireAdmin, control plane only]
 PUT    /admin/zones/{id}                    display_name / ingest_url / query_url [Protected + RequireAdmin, control plane only] — slug & status are REFUSED
 POST   /admin/zones/{id}/retire             soft-delete; 409 with live projects   [Protected + RequireAdmin, control plane only]

@@ -147,6 +147,10 @@ func buildRouter(role env.Role) *mux.Router {
 		// would compile fine and read as the cache to anyone skimming.
 		registryAdmin := r.PathPrefix("/admin").Subrouter()
 		registryAdmin.Use(middleware.SessionMiddleware)
+		// User admin: list accounts, approve pending ones (a role change), set
+		// roles, disable. Control plane only — it owns the users table.
+		registryAdmin.HandleFunc("/users", middleware.RequireAdmin(routes.HandleAdminListUsers)).Methods(http.MethodGet)
+		registryAdmin.HandleFunc("/users/{id}", middleware.RequireAdmin(routes.HandleAdminUpdateUser)).Methods(http.MethodPut)
 		registryAdmin.HandleFunc("/zones", middleware.RequireAdmin(routes.HandleCreateZone)).Methods(http.MethodPost)
 		registryAdmin.HandleFunc("/zones/{id}", middleware.RequireAdmin(routes.HandleUpdateZone)).Methods(http.MethodPut)
 		registryAdmin.HandleFunc("/zones/{id}/retire", middleware.RequireAdmin(routes.HandleRetireZone)).Methods(http.MethodPost)

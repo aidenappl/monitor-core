@@ -190,3 +190,105 @@ func ListUsersByIDs(engine db.Queryable, ids []int64) (map[int64]structs.User, e
 	}
 	return byID, rows.Err()
 }
+
+// ValidUserRoles are the roles an admin may assign. "pending" is how SSO
+// auto-provisioning creates an account; setting it again revokes access.
+var ValidUserRoles = map[string]bool{"admin": true, "editor": true, "viewer": true, "pending": true}
+
+type ListUsersRequest struct {
+	Role   *string
+	Search *string // substring of email, name or display name
+	Limit  int
+	Offset int
+}
+
+func applyUserFilters(q sq.SelectBuilder, req ListUsersRequest) sq.SelectBuilder {
+	if req.Role != nil {
+		q = q.Where(sq.Eq{"role": *req.Role})
+	}
+	if req.Search != nil && *req.Search != "" {
+		pattern := "%" + *req.Search + "%"
+		q = q.Where(sq.Or{
+			sq.Like{"email": pattern},
+			sq.Like{"name": pattern},
+			sq.Like{"display_name": pattern},
+		})
+	}
+	return q
+}
+
+// ListUsers pages through accounts, pending ones first (they are the ones
+// waiting on an admin), then newest.
+func ListUsers(engine db.Queryable, req ListUsersRequest) ([]structs.User, int, error) {
+	if req.Limit <= 0 || req.Limit > db.MAX_LIMIT {
+		req.Limit = db.DEFAULT_LIMIT
+	}
+
+	countQ, countArgs, err := applyUserFilters(sq.Select("COUNT(*)").From("users"), req).ToSql()
+	if err != nil {
+		return nil, 0, fmt.Errorf("build count query: %w", err)
+	}
+	var total int
+	if err := engine.QueryRow(countQ, countArgs...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count users: %w", err)
+	}
+
+	q := applyUserFilters(sq.Select(userColumns...).From("users"), req).
+		OrderBy("role = 'pending' DESC", "id DESC").
+		Limit(uint64(req.Limit)).Offset(uint64(req.Offset))
+	qStr, args, err := q.ToSql()
+	if err != nil {
+		return nil, 0, fmt.Errorf("build query: %w", err)
+	}
+	rows, err := engine.Query(qStr, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list users: %w", err)
+	}
+	defer rows.Close()
+
+	users := []structs.User{}
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, 0, fmt.Errorf("scan user: %w", err)
+		}
+		users = append(users, *u)
+	}
+	return users, total, rows.Err()
+}
+
+// CountActiveAdmins counts accounts that can still administer Monitor. The
+// user admin refuses any change that would take this to zero.
+func CountActiveAdmins(engine db.Queryable) (int, error) {
+	var n int
+	err := engine.QueryRow("SELECT COUNT(*) FROM users WHERE role = 'admin' AND active = 1").Scan(&n)
+	return n, err
+}
+
+// ListProvidersByUsers returns the sign-in methods (identity providers) of
+// several users in one query, keyed by user id.
+func ListProvidersByUsers(engine db.Queryable, ids []int64) (map[int64][]string, error) {
+	out := map[int64][]string{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	qStr, args, err := sq.Select("user_id", "provider").From("identities").
+		Where(sq.Eq{"user_id": ids}).OrderBy("user_id", "provider").ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("build query: %w", err)
+	}
+	rows, err := engine.Query(qStr, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list providers: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var provider string
+		if err := rows.Scan(&id, &provider); err != nil {
+			return nil, fmt.Errorf("scan provider: %w", err)
+		}
+		out[id] = append(out[id], provider)
+	}
+	return out, rows.Err()
+}
