@@ -88,6 +88,7 @@ var deployedSurface = []string{
 	"DELETE /v1/service-repos/{service}",
 	"DELETE /v1/views/{id}",
 	"GET /admin/sso-providers",
+	"GET /admin/users",
 	"GET /auth/self",
 	"GET /auth/self/identities",
 	"GET /auth/sso/callback",
@@ -160,6 +161,7 @@ var deployedSurface = []string{
 	"POST /webhooks/github",
 	"PUT /admin/projects/{id}",
 	"PUT /admin/sso-providers/{slug}",
+	"PUT /admin/users/{id}",
 	"PUT /admin/zones/{id}",
 	"PUT /auth/self",
 	"PUT /v1/alert-rules/{id}",
@@ -242,6 +244,10 @@ var controlPlaneOnly = []string{
 	"POST /admin/zones/{id}/projects",
 	"PUT /admin/projects/{id}",
 	"POST /admin/projects/{id}/retire",
+
+	// User admin: only the control plane has a users table.
+	"GET /admin/users",
+	"PUT /admin/users/{id}",
 }
 
 // TestBothIsTheDeployedSurface is the no-op guard. MON_ROLE defaults to `both`,
