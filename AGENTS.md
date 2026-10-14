@@ -49,7 +49,7 @@ what is deliberately **not** built yet.
 
 ## 2. Stack & dependencies
 
-- **Language:** Go 1.25 (`go.mod` — `go 1.25.5`).
+- **Language:** Go 1.26 (`go.mod` — `go 1.25.5`).
 - **Router:** `github.com/gorilla/mux`.
 - **SQL builder:** `github.com/Masterminds/squirrel` (imported as `sq`) — **no ORM**.
 - **Datastores — two of them:**
@@ -149,7 +149,7 @@ Sub-package deep dives: `routes/AGENTS.md`, `services/AGENTS.md`, `alerts/AGENTS
 
 ## 4. Running, building & testing
 
-Uses the `dev` CLI (`Devfile.yaml`). Prerequisites: Go 1.25, Docker (for local
+Uses the `dev` CLI (`Devfile.yaml`). Prerequisites: Go 1.26, Docker (for local
 ClickHouse **and** MariaDB — both are in `docker-compose.yml`).
 
 ```bash
