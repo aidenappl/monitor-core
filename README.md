@@ -599,6 +599,10 @@ credential kinds coexist:
   token and a rotating 7-day refresh token with reuse detection. Delivered as the `mon-*`
   cookies (`mon-access-token`, `mon-refresh-token`, `mon-logged-in`, `mon-csrf`); unsafe
   requests are CSRF-protected via a double-submit `mon-csrf` ↔ `X-CSRF-Token` check.
+  **Roles gate `/v1` for sessions:** a `pending` account is refused everything (`403`,
+  `error_code 4004`), a `viewer` may read but not write (`403`, `4003`), `editor` and
+  `admin` may do both. Comment edits/deletes are limited to the author or an admin.
+  Key use is recorded in `api_keys.last_used_at` (flushed once a minute).
 
 Auth/identity data lives in MariaDB (`monitor_auth`): `users`, `identities`
 (`UNIQUE(provider, provider_user_id)` — true account linking, one user ↔ many sign-in

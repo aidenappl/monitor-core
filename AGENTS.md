@@ -98,7 +98,7 @@ monitor-core/
     clickhouse.go          # ClickHouse connection (db.Connect/db.Close) + batch Writer + ValidateDatabaseName + the per-query max_memory_usage ceiling
     observe.go             # The ClickHouse chokepoint: observedConn (every read/exec gets a query kind + slow-query warning) and QueryError/SQLError (quoted values elided from what reaches Monitor)
     sql.go                 # MariaDB connection (db.SQL), db.Queryable, db.RunMigrations (embeds db/migrations/*.sql)
-    migrations/            # MariaDB DDL: identity + tenancy + issues + alert/dashboard config (100_users … 133_service_repos_project)
+    migrations/            # MariaDB DDL: identity + tenancy + issues + alert/dashboard config (100_users … 137_alert_rules_percentile_metrics)
   jwt/jwt.go               # Monitor-owned HS512 access/refresh JWTs (mint + validate, alg-pinned)
   tools/                   # Password.tool.go (bcrypt 12), Crypto.go (AES-256-GCM), Validate.tool.go (SSRF guard), Slug.tool.go (zone/project slug rule + reserved names)
   bootstrap/               # First-run seeding: admin.go (first admin user), registry.go (the single zone + default project)
@@ -111,6 +111,7 @@ monitor-core/
     csrf.go                # Double-submit CSRF (mon-csrf ↔ X-CSRF-Token); Bearer/X-Api-Key/safe-method exempt
     ingest_auth.go         # X-Api-Key auth for POST /v1/events (env master key OR ingest-scope DB key); injects the credential's project
     query_auth.go          # X-Api-Key (admin) OR a Monitor session for /v1/* reads; injects the project EVERY read is scoped to — credential-derived for keys, a validated ?project SELECTOR for sessions (§6)
+    role_gate.go           # requireSessionRole: the session branch of /v1 refuses pending accounts (4004) and non-editor WRITES (4003). See §6 *Roles on /v1*
     logging.go header.go   # RequestID; the ONE http.request.end event per request, the failure recorder the responder feeds, RecoverMiddleware (SSE-safe); Server header
     timeout.go             # RequestTimeout: 25s context deadline on /v1 (REQUEST_TIMEOUT), SSE streams skipped
     gzip.go                # GzipMiddleware: gzips /v1 application/json bodies >= 1 KB; Flush + Unwrap; SSE/HEAD/POST /v1/api-keys skipped
@@ -586,7 +587,7 @@ HS512** via `WithValidMethods` and the keyfunc re-checks the method (defeats
 | Middleware | Applies to | Accepts |
 |---|---|---|
 | `IngestAuthMiddleware` | `POST /v1/events` | env master key (`MONITOR_API_KEY`) **or** a DB **ingest-scope** key. Admin keys → `401`: they are query credentials that live in dashboards and MCP configs, and reading events does not imply permission to forge them. |
-| `QueryAuthMiddleware` | all other `/v1/*` | env master key **or** DB **admin-scope** key **or** a valid Monitor session (`mon-access-token`/Bearer). Ingest keys → `403`. Injects the project every read is scoped to: **credential-derived** for the two key branches, a validated **`?project=` selector** (defaulting to `MON_DEFAULT_PROJECT`) for a session — see §6 *The project asymmetry*. |
+| `QueryAuthMiddleware` | all other `/v1/*` | env master key **or** DB **admin-scope** key **or** a valid Monitor session (`mon-access-token`/Bearer). Ingest keys → `403`. Injects the project every read is scoped to: **credential-derived** for the two key branches, a validated **`?project=` selector** (defaulting to `MON_DEFAULT_PROJECT`) for a session — see §6 *The project asymmetry*. The session branch runs `requireSessionRole` between `SessionMiddleware` and the project selector — see *Roles on /v1* below. |
 | `SessionMiddleware` (`Protected`) | `/auth/*`, `/admin/*` | a valid access JWT (Bearer or `mon-access-token`) → puts the user in context. `RequireAdmin`/`RequireEditor`/`RejectPending` gate on `role`. **Resolves the user two ways** — control plane reads the live row (`Active`); a zone builds it from the token's claims. SSO liveness is enforced at `/auth/refresh` (the refresh gate), not per request. See *Zone session trust* below. |
 | `CSRFMiddleware` (global) | all unsafe methods | `mon-csrf` cookie == `X-CSRF-Token` header (constant-time). Safe methods, Bearer clients, `X-Api-Key` clients, and `/auth/{login,register,refresh}` + SSO callbacks are exempt. |
 | `RequestTimeout(REQUEST_TIMEOUT)` | `/v1` subrouter, after `QueryAuthMiddleware` | not auth — derives the request context with a **25s** deadline, so a ClickHouse query started from `r.Context()` is cancelled before the server's 30s `WriteTimeout` gives up on the response. **Skips `/v1/events/stream` and `/v1/alerts/stream` by path.** A context deadline, never `http.TimeoutHandler` (which buffers and hides `http.Flusher`). |
@@ -673,8 +674,8 @@ PUT    /v1/issues/{id}                      status / priority / title / assignee
 GET    /v1/issues/{id}/timeline             the activity feed, oldest first       [QueryAuthMiddleware]
 GET    /v1/issues/{id}/history              per-day occurrence sparkline          [QueryAuthMiddleware]
 POST   /v1/issues/{id}/comments             add a note (optional dedupe_key)      [QueryAuthMiddleware]
-PATCH  /v1/issues/{id}/comments/{commentID} edit a comment body                   [QueryAuthMiddleware]
-DELETE /v1/issues/{id}/comments/{commentID} soft-delete a comment                 [QueryAuthMiddleware]
+PATCH  /v1/issues/{id}/comments/{commentID} edit a comment body — author or admin only (403 otherwise)  [QueryAuthMiddleware]
+DELETE /v1/issues/{id}/comments/{commentID} soft-delete a comment — author or admin only (403 otherwise) [QueryAuthMiddleware]
 GET    /v1/issues/{id}/links                list linked PRs/issues/commits        [QueryAuthMiddleware]
 POST   /v1/issues/{id}/links                link a url, owner/repo#n, or #n       [QueryAuthMiddleware]
 DELETE /v1/issues/{id}/links/{linkID}       remove a link                         [QueryAuthMiddleware]
@@ -682,7 +683,55 @@ GET    /v1/service-repos                    this project's service → repo mapp
 GET    /v1/service-repos/{service}          one mapping (404 when unmapped here)   [QueryAuthMiddleware]
 PUT    /v1/service-repos/{service}          create/replace this project's mapping  [QueryAuthMiddleware]
 DELETE /v1/service-repos/{service}          remove this project's mapping          [QueryAuthMiddleware]
+PUT    /v1/api-keys/{id}                    rename ({name}) — scope & project are immutable; 409 on a duplicate name  [QueryAuthMiddleware]
+PUT    /v1/views/{id}                       {name?, query_params?} — omitted fields are left alone  [QueryAuthMiddleware]
+PUT    /v1/notification-channels/{id}       {name?, type?, config?} — OMITTED config KEEPS the stored credential; a type change requires a config  [QueryAuthMiddleware]
 ```
+
+The rest of `/v1` (events, analytics, dashboards, views, alert rules/history, channels,
+service groups, policies, API keys) is registered in `router.go` and inventoried in
+`router_test.go`'s `deployedSurface`, which a new route must be added to.
+
+### Roles on `/v1` (`middleware/role_gate.go`)
+
+⚠️ **Until 2026-10-14 roles gated nothing on `/v1`.** `RequireEditor` and `RejectPending`
+existed and this file said "roles gate verbs", but neither was wired onto the `/v1`
+subrouter. A `viewer` could mint admin-scope API keys, delete rules, channels and
+dashboards, and revoke the ingest key a fleet reports through; a `pending` account — every
+SSO auto-provisioned sign-in starts as one — could read and write every project the moment
+its session was issued. The approval gate was only monitor-web's redirect.
+
+`requireSessionRole` runs on the **session branch only** (API-key callers are bounded by the
+key's own scope):
+
+| Caller | Reads | Writes |
+|---|---|---|
+| `pending` | 403 `4004` | 403 `4004` |
+| `viewer` (or a pre-`Claims.Role` token with no role) | ✅ | 403 `4003` |
+| `editor`, `admin` | ✅ | ✅ |
+
+A **write** is any non-safe method, except the POST-bodied reads in `readOnlyPOSTPaths`
+(`/v1/analytics`, `/v1/timeseries`, `/v1/topn`, `/v1/gauge`, `/v1/compare`) and
+`POST /v1/alert-rules/{id}/test`, which evaluates a query and stores/sends nothing. The
+**channel** test sends a real notification and stays a write. A new POST that only reads
+must be added there, or viewers get bounced to `/unauthorized` by monitor-web. Pinned by
+`middleware/role_gate_test.go`.
+
+**Comment ownership** (`routes/issue_timeline.go` `canModifyComment`): `PATCH`/`DELETE` on a
+comment require the actor to be its author — same user id, or same API key id — or an admin
+session, or the env master key. Agents' notes are the record of what was tried; any caller
+could previously rewrite or delete them.
+
+**API key last-used** (`apikeys/usage.go`): `api_keys.last_used_at` existed since migration
+106 and nothing wrote it, so every key read "never used". Validation now records use in
+memory (its own mutex, never the cache's) and a background loop writes one `UPDATE` per used
+key per minute (`USAGE_FLUSH_INTERVAL`), `GREATEST`-guarded so a retried batch cannot move it
+backwards. "Last used" is therefore up to a minute stale, and empty for keys unused since this
+shipped.
+
+**Percentile alert metrics**: `alert_rules.metric` accepts `p50`/`p95`/`p99` (migration 137
+widens the ENUM; `alerts/evaluator.go` builds `quantile(…)` over the guarded numeric field).
+monitor-web's rule form offered them long before the API accepted them.
 
 Native flows: `HandleLogin` returns a neutral 401 on every failure (no email
 enumeration; missing accounts still pay a dummy bcrypt cost). `HandleRefresh` implements
@@ -952,7 +1001,7 @@ registration, cannot drift that way.
 
   This is why `jwt.Claims` carries **`Role`** on access tokens (not refresh — those are
   redeemed at the control plane, which reads the live row). Without it every write in a zone
-  403s on `RequireEditor`, which reads exactly that field.
+  403s on `requireSessionRole` (and `RequireEditor`), which read exactly that field.
 
   ⚠️ **What it costs:** no `Active` check at a zone, and the role is a
   mint-time snapshot — so a disabled or demoted user keeps their old access at a zone until
@@ -962,7 +1011,7 @@ registration, cannot drift that way.
   fan-out itself — the larger design this defers to.
 
   A token minted before `Claims.Role` existed carries no role and fails **closed**: reads
-  work, `RequireEditor`/`RequireAdmin` refuse, and the next refresh heals the session inside
+  work, writes (`requireSessionRole`) and `RequireEditor`/`RequireAdmin` refuse, and the next refresh heals the session inside
   one access lifetime without logging anyone out. Pinned by `middleware/session_zone_test.go`,
   which also asserts a refresh token cannot be spent as a session at a zone — the type pin is
   what keeps the revocation gap at minutes rather than the refresh token's 7 days.

@@ -131,6 +131,11 @@ func Init(ctx context.Context) error {
 		runCacheRefresher(ctx)
 	}()
 
+	go func() {
+		defer telemetry.Recover(ctx, "apikeys-usage", "api_keys.last_used_at stops updating")
+		runUsageFlusher(ctx)
+	}()
+
 	return err
 }
 
@@ -210,8 +215,11 @@ func refreshCache() error {
 func Validate(rawKey string) bool {
 	hash := hashKey(rawKey)
 	cacheMu.RLock()
-	defer cacheMu.RUnlock()
-	_, ok := cache[hash]
+	entry, ok := cache[hash]
+	cacheMu.RUnlock()
+	if ok {
+		markUsed(entry.ID)
+	}
 	return ok
 }
 
@@ -232,11 +240,12 @@ func ValidateWithScope(rawKey string) Scope {
 func ValidateWithIdentity(rawKey string) (Identity, bool) {
 	hash := hashKey(rawKey)
 	cacheMu.RLock()
-	defer cacheMu.RUnlock()
 	entry, ok := cache[hash]
+	cacheMu.RUnlock()
 	if !ok {
 		return Identity{}, false
 	}
+	markUsed(entry.ID)
 	return Identity{
 		ID:          entry.ID,
 		Name:        entry.Name,
@@ -449,6 +458,48 @@ func Delete(ctx context.Context, id string) error {
 	cacheMu.Unlock()
 
 	return nil
+}
+
+// ErrKeyNotFound means no key with that id exists in the caller's project.
+var ErrKeyNotFound = errors.New("api key not found")
+
+// Rename changes a key's display name within the caller's project and returns
+// the key as stored. Scoped exactly as Delete is.
+//
+// The cache is updated in place: it carries the name for the actor label an
+// admin key's writes are attributed to, and a stale one would sign the next
+// audit row with the old name for up to a refresh interval.
+func Rename(ctx context.Context, id, name string) (*APIKey, error) {
+	project, ok := scope.GetProject(ctx)
+	if !ok {
+		return nil, scope.ErrNoProject
+	}
+	zone := strings.TrimSpace(env.ZoneSlug)
+
+	existing, err := query.GetAPIKeyByID(db.SQL, zone, project, id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to look up api key: %w", err)
+	}
+	if existing == nil {
+		return nil, ErrKeyNotFound
+	}
+
+	if err := query.RenameAPIKey(db.SQL, zone, project, id, name); err != nil {
+		if isDuplicateEntry(err) {
+			return nil, fmt.Errorf("%w: a key named %q already exists in project %q", ErrDuplicateKeyName, name, project)
+		}
+		return nil, fmt.Errorf("failed to rename api key: %w", err)
+	}
+
+	cacheMu.Lock()
+	if cached, ok := cache[existing.KeyHash]; ok {
+		cached.Name = name
+		cache[existing.KeyHash] = cached
+	}
+	cacheMu.Unlock()
+
+	existing.Name = name
+	return existing, nil
 }
 
 func generateKey() (string, error) {

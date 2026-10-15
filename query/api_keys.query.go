@@ -216,3 +216,51 @@ func DeleteAPIKey(engine db.Queryable, zoneSlug, projectSlug, id string) error {
 	}
 	return nil
 }
+
+// RenameAPIKey changes one key's name, scoped to a project exactly as
+// DeleteAPIKey is — the predicate is in the UPDATE itself.
+//
+// Only the name is mutable. Scope and project are the key's authorisation and
+// tenancy, and changing either would silently re-home every event its producer
+// sends; that is a new key, not an edit.
+func RenameAPIKey(engine db.Queryable, zoneSlug, projectSlug, id, name string) error {
+	query, args, err := sq.Update("api_keys").
+		Set("name", name).
+		Where(sq.Expr(
+			"id = ? AND project_id = ("+
+				"SELECT p.id FROM projects p "+
+				"JOIN zones z ON z.id = p.zone_id "+
+				"WHERE z.slug = ? AND p.slug = ?)",
+			id, zoneSlug, projectSlug,
+		)).ToSql()
+	if err != nil {
+		return fmt.Errorf("build query: %w", err)
+	}
+
+	if _, err := engine.Exec(query, args...); err != nil {
+		return fmt.Errorf("rename api key: %w", err)
+	}
+	return nil
+}
+
+// TouchAPIKeys records when each key last authenticated a request. One UPDATE
+// per key, in one transaction-free loop: the batch is a minute of use, so it
+// holds as many rows as there are distinct keys in use, never one per request.
+//
+// GREATEST keeps the column monotonic, so a delayed retry of an older batch
+// cannot move a key's last use backwards.
+func TouchAPIKeys(engine db.Queryable, usedAt map[string]time.Time) error {
+	for id, at := range usedAt {
+		q, args, err := sq.Update("api_keys").
+			Set("last_used_at", sq.Expr("GREATEST(COALESCE(last_used_at, ?), ?)", at, at)).
+			Where(sq.Eq{"id": id}).
+			ToSql()
+		if err != nil {
+			return fmt.Errorf("build query: %w", err)
+		}
+		if _, err := engine.Exec(q, args...); err != nil {
+			return fmt.Errorf("touch api key %s: %w", id, err)
+		}
+	}
+	return nil
+}

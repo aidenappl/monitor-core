@@ -249,6 +249,7 @@ func buildRouter(role env.Role) *mux.Router {
 	// API key management — protected by the session/API-key middleware (admin UI)
 	v1.HandleFunc("/api-keys", routes.HandleListAPIKeys).Methods(http.MethodGet)
 	v1.HandleFunc("/api-keys", routes.HandleCreateAPIKey).Methods(http.MethodPost)
+	v1.HandleFunc("/api-keys/{id}", routes.HandleUpdateAPIKey).Methods(http.MethodPut)
 	v1.HandleFunc("/api-keys/{id}", routes.HandleDeleteAPIKey).Methods(http.MethodDelete)
 
 	if role.RunsDataPlane() {
@@ -262,6 +263,7 @@ func buildRouter(role env.Role) *mux.Router {
 		// Saved views
 		v1.HandleFunc("/views", routes.HandleListViews).Methods(http.MethodGet)
 		v1.HandleFunc("/views", routes.HandleCreateView).Methods(http.MethodPost)
+		v1.HandleFunc("/views/{id}", routes.HandleUpdateView).Methods(http.MethodPut)
 		v1.HandleFunc("/views/{id}", routes.HandleDeleteView).Methods(http.MethodDelete)
 
 		// Alert rules
@@ -278,6 +280,7 @@ func buildRouter(role env.Role) *mux.Router {
 		// Notification channels
 		v1.HandleFunc("/notification-channels", routes.HandleListNotificationChannels).Methods(http.MethodGet)
 		v1.HandleFunc("/notification-channels", routes.HandleCreateNotificationChannel).Methods(http.MethodPost)
+		v1.HandleFunc("/notification-channels/{id}", routes.HandleUpdateNotificationChannel).Methods(http.MethodPut)
 		v1.HandleFunc("/notification-channels/{id}", routes.HandleDeleteNotificationChannel).Methods(http.MethodDelete)
 		v1.HandleFunc("/notification-channels/{id}/test", routes.HandleTestNotificationChannel).Methods(http.MethodPost)
 

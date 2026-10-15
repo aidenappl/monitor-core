@@ -1,6 +1,7 @@
 package query
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -181,4 +182,63 @@ func DeleteSavedView(engine db.Queryable, project, id string) (bool, error) {
 		return false, nil
 	}
 	return affected > 0, nil
+}
+
+// UpdateSavedViewRequest is the PUT /v1/views/{id} body. A nil field is left
+// alone, so a rename does not have to resend the query it is renaming.
+type UpdateSavedViewRequest struct {
+	Name        *string `json:"name"`
+	QueryParams *string `json:"query_params"`
+}
+
+// UpdateSavedView changes one of a project's saved views and returns the row as
+// stored, or nil when no view with that id exists in the project.
+//
+// The project is in the UPDATE's own WHERE, for the reason DeleteSavedView
+// gives: an id lifted from another project's response must change nothing.
+func UpdateSavedView(engine db.Queryable, project, id string, req UpdateSavedViewRequest) (*structs.SavedView, error) {
+	if project == "" {
+		return nil, ErrNoSavedViewProject
+	}
+	if req.Name == nil && req.QueryParams == nil {
+		return nil, fmt.Errorf("nothing to update")
+	}
+	if req.Name != nil && *req.Name == "" {
+		return nil, fmt.Errorf("name cannot be empty")
+	}
+
+	u := sq.Update(savedViewsTable).Where(sq.Eq{"id": id, "project": project})
+	if req.Name != nil {
+		u = u.Set("name", *req.Name)
+	}
+	if req.QueryParams != nil {
+		u = u.Set("query_params", *req.QueryParams)
+	}
+	qStr, args, err := u.ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build sql query: %w", err)
+	}
+	if _, err := engine.Exec(qStr, args...); err != nil {
+		return nil, fmt.Errorf("failed to update saved view: %w", err)
+	}
+
+	// Read back rather than trusting RowsAffected: MariaDB reports 0 for an
+	// UPDATE that matched a row but changed nothing, which is not "not found".
+	q, err := scopeSavedViews(sq.Select(savedViewColumns...).From(savedViewsTable).
+		Where(sq.Eq{"monitor.saved_views.id": id}).Limit(1), project)
+	if err != nil {
+		return nil, err
+	}
+	sel, selArgs, err := q.ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build sql query: %w", err)
+	}
+	v, err := scanSavedView(engine.QueryRow(sel, selArgs...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read saved view: %w", err)
+	}
+	return v, nil
 }

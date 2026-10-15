@@ -346,6 +346,9 @@ func TestEvaluatorDataExpressionsAreGuarded(t *testing.T) {
 		structs.AggAvg: "toFloat64(avg(" + wantGuardedNumber + "))",
 		structs.AggMin: "toFloat64(min(" + wantGuardedNumber + "))",
 		structs.AggMax: "toFloat64(max(" + wantGuardedNumber + "))",
+		structs.AggP50: "toFloat64(quantile(0.5)(" + wantGuardedNumber + "))",
+		structs.AggP95: "toFloat64(quantile(0.95)(" + wantGuardedNumber + "))",
+		structs.AggP99: "toFloat64(quantile(0.99)(" + wantGuardedNumber + "))",
 	}
 	for agg, want := range aggregations {
 		if got, err := buildAggExpr(agg, "data.latency_ms"); err != nil || got != want {
