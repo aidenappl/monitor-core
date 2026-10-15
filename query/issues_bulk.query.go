@@ -1,6 +1,7 @@
 package query
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 
@@ -37,17 +38,39 @@ var ErrBulkNoTarget = errors.New("exactly one of ids or filter is required")
 type BulkUpdateIssueStatusRequest struct {
 	// Project is server-derived and mandatory, exactly as on ListIssuesRequest.
 	Project string
-	Status  structs.IssueStatus
-	IDs     []string
-	Filter  *ListIssuesRequest
-	DryRun  bool
+	// Status is the target status; "" leaves status alone (a priority- or
+	// assignee-only bulk change).
+	Status structs.IssueStatus
+	// SetPriority applies Priority (nil clears it). Without it priority is
+	// left alone — the explicit flag is what lets "clear" differ from "omit".
+	SetPriority bool
+	Priority    *structs.IssuePriority
+	// SetAssignee applies AssigneeUserID (nil unassigns), same convention.
+	SetAssignee    bool
+	AssigneeUserID *int64
+	IDs            []string
+	Filter         *ListIssuesRequest
+	DryRun         bool
 }
+
+// onlyStatus reports a status-only change: the original shape of this request,
+// whose SQL is kept byte-identical to before the other fields existed.
+func (r BulkUpdateIssueStatusRequest) onlyStatus() bool {
+	return !r.SetPriority && !r.SetAssignee
+}
+
+// ErrBulkNothingToSet is returned when a bulk request changes no field.
+var ErrBulkNothingToSet = errors.New("set at least one of status, priority or assignee_user_id")
 
 // BulkIssueChange is one issue a bulk write moved, with the status it left — the
 // handler needs the old value to write an accurate timeline entry.
 type BulkIssueChange struct {
 	ID   string              `json:"id"`
 	From structs.IssueStatus `json:"from"`
+	// The prior priority and assignee, read only when the request changes them
+	// (otherwise nil, and unused).
+	FromPriority *structs.IssuePriority `json:"-"`
+	FromAssignee *int64                 `json:"-"`
 }
 
 // BulkUpdateIssueStatusResult reports a bulk write.
@@ -76,7 +99,31 @@ func bulkTargetWhere(q sq.SelectBuilder, req BulkUpdateIssueStatusRequest) (sq.S
 	} else {
 		q = applyIssueFilters(q, *req.Filter)
 	}
-	return q.Where(sq.NotEq{"monitor.issues.status": string(req.Status)}), nil
+	if req.onlyStatus() {
+		return q.Where(sq.NotEq{"monitor.issues.status": string(req.Status)}), nil
+	}
+	// A row is a target when ANY requested field differs from its target value,
+	// so a no-op is neither written nor counted. <=> is null-safe: "clear the
+	// priority" must skip rows whose priority is already NULL.
+	var differs sq.Or
+	if req.Status != "" {
+		differs = append(differs, sq.NotEq{"monitor.issues.status": string(req.Status)})
+	}
+	if req.SetPriority {
+		var v interface{}
+		if req.Priority != nil {
+			v = string(*req.Priority)
+		}
+		differs = append(differs, sq.Expr("NOT (monitor.issues.priority <=> ?)", v))
+	}
+	if req.SetAssignee {
+		var v interface{}
+		if req.AssigneeUserID != nil {
+			v = *req.AssigneeUserID
+		}
+		differs = append(differs, sq.Expr("NOT (monitor.issues.assignee_user_id <=> ?)", v))
+	}
+	return q.Where(differs), nil
 }
 
 // BulkUpdateIssueStatus moves the selected issues to req.Status in one
@@ -94,8 +141,14 @@ func BulkUpdateIssueStatus(engine db.Queryable, req BulkUpdateIssueStatusRequest
 	if req.Project == "" {
 		return nil, ErrNoIssueProject
 	}
-	if !req.Status.IsValid() {
+	if req.Status == "" && req.onlyStatus() {
+		return nil, ErrBulkNothingToSet
+	}
+	if req.Status != "" && !req.Status.IsValid() {
 		return nil, fmt.Errorf("invalid issue status %q", req.Status)
+	}
+	if req.SetPriority && req.Priority != nil && !req.Priority.IsValid() {
+		return nil, fmt.Errorf("invalid issue priority %q", *req.Priority)
 	}
 	if (req.IDs == nil) == (req.Filter == nil) {
 		return nil, ErrBulkNoTarget
@@ -155,7 +208,11 @@ func bulkUpdateIssueStatus(engine db.Queryable, req BulkUpdateIssueStatusRequest
 
 	// Oldest-seen last: when a filter overflows the cap, the issues still firing
 	// are the ones moved first.
-	selQ, err := bulkTargetWhere(sq.Select("monitor.issues.id", "monitor.issues.status").From(issuesTable), req)
+	cols := []string{"monitor.issues.id", "monitor.issues.status"}
+	if !req.onlyStatus() {
+		cols = append(cols, "monitor.issues.priority", "monitor.issues.assignee_user_id")
+	}
+	selQ, err := bulkTargetWhere(sq.Select(cols...).From(issuesTable), req)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +233,23 @@ func bulkUpdateIssueStatus(engine db.Queryable, req BulkUpdateIssueStatusRequest
 	for rows.Next() {
 		var c BulkIssueChange
 		var from string
-		if err := rows.Scan(&c.ID, &from); err != nil {
+		var scanErr error
+		if req.onlyStatus() {
+			scanErr = rows.Scan(&c.ID, &from)
+		} else {
+			var priority sql.NullString
+			var assignee sql.NullInt64
+			scanErr = rows.Scan(&c.ID, &from, &priority, &assignee)
+			if priority.Valid {
+				p := structs.IssuePriority(priority.String)
+				c.FromPriority = &p
+			}
+			if assignee.Valid {
+				a := assignee.Int64
+				c.FromAssignee = &a
+			}
+		}
+		if err := scanErr; err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("failed to scan bulk target: %w", err)
 		}
@@ -194,11 +267,28 @@ func bulkUpdateIssueStatus(engine db.Queryable, req BulkUpdateIssueStatusRequest
 		return result, nil
 	}
 
-	u := sq.Update(issuesTable).Set("status", string(req.Status))
-	if req.Status == structs.IssueStatusResolved {
-		u = u.Set("resolved_at", sq.Expr("CURRENT_TIMESTAMP(3)"))
-	} else {
-		u = u.Set("resolved_at", nil)
+	u := sq.Update(issuesTable)
+	if req.Status != "" {
+		u = u.Set("status", string(req.Status))
+		if req.Status == structs.IssueStatusResolved {
+			u = u.Set("resolved_at", sq.Expr("CURRENT_TIMESTAMP(3)"))
+		} else {
+			u = u.Set("resolved_at", nil)
+		}
+	}
+	if req.SetPriority {
+		if req.Priority != nil {
+			u = u.Set("priority", string(*req.Priority))
+		} else {
+			u = u.Set("priority", nil)
+		}
+	}
+	if req.SetAssignee {
+		if req.AssigneeUserID != nil {
+			u = u.Set("assignee_user_id", *req.AssigneeUserID)
+		} else {
+			u = u.Set("assignee_user_id", nil)
+		}
 	}
 	updSQL, updArgs, err := u.Where(sq.Eq{"id": ids, "project": req.Project}).ToSql()
 	if err != nil {
