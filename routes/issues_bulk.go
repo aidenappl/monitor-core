@@ -27,11 +27,16 @@ var bulkFilterKeys = map[string]bool{
 	"has_pr": true, "from": true, "to": true,
 }
 
-// HandleBulkUpdateIssues moves many issues to one status.
+// HandleBulkUpdateIssues sets status, priority and/or assignee on many issues.
 //
 //	POST /v1/issues/bulk
 //	{"status": "resolved", "ids": ["…", "…"]}
 //	{"status": "resolved", "filter": {"service": "scraper-service", "q": "429"}, "dry_run": true}
+//	{"priority": "high", "assignee_user_id": 7, "ids": ["…"]}
+//	{"priority": null, "ids": ["…"]}          // explicit null clears; an omitted key leaves it
+//
+// At least one of status, priority or assignee_user_id is required. Rows
+// already at every requested value are not targets (not counted, not written).
 //
 // Exactly one of ids or filter. A filter selects the same rows GET /v1/issues
 // would for the same parameters, minus those already at the target status, and
@@ -55,20 +60,45 @@ func HandleBulkUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Status string         `json:"status"`
-		IDs    []string       `json:"ids"`
-		Filter map[string]any `json:"filter"`
-		DryRun bool           `json:"dry_run"`
+		Status         string         `json:"status"`
+		Priority       *string        `json:"priority"`
+		AssigneeUserID *int64         `json:"assignee_user_id"`
+		IDs            []string       `json:"ids"`
+		Filter         map[string]any `json:"filter"`
+		DryRun         bool           `json:"dry_run"`
 	}
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	// Presence, not value, decides whether priority/assignee are being set:
+	// {"priority": null} clears it, a missing key leaves it alone.
+	present := map[string]json.RawMessage{}
+	if err := json.Unmarshal(rawBody, &present); err != nil {
+		responder.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	_, setPriority := present["priority"]
+	_, setAssignee := present["assignee_user_id"]
 
 	status := structs.IssueStatus(body.Status)
-	if !status.IsValid() {
+	if body.Status != "" && !status.IsValid() {
 		responder.Error(w, http.StatusBadRequest,
 			fmt.Sprintf("invalid status %q (expected unresolved, in_progress, resolved or ignored)", body.Status))
+		return
+	}
+	var priority *structs.IssuePriority
+	if body.Priority != nil {
+		p := structs.IssuePriority(*body.Priority)
+		if !p.IsValid() {
+			responder.Error(w, http.StatusBadRequest,
+				fmt.Sprintf("invalid priority %q (expected low, medium, high or critical)", *body.Priority))
+			return
+		}
+		priority = &p
+	}
+	if body.Status == "" && !setPriority && !setAssignee {
+		responder.Error(w, http.StatusBadRequest, "set at least one of status, priority or assignee_user_id")
 		return
 	}
 
@@ -78,9 +108,13 @@ func HandleBulkUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req := query.BulkUpdateIssueStatusRequest{
-		Project: project,
-		Status:  status,
-		DryRun:  body.DryRun,
+		Project:        project,
+		Status:         status,
+		SetPriority:    setPriority,
+		Priority:       priority,
+		SetAssignee:    setAssignee,
+		AssigneeUserID: body.AssigneeUserID,
+		DryRun:         body.DryRun,
 	}
 	switch {
 	case body.IDs != nil && body.Filter != nil:
@@ -106,7 +140,7 @@ func HandleBulkUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := query.BulkUpdateIssueStatus(db.SQL, req)
-	if errors.Is(err, query.ErrBulkTooManyIDs) || errors.Is(err, query.ErrBulkNoTarget) {
+	if errors.Is(err, query.ErrBulkTooManyIDs) || errors.Is(err, query.ErrBulkNoTarget) || errors.Is(err, query.ErrBulkNothingToSet) {
 		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -116,8 +150,18 @@ func HandleBulkUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, c := range result.Changes {
-		appendUpdateTimeline(r.Context(), c.ID, actor,
-			&structs.Issue{Status: c.From}, &structs.Issue{Status: status})
+		before := &structs.Issue{Status: c.From, Priority: c.FromPriority, AssigneeUserID: c.FromAssignee}
+		after := &structs.Issue{Status: c.From, Priority: c.FromPriority, AssigneeUserID: c.FromAssignee}
+		if status != "" {
+			after.Status = status
+		}
+		if setPriority {
+			after.Priority = priority
+		}
+		if setAssignee {
+			after.AssigneeUserID = body.AssigneeUserID
+		}
+		appendUpdateTimeline(r.Context(), c.ID, actor, before, after)
 	}
 	if result.Updated > 0 {
 		mode := "ids"
@@ -125,11 +169,13 @@ func HandleBulkUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			mode = "filter"
 		}
 		telemetry.Info(r.Context(), "issue.status.bulk_updated", map[string]any{
-			"project":   project,
-			"to":        string(status),
-			"mode":      mode,
-			"updated":   result.Updated,
-			"remaining": result.Remaining,
+			"project":      project,
+			"to":           string(status),
+			"set_priority": setPriority,
+			"set_assignee": setAssignee,
+			"mode":         mode,
+			"updated":      result.Updated,
+			"remaining":    result.Remaining,
 		})
 	}
 

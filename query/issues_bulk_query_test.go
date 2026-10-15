@@ -140,3 +140,102 @@ func TestBulkUpdateIssueStatusReopenClearsResolvedAt(t *testing.T) {
 		t.Errorf("unmet expectations: %v", err)
 	}
 }
+
+// A priority + assignee change targets rows where EITHER differs (null-safe),
+// reads the prior values for the timeline, and leaves status and resolved_at
+// untouched when no status was asked for.
+func TestBulkUpdateIssuesPriorityAndAssignee(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	high := structs.IssuePriorityHigh
+	user := int64(7)
+	req := BulkUpdateIssueStatusRequest{
+		Project:     "atlas",
+		SetPriority: true, Priority: &high,
+		SetAssignee: true, AssigneeUserID: &user,
+		IDs: []string{"a", "b"},
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM monitor.issues WHERE monitor.issues.project = \? AND monitor.issues.id IN \(\?,\?\) AND \(NOT \(monitor.issues.priority <=> \?\) OR NOT \(monitor.issues.assignee_user_id <=> \?\)\)`).
+		WithArgs("atlas", "a", "b", "high", int64(7)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
+	mock.ExpectQuery(`SELECT monitor.issues.id, monitor.issues.status, monitor.issues.priority, monitor.issues.assignee_user_id FROM monitor.issues .* FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status", "priority", "assignee_user_id"}).
+			AddRow("a", "unresolved", nil, nil).
+			AddRow("b", "in_progress", "low", int64(3)))
+	mock.ExpectExec(`UPDATE monitor.issues SET priority = \?, assignee_user_id = \? WHERE id IN \(\?,\?\) AND project = \?`).
+		WithArgs("high", int64(7), "a", "b", "atlas").
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectCommit()
+
+	res, err := BulkUpdateIssueStatus(mockDB, req)
+	if err != nil {
+		t.Fatalf("BulkUpdateIssueStatus: %v", err)
+	}
+	if res.Updated != 2 {
+		t.Errorf("updated = %d, want 2", res.Updated)
+	}
+	if res.Changes[0].FromPriority != nil || res.Changes[1].FromPriority == nil || *res.Changes[1].FromPriority != structs.IssuePriorityLow {
+		t.Errorf("prior priorities not carried: %+v", res.Changes)
+	}
+	if res.Changes[1].FromAssignee == nil || *res.Changes[1].FromAssignee != 3 {
+		t.Errorf("prior assignee not carried: %+v", res.Changes[1])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// Clearing the priority sends NULL and skips rows already NULL (<=> NULL).
+func TestBulkUpdateIssuesClearPriority(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM monitor.issues .* AND \(NOT \(monitor.issues.priority <=> \?\)\)`).
+		WithArgs("atlas", "a", nil).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status", "priority", "assignee_user_id"}).AddRow("a", "unresolved", "high", nil))
+	mock.ExpectExec(`UPDATE monitor.issues SET priority = \? WHERE`).
+		WithArgs(nil, "a", "atlas").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if _, err := BulkUpdateIssueStatus(mockDB, BulkUpdateIssueStatusRequest{
+		Project: "atlas", SetPriority: true, IDs: []string{"a"},
+	}); err != nil {
+		t.Fatalf("BulkUpdateIssueStatus: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestBulkUpdateIssuesRefusesNothingToSet(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	_, err = BulkUpdateIssueStatus(mockDB, BulkUpdateIssueStatusRequest{Project: "atlas", IDs: []string{"a"}})
+	if !errors.Is(err, ErrBulkNothingToSet) {
+		t.Errorf("err = %v, want ErrBulkNothingToSet", err)
+	}
+	bad := structs.IssuePriority("urgent")
+	if _, err := BulkUpdateIssueStatus(mockDB, BulkUpdateIssueStatusRequest{Project: "atlas", SetPriority: true, Priority: &bad, IDs: []string{"a"}}); err == nil {
+		t.Error("expected an invalid priority to be refused")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a refused request must not reach the database: %v", err)
+	}
+}
