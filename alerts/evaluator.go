@@ -997,6 +997,13 @@ func buildAggExpr(agg structs.AggregationType, field string) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("toFloat64(max(%s))", col), nil
+	case structs.AggP50, structs.AggP95, structs.AggP99:
+		col, err := numericFieldExpr(field)
+		if err != nil {
+			return "", err
+		}
+		level := map[structs.AggregationType]string{structs.AggP50: "0.5", structs.AggP95: "0.95", structs.AggP99: "0.99"}[agg]
+		return fmt.Sprintf("toFloat64(quantile(%s)(%s))", level, col), nil
 	default:
 		return "toFloat64(count())", nil
 	}

@@ -2,6 +2,7 @@ package routes
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/aidenappl/monitor-core/db"
@@ -84,4 +85,41 @@ func HandleDeleteView(w http.ResponseWriter, r *http.Request) {
 	}
 
 	responder.New(w, nil, "view deleted")
+}
+
+// HandleUpdateView renames a saved view or replaces the query it stores.
+// PUT /v1/views/{id}, body {"name"?: "...", "query_params"?: "..."}.
+func HandleUpdateView(w http.ResponseWriter, r *http.Request) {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	id := mux.Vars(r)["id"]
+	if id == "" {
+		responder.Error(w, http.StatusBadRequest, "id is required")
+		return
+	}
+
+	var body query.UpdateSavedViewRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		responder.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	view, err := query.UpdateSavedView(db.SQL, project, id, body)
+	if err != nil {
+		if errors.Is(err, query.ErrNoSavedViewProject) {
+			responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to update view", err)
+			return
+		}
+		responder.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if view == nil {
+		responder.Error(w, http.StatusNotFound, "view not found")
+		return
+	}
+
+	responder.New(w, view)
 }

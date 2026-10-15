@@ -294,6 +294,49 @@ func HandleDeleteNotificationChannel(w http.ResponseWriter, r *http.Request) {
 	responder.New(w, nil, "notification channel deleted")
 }
 
+// HandleUpdateNotificationChannel edits a channel in place.
+// PUT /v1/notification-channels/{id}, body {"name"?, "type"?, "config"?}.
+//
+// An omitted config keeps the stored credential — the client never receives it,
+// so it cannot resend it; see query.UpdateNotificationChannelRequest.
+func HandleUpdateNotificationChannel(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	if id == "" {
+		responder.Error(w, http.StatusBadRequest, "id is required")
+		return
+	}
+
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	var req query.UpdateNotificationChannelRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		responder.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	updated, err := query.UpdateNotificationChannel(db.SQL, project, id, req)
+	if err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if updated == nil {
+		responder.Error(w, http.StatusNotFound, "notification channel not found")
+		return
+	}
+
+	// Id, type and WHETHER the credential changed — never the credential.
+	telemetry.Info(r.Context(), "notification_channel.updated", map[string]any{
+		"channel_id":     updated.ID,
+		"channel_type":   updated.Type,
+		"config_changed": req.Config != nil,
+		"project":        project,
+	})
+	responder.New(w, updated)
+}
+
 func HandleTestNotificationChannel(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	if id == "" {

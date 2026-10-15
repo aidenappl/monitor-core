@@ -251,3 +251,87 @@ func DeleteNotificationChannel(engine db.Queryable, project, id string) (bool, e
 	}
 	return affected > 0, nil
 }
+
+// UpdateNotificationChannelRequest is the PUT /v1/notification-channels/{id}
+// body. Every field is optional; nil leaves it alone.
+//
+// ⚠️ An omitted Config KEEPS THE STORED CREDENTIAL. The client never receives
+// the config (it is json:"-"), so an edit form cannot round-trip it — a rename
+// that had to resend the Slack URL would mean asking the operator for the secret
+// every time. Sending a config replaces it whole.
+type UpdateNotificationChannelRequest struct {
+	Name   *string `json:"name"`
+	Type   *string `json:"type"`
+	Config *string `json:"config"`
+}
+
+// UpdateNotificationChannel changes one of a project's channels and returns it
+// as stored, or nil when the project has no channel with that id.
+//
+// Changing the type requires a new config: the stored one was written for the
+// old type's notifier and would fail to parse — silently, at send time.
+func UpdateNotificationChannel(engine db.Queryable, project, id string, req UpdateNotificationChannelRequest) (*structs.NotificationChannel, error) {
+	if project == "" {
+		return nil, ErrNoAlertingProject
+	}
+	if req.Name == nil && req.Type == nil && req.Config == nil {
+		return nil, fmt.Errorf("nothing to update")
+	}
+	if req.Name != nil && *req.Name == "" {
+		return nil, fmt.Errorf("name cannot be empty")
+	}
+
+	existing, err := GetNotificationChannel(engine, project, id)
+	if err != nil {
+		return nil, err
+	}
+	if existing == nil {
+		return nil, nil
+	}
+
+	if req.Type != nil {
+		if !validNotificationChannelTypes[*req.Type] {
+			return nil, fmt.Errorf("invalid type: %s (must be webhook, slack, email, or pagerduty)", *req.Type)
+		}
+		if *req.Type != existing.Type && req.Config == nil {
+			return nil, fmt.Errorf("changing the type requires a new config")
+		}
+	}
+
+	u := sq.Update(notificationChannelsTable).Where(sq.Eq{"id": id, "project": project})
+	if req.Name != nil {
+		u = u.Set("name", *req.Name)
+		existing.Name = *req.Name
+	}
+	if req.Type != nil {
+		u = u.Set("type", *req.Type)
+		existing.Type = *req.Type
+	}
+	if req.Config != nil {
+		cfg := *req.Config
+		if cfg == "" {
+			cfg = "{}"
+		}
+		if err := requireJSONText("config", cfg); err != nil {
+			return nil, err
+		}
+		encrypted, err := tools.Encrypt(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encrypt notification channel config: %w", err)
+		}
+		// The legacy plaintext column is cleared on every config write, so a
+		// row never carries two credentials that disagree.
+		u = u.Set("config_enc", encrypted).Set("config", nil)
+		existing.Config = cfg
+	}
+	existing.ConfigSummary = structs.SummariseChannelConfig(existing.Type, existing.Config)
+
+	qStr, args, err := u.ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build sql query: %w", err)
+	}
+	if _, err := engine.Exec(qStr, args...); err != nil {
+		return nil, fmt.Errorf("failed to update notification channel: %w", err)
+	}
+	return existing, nil
+}

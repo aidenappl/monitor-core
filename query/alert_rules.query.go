@@ -69,8 +69,11 @@ var (
 		ALERT_PRIORITY_MEDIUM:   true,
 		ALERT_PRIORITY_LOW:      true,
 	}
-	validAlertTypes      = map[string]bool{"threshold": true, "absence": true, "rate_change": true}
-	validAlertMetrics    = map[string]bool{"count": true, "sum": true, "avg": true, "min": true, "max": true}
+	validAlertTypes = map[string]bool{"threshold": true, "absence": true, "rate_change": true}
+	// p50/p95/p99 are what latency alerts are written in ("p95 over 800ms"); the
+	// web form offered them long before this accepted them, so saving one failed
+	// with a 400 the form could not explain.
+	validAlertMetrics    = map[string]bool{"count": true, "sum": true, "avg": true, "min": true, "max": true, "p50": true, "p95": true, "p99": true}
 	validAlertConditions = map[string]bool{"gt": true, "lt": true, "gte": true, "lte": true, "eq": true}
 )
 
@@ -245,7 +248,7 @@ func CreateAlertRule(engine db.Queryable, project string, req CreateAlertRuleReq
 		rule.Metric = "count"
 	}
 	if !validAlertMetrics[rule.Metric] {
-		return nil, fmt.Errorf("invalid metric: %s (must be count, sum, avg, min, or max)", rule.Metric)
+		return nil, fmt.Errorf("invalid metric: %s (must be count, sum, avg, min, max, p50, p95 or p99)", rule.Metric)
 	}
 	if rule.EvaluationIntervalSecs == 0 {
 		rule.EvaluationIntervalSecs = 60
@@ -471,7 +474,7 @@ func UpdateAlertRule(engine db.Queryable, project, id string, req UpdateAlertRul
 	}
 	if req.Metric != nil {
 		if !validAlertMetrics[*req.Metric] {
-			return nil, fmt.Errorf("invalid metric: %s (must be count, sum, avg, min, or max)", *req.Metric)
+			return nil, fmt.Errorf("invalid metric: %s (must be count, sum, avg, min, max, p50, p95 or p99)", *req.Metric)
 		}
 		u = u.Set("metric", *req.Metric)
 	}

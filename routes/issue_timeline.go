@@ -68,6 +68,51 @@ func requireActor(w http.ResponseWriter, r *http.Request) *structs.Actor {
 	return actor
 }
 
+// canModifyComment reports whether actor may edit or delete a comment.
+//
+// Until this existed, any authenticated caller could rewrite or delete anyone's
+// comment — including the notes agents leave on issues as they work, which are
+// the record of what was tried. The author may change their own; an admin
+// session and the master key (break-glass) may moderate anything.
+func canModifyComment(actor *structs.Actor, user *structs.User, entry *structs.IssueTimelineEntry) bool {
+	if actor == nil || entry == nil {
+		return false
+	}
+	if user != nil && user.Role == "admin" {
+		return true
+	}
+	if actor.Kind == structs.ActorKindSystem {
+		return true
+	}
+	if actor.UserID != nil && entry.ActorUserID != nil && *actor.UserID == *entry.ActorUserID {
+		return true
+	}
+	if actor.APIKeyID != nil && entry.ActorAPIKeyID != nil && *actor.APIKeyID == *entry.ActorAPIKeyID {
+		return true
+	}
+	return false
+}
+
+// requireOwnComment loads the comment and refuses (403) an actor who did not
+// write it. It writes the response and returns false on any refusal.
+func requireOwnComment(w http.ResponseWriter, r *http.Request, issueID string, entryID int64, actor *structs.Actor) bool {
+	entry, err := query.GetTimelineEntry(db.SQL, issueID, entryID)
+	if err != nil {
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to load comment", err)
+		return false
+	}
+	if entry == nil || entry.Type != structs.TimelineComment || entry.DeletedAt != nil {
+		responder.Error(w, http.StatusNotFound, "comment not found")
+		return false
+	}
+	user, _ := middleware.GetUserFromContext(r.Context())
+	if !canModifyComment(actor, user, entry) {
+		responder.Error(w, http.StatusForbidden, "only the comment's author or an admin can change it")
+		return false
+	}
+	return true
+}
+
 // HandleGetIssueTimeline returns one issue's activity feed, oldest first.
 func HandleGetIssueTimeline(w http.ResponseWriter, r *http.Request) {
 	issue := requireIssue(w, r)
@@ -219,13 +264,17 @@ func HandleEditIssueComment(w http.ResponseWriter, r *http.Request) {
 	if issue == nil {
 		return
 	}
-	if actor := requireActor(w, r); actor == nil {
+	actor := requireActor(w, r)
+	if actor == nil {
 		return
 	}
 
 	entryID, err := strconv.ParseInt(mux.Vars(r)["commentID"], 10, 64)
 	if err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid comment id")
+		return
+	}
+	if !requireOwnComment(w, r, issue.ID, entryID, actor) {
 		return
 	}
 
@@ -260,13 +309,17 @@ func HandleDeleteIssueComment(w http.ResponseWriter, r *http.Request) {
 	if issue == nil {
 		return
 	}
-	if actor := requireActor(w, r); actor == nil {
+	actor := requireActor(w, r)
+	if actor == nil {
 		return
 	}
 
 	entryID, err := strconv.ParseInt(mux.Vars(r)["commentID"], 10, 64)
 	if err != nil {
 		responder.Error(w, http.StatusBadRequest, "invalid comment id")
+		return
+	}
+	if !requireOwnComment(w, r, issue.ID, entryID, actor) {
 		return
 	}
 

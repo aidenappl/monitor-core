@@ -165,12 +165,15 @@ var deployedSurface = []string{
 	"PUT /admin/zones/{id}",
 	"PUT /auth/self",
 	"PUT /v1/alert-rules/{id}",
+	"PUT /v1/api-keys/{id}",
 	"PUT /v1/dashboards/{id}",
 	"PUT /v1/issues/{id}",
+	"PUT /v1/notification-channels/{id}",
 	"PUT /v1/notification-policies/reorder",
 	"PUT /v1/notification-policies/{id}",
 	"PUT /v1/service-groups/{id}",
 	"PUT /v1/service-repos/{service}",
+	"PUT /v1/views/{id}",
 }
 
 // dataPlaneOnly are the routes an app process MUST NOT register. Every one of

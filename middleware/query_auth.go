@@ -92,7 +92,11 @@ func QueryAuthMiddleware(next http.Handler) http.Handler {
 		// before the call: it must be added to the context SessionMiddleware
 		// built, on the way to the handler, not to the one handed to a middleware
 		// that is still free to reject the request.
-		SessionMiddleware(withSessionProject(next)).ServeHTTP(w, r)
+		//
+		// requireSessionRole sits between the two: it needs the user
+		// SessionMiddleware resolved, and it must refuse a pending account or a
+		// read-only write before anything else runs.
+		SessionMiddleware(requireSessionRole(withSessionProject(next))).ServeHTTP(w, r)
 	})
 }
 

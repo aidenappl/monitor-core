@@ -327,6 +327,11 @@ func SoftDeleteComment(engine db.Queryable, issueID string, entryID int64) (bool
 	return affected > 0, nil
 }
 
+// GetTimelineEntry returns one entry of an issue's timeline, or nil.
+func GetTimelineEntry(engine db.Queryable, issueID string, entryID int64) (*structs.IssueTimelineEntry, error) {
+	return getTimelineEntryByID(engine, issueID, entryID)
+}
+
 func getTimelineEntryByID(engine db.Queryable, issueID string, entryID int64) (*structs.IssueTimelineEntry, error) {
 	q := sq.Select(timelineColumns...).From(timelineTable).
 		Where(sq.Eq{"monitor.issue_timeline.id": entryID}).

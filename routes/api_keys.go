@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/aidenappl/monitor-core/apikeys"
 	"github.com/aidenappl/monitor-core/responder"
@@ -89,4 +90,46 @@ func HandleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
 
 	telemetry.Info(r.Context(), "api_key.deleted", map[string]any{"key_id": id})
 	responder.New(w, nil, "api key deleted")
+}
+
+// HandleUpdateAPIKey renames a key. PUT /v1/api-keys/{id}, body {"name": "..."}.
+//
+// Name only, deliberately: scope and project are what the key AUTHORISES and
+// WHERE its events land, and the honest way to change either is a new key — an
+// edit would silently re-home every event its producer already sends.
+func HandleUpdateAPIKey(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	if id == "" {
+		responder.Error(w, http.StatusBadRequest, "id is required")
+		return
+	}
+
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		responder.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	body.Name = strings.TrimSpace(body.Name)
+	if body.Name == "" {
+		responder.Error(w, http.StatusBadRequest, "name is required")
+		return
+	}
+
+	key, err := apikeys.Rename(r.Context(), id, body.Name)
+	if err != nil {
+		switch {
+		case errors.Is(err, apikeys.ErrKeyNotFound):
+			responder.Error(w, http.StatusNotFound, "api key not found")
+		case errors.Is(err, apikeys.ErrDuplicateKeyName):
+			responder.Error(w, http.StatusConflict, err.Error())
+		default:
+			responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to rename api key", err, map[string]any{"key_id": id})
+		}
+		return
+	}
+
+	telemetry.Info(r.Context(), "api_key.renamed", map[string]any{"key_id": id})
+	responder.New(w, key)
 }
