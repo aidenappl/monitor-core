@@ -54,6 +54,42 @@ func DataOperand(op string, value any) (arg any, numeric bool, raw bool, err err
 	}
 }
 
+// InValues normalises the value of an `in` filter on field into a list. An
+// array is taken as is; a string is split on commas, each part trimmed and
+// empties dropped — monitor-web's filter bar, and anyone typing into a query
+// tool, sends `a,b` rather than ["a","b"]. Anything else, and a list that ends
+// up empty, is ErrInvalidFilterValue naming the field, which every route
+// answers with a 400 rather than letting the builder fail as a 500.
+func InValues(field string, value any) ([]any, error) {
+	switch v := value.(type) {
+	case []any:
+		if len(v) == 0 {
+			break
+		}
+		return v, nil
+	case []string:
+		if len(v) == 0 {
+			break
+		}
+		out := make([]any, len(v))
+		for i, s := range v {
+			out[i] = s
+		}
+		return out, nil
+	case string:
+		var out []any
+		for _, part := range strings.Split(v, ",") {
+			if p := strings.TrimSpace(part); p != "" {
+				out = append(out, p)
+			}
+		}
+		if len(out) > 0 {
+			return out, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: filter on %s with operator in needs a list of values (an array, or a comma-separated string)", ErrInvalidFilterValue, field)
+}
+
 // DataInOperands is DataOperand for the `in` operator: numeric when every
 // value is a number, text otherwise (numbers rendered as their JSON text).
 func DataInOperands(values []any) (args []any, numeric bool) {

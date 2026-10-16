@@ -188,6 +188,17 @@ func buildFilterClause(filters []structs.QueryFilter) (string, []interface{}, er
 func buildSingleFilter(f structs.QueryFilter) (string, []interface{}, error) {
 	var fieldExpr string
 
+	// An `in` value is normalised once, here, for both the data.* and the
+	// column path: a comma-separated string becomes a list, anything else that
+	// is not a list is a 400-class ErrInvalidFilterValue naming the field.
+	if f.Operator == "in" {
+		values, err := structs.InValues(f.Field, f.Value)
+		if err != nil {
+			return "", nil, err
+		}
+		f.Value = values
+	}
+
 	if strings.HasPrefix(f.Field, "data.") {
 		key := strings.TrimPrefix(f.Field, "data.")
 		if !structs.SafeIdentifierRegex.MatchString(key) {
@@ -198,19 +209,7 @@ func buildSingleFilter(f structs.QueryFilter) (string, []interface{}, error) {
 		// Comparing a number against the String extract is ClickHouse 386.
 		cf := f
 		if f.Operator == "in" {
-			values, ok := f.Value.([]interface{})
-			if !ok {
-				if strs, isStrs := f.Value.([]string); isStrs {
-					for _, v := range strs {
-						values = append(values, v)
-					}
-					ok = true
-				}
-			}
-			if !ok {
-				return "", nil, fmt.Errorf("in operator requires array value")
-			}
-			args, numeric := structs.DataInOperands(values)
+			args, numeric := structs.DataInOperands(f.Value.([]interface{}))
 			fieldExpr = dataStringExpr(key)
 			if numeric {
 				fieldExpr = dataNumberExpr(key)
