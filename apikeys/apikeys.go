@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
@@ -33,7 +34,41 @@ var (
 	ErrUnknownProject = errors.New("unknown project")
 	// ErrDuplicateKeyName means the project already owns a key by that name.
 	ErrDuplicateKeyName = errors.New("duplicate api key name")
+	// ErrInvalidKeyName means the name is empty or longer than the column.
+	// Before it existed an over-long name reached MariaDB and came back as
+	// errno 1406 ("Data too long"), which the routes answered as a 500.
+	ErrInvalidKeyName = errors.New("invalid api key name")
+	// ErrInvalidScope means the scope is neither admin nor ingest.
+	ErrInvalidScope = errors.New("invalid api key scope")
 )
+
+// MAX_NAME_LENGTH is api_keys.name's VARCHAR(255) (migration 106), counted in
+// characters as utf8mb4 counts them, not bytes.
+const MAX_NAME_LENGTH = 255
+
+// NormalizeName trims name and checks it against the column, returning the
+// value to store. Create and Rename both go through it, so the two verbs cannot
+// disagree about what a valid name is.
+func NormalizeName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", validationError{ErrInvalidKeyName, "name is required"}
+	}
+	if utf8.RuneCountInString(name) > MAX_NAME_LENGTH {
+		return "", validationError{ErrInvalidKeyName, fmt.Sprintf("name must be at most %d characters", MAX_NAME_LENGTH)}
+	}
+	return name, nil
+}
+
+// validationError carries a message meant for the client verbatim while still
+// matching its sentinel under errors.Is.
+type validationError struct {
+	sentinel error
+	msg      string
+}
+
+func (e validationError) Error() string { return e.msg }
+func (e validationError) Unwrap() error { return e.sentinel }
 
 // MYSQL_ERR_DUPLICATE_ENTRY is MariaDB's ER_DUP_ENTRY.
 const MYSQL_ERR_DUPLICATE_ENTRY = 1062
@@ -265,11 +300,12 @@ func ValidateWithIdentity(rawKey string) (Identity, bool) {
 // project yet, and a hard requirement here would break key creation for both on
 // the deploy that shipped this rather than at a time anyone chose.
 func Create(ctx context.Context, name string, scope Scope, projectSlug string) (*CreateResult, error) {
-	if name == "" {
-		return nil, fmt.Errorf("name is required")
+	name, err := NormalizeName(name)
+	if err != nil {
+		return nil, err
 	}
 	if scope != ScopeAdmin && scope != ScopeIngest {
-		return nil, fmt.Errorf("scope must be 'admin' or 'ingest'")
+		return nil, validationError{ErrInvalidScope, "scope must be 'admin' or 'ingest'"}
 	}
 
 	project, err := resolveProject(ctx, projectSlug)
@@ -470,6 +506,10 @@ var ErrKeyNotFound = errors.New("api key not found")
 // admin key's writes are attributed to, and a stale one would sign the next
 // audit row with the old name for up to a refresh interval.
 func Rename(ctx context.Context, id, name string) (*APIKey, error) {
+	name, err := NormalizeName(name)
+	if err != nil {
+		return nil, err
+	}
 	project, ok := scope.GetProject(ctx)
 	if !ok {
 		return nil, scope.ErrNoProject
