@@ -58,6 +58,7 @@ func RegisterSSORoutes(r *mux.Router) {
 	// role=admin. RequireAdmin reads the user SessionMiddleware puts in context.
 	admin := r.PathPrefix("/admin").Subrouter()
 	admin.Use(middleware.SessionMiddleware)
+	admin.Use(ActivitySinkMiddleware)
 	admin.HandleFunc("/sso-providers", middleware.RequireAdmin(HandleListSSOProviders)).Methods(http.MethodGet)
 	admin.HandleFunc("/sso-providers", middleware.RequireAdmin(HandleCreateSSOProvider)).Methods(http.MethodPost)
 	admin.HandleFunc("/sso-providers/{slug}", middleware.RequireAdmin(HandleUpdateSSOProvider)).Methods(http.MethodPut)

@@ -147,6 +147,7 @@ func buildRouter(role env.Role) *mux.Router {
 		// would compile fine and read as the cache to anyone skimming.
 		registryAdmin := r.PathPrefix("/admin").Subrouter()
 		registryAdmin.Use(middleware.SessionMiddleware)
+		registryAdmin.Use(routes.ActivitySinkMiddleware)
 		// User admin: list accounts, approve pending ones (a role change), set
 		// roles, disable. Control plane only — it owns the users table.
 		registryAdmin.HandleFunc("/users", middleware.RequireAdmin(routes.HandleAdminListUsers)).Methods(http.MethodGet)
@@ -203,6 +204,7 @@ func buildRouter(role env.Role) *mux.Router {
 	// middleware/timeout.go and middleware/gzip.go for the full rule sets.
 	v1.Use(middleware.RequestTimeout(v1RequestTimeout))
 	v1.Use(middleware.GzipMiddleware)
+	v1.Use(routes.ActivitySinkMiddleware)
 
 	// Tenancy registry reads. These are what the project switcher in monitor-web
 	// populates from, and they are READS ONLY — the registry is seeded by

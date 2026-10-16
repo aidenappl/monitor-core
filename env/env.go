@@ -70,6 +70,14 @@ var (
 	// (which would resolve to the API host). Defaults to the dashboard origin.
 	WebBaseURL string
 
+	// Activity sink (optional, both required to enable): changes made by users
+	// signed in through SSO provider ActivityReportProvider (a slug) are
+	// mirrored to ActivityReportURL — that provider's per-user activity trail,
+	// authenticated with the provider's client credentials. See
+	// routes/activity_sink.go.
+	ActivityReportURL      string
+	ActivityReportProvider string
+
 	// SSE
 	MaxSSESubscribers int
 
@@ -207,6 +215,9 @@ func Load() {
 	// this still boots. Both deployed stacks set it explicitly.
 	PublicBaseURL = getEnv("MON_PUBLIC_URL", "")
 	WebBaseURL = getEnv("MON_WEB_URL", "https://monitor.appleby.cloud")
+
+	ActivityReportURL = strings.TrimSpace(getEnv("ACTIVITY_REPORT_URL", ""))
+	ActivityReportProvider = strings.TrimSpace(getEnv("ACTIVITY_REPORT_PROVIDER", ""))
 
 	BatchSize = getEnvInt("BATCH_SIZE", 1000)
 	FlushInterval = getEnvDuration("FLUSH_INTERVAL", 5*time.Second)
