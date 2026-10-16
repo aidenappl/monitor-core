@@ -6,6 +6,7 @@ require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.43.0
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/Masterminds/squirrel v1.5.4
+	github.com/aidenappl/go-forta v1.13.0
 	github.com/aidenappl/go-keyring v1.0.2
 	github.com/aidenappl/go-monitor v0.0.9-0.20260912224748-17017e52efeb
 	github.com/go-sql-driver/mysql v1.9.3

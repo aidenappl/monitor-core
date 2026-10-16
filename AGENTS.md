@@ -49,7 +49,7 @@ what is deliberately **not** built yet.
 
 ## 2. Stack & dependencies
 
-- **Language:** Go 1.26 (`go.mod` — `go 1.25.5`).
+- **Language:** Go 1.26 (`go.mod` — `go 1.26.9`).
 - **Router:** `github.com/gorilla/mux`.
 - **SQL builder:** `github.com/Masterminds/squirrel` (imported as `sq`) — **no ORM**.
 - **Datastores — two of them:**
@@ -74,6 +74,9 @@ what is deliberately **not** built yet.
   (adapters, PKCE, state, back-channel logout, and the server-side SSO session `Manager` +
   `sqlstore`). It brings `coreos/go-oidc/v3` and `golang.org/x/oauth2` transitively.
   Pinned at **v0.1.0**; upgrade with `go get github.com/aidenappl/go-oidc-session@vX.Y.Z`.
+- **Activity sink:** `github.com/aidenappl/go-forta/activity` (v1.13.0) — the stdlib-only reporter
+  subpackage, used generically (no Forta auth code). Off unless `ACTIVITY_REPORT_URL` and
+  `ACTIVITY_REPORT_PROVIDER` are set — see §6 *Activity sink*.
 - **Passwords/crypto:** `golang.org/x/crypto/bcrypt` (cost 12) + AES-256-GCM (`tools/Crypto.go`).
 - **Secrets:** `github.com/aidenappl/go-keyring` (optional at startup — see §4).
 - **IDs:** `github.com/google/uuid`.
@@ -1792,6 +1795,30 @@ through `telemetry.Go` or defers `telemetry.Recover`, so a panic is reported as
 `panic.recovered` with the goroutine's name and what stopping it costs. Note the recover
 still sits **outside** each loop, so a panic ends that goroutine for the life of the
 process rather than restarting it — now reported, but still a shared weakness.
+
+### Activity sink (`routes/activity_sink.go`, optional)
+
+When `ACTIVITY_REPORT_URL` and `ACTIVITY_REPORT_PROVIDER` (an `sso_providers` slug — prod `forta`)
+are both set, every **successful (2xx), named change by a user actor** is posted to the URL as
+`{sub, action, outcome: "success", details}`. `sub` is the user's `identities.provider_user_id` for
+that provider; the request is authenticated with that provider's client id/secret
+(`sso.LoadProvider`, so a rotated secret is picked up). In production this puts issue triage,
+comments, alert-rule/channel/policy changes, API keys and admin changes on the person's Forta
+activity trail.
+
+- **One middleware, mounted on `/v1`, the registry `/admin` and the SSO `/admin` subrouters,
+  reporting ONLY routes named in `sinkActions`.** Several `/v1` POSTs are reads (analytics,
+  timeseries, topn, gauge, compare), so there is no generic fallback.
+  `TestActivitySinkCoversMutatingRoutes` (package main) fails when a named route does not exist
+  **or a mutating route is neither named nor in its `sinkExcluded` list** — adding a route means
+  deciding which.
+- Not reported: API-key and system actors (agents, CI, the evaluator), users with no identity
+  from that provider, non-2xx responses. A zone-only process (`MON_ROLE=zone`, e.g.
+  `appleby-core`) can only report if its MariaDB holds the identity tables; otherwise the lookup
+  fails and the event is skipped quietly.
+- Details: route variables (`id`, `service`, `slug`, `commentid`, `linkid`) plus `zone` on `/v1`
+  — never bodies, comment text, rule definitions or keys.
+- Fire-and-forget; failures emit `activity_sink.report.failed` (warn).
 
 ### External systems
 
