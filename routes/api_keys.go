@@ -3,8 +3,10 @@ package routes
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/aidenappl/monitor-core/apikeys"
 	"github.com/aidenappl/monitor-core/responder"
@@ -24,6 +26,10 @@ func HandleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 	responder.New(w, keys)
 }
 
+// MAX_API_KEY_NAME_LENGTH is api_keys.name's VARCHAR(255) (migration 106). A
+// longer name used to reach MariaDB and come back as a 500 (Error 1406).
+const MAX_API_KEY_NAME_LENGTH = 255
+
 func HandleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	// ProjectSlug names the tenant the new key will file events under. Omitting
 	// it falls back to env.DefaultProjectSlug inside apikeys.Create — the same
@@ -40,6 +46,10 @@ func HandleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Name == "" {
 		responder.Error(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if utf8.RuneCountInString(body.Name) > MAX_API_KEY_NAME_LENGTH {
+		responder.Error(w, http.StatusBadRequest, fmt.Sprintf("name must be at most %d characters", MAX_API_KEY_NAME_LENGTH))
 		return
 	}
 
@@ -114,6 +124,10 @@ func HandleUpdateAPIKey(w http.ResponseWriter, r *http.Request) {
 	body.Name = strings.TrimSpace(body.Name)
 	if body.Name == "" {
 		responder.Error(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if utf8.RuneCountInString(body.Name) > MAX_API_KEY_NAME_LENGTH {
+		responder.Error(w, http.StatusBadRequest, fmt.Sprintf("name must be at most %d characters", MAX_API_KEY_NAME_LENGTH))
 		return
 	}
 

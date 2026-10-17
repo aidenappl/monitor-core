@@ -138,9 +138,13 @@ func applyColumnFilter(builder sq.SelectBuilder, f Filter) (sq.SelectBuilder, er
 	case OpEndsWith:
 		builder = builder.Where(sq.Like{f.Field: fmt.Sprintf("%%%v", f.Value)})
 	case OpIn:
-		if values, ok := f.Value.([]string); ok {
-			builder = builder.Where(sq.Eq{f.Field: values})
+		// Previously only []string was honoured and anything else (a JSON
+		// []any, a scalar) silently dropped the filter, widening the result.
+		values, err := structs.InValues(f.Value)
+		if err != nil {
+			return builder, err
 		}
+		builder = builder.Where(sq.Eq{f.Field: values})
 	}
 
 	return builder, nil
@@ -158,6 +162,23 @@ func applyDataFilter(builder sq.SelectBuilder, f Filter) (sq.SelectBuilder, erro
 	}
 
 	extractStr := dataStringExpr(f.Field)
+
+	// `in` has its own operand rule (numeric only when every value is a
+	// number) and had no case below, so a data.* in filter was silently
+	// dropped. Same handling as services/analytics.go and alerts.
+	if f.Operator == OpIn {
+		values, err := structs.InValues(f.Value)
+		if err != nil {
+			return builder, err
+		}
+		args, numeric := structs.DataInOperands(values)
+		extract := extractStr
+		if numeric {
+			extract = dataNumberExpr(f.Field)
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(args)), ", ")
+		return builder.Where(fmt.Sprintf("%s IN (%s)", extract, placeholders), args...), nil
+	}
 
 	// structs.DataOperand picks the extract from the value: a number compares
 	// numerically, text as text, a bool against the raw JSON. Comparing a

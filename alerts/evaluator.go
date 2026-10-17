@@ -1056,7 +1056,7 @@ func buildFilterCondition(f structs.QueryFilter) (string, []interface{}, error) 
 		if f.Operator == "in" {
 			// Same rule as services/analytics.go: numeric when every value is
 			// a number, text otherwise.
-			values, err := inValues(f.Value)
+			values, err := structs.InValues(f.Value)
 			if err != nil {
 				return "", nil, err
 			}
@@ -1111,7 +1111,7 @@ func buildFilterCondition(f structs.QueryFilter) (string, []interface{}, error) 
 	case "endswith":
 		return fmt.Sprintf("%s LIKE ?", fieldExpr), []interface{}{fmt.Sprintf("%%%v", f.Value)}, nil
 	case "in":
-		values, err := inValues(f.Value)
+		values, err := structs.InValues(f.Value)
 		if err != nil {
 			return "", nil, err
 		}
@@ -1126,27 +1126,6 @@ func buildFilterCondition(f structs.QueryFilter) (string, []interface{}, error) 
 		// array (or pattern) with `=`.
 		return fmt.Sprintf("%s = ?", fieldExpr), []interface{}{f.Value}, nil
 	}
-}
-
-// inValues is an `in` filter's value list. Rules store query_filters as JSON,
-// so it arrives as []interface{}; []string covers callers building filters in
-// Go. An empty list is refused: `IN ()` is a ClickHouse syntax error.
-func inValues(v interface{}) ([]interface{}, error) {
-	switch vals := v.(type) {
-	case []interface{}:
-		if len(vals) > 0 {
-			return vals, nil
-		}
-	case []string:
-		if len(vals) > 0 {
-			out := make([]interface{}, len(vals))
-			for i, s := range vals {
-				out[i] = s
-			}
-			return out, nil
-		}
-	}
-	return nil, fmt.Errorf("in operator requires a non-empty array value")
 }
 
 // CheckCondition evaluates whether a value meets the alert condition against the threshold

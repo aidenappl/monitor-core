@@ -375,6 +375,14 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
   extract, so a numeric value was ClickHouse error 386 ("no supertype for String,
   UInt16") — and `JSONExtractString` returns `''` for a JSON number, so even the text
   `"500"` never matched a numeric field.
+- **An `in` filter's value goes through `structs.InValues`** at all three filter sites, for
+  columns and `data.*` alike: a JSON `[]any` or Go `[]string` is the list, a lone scalar is a
+  one-element list, and an empty list or `nil` is `ErrInvalidFilterValue` (400). Before this,
+  each site had its own rule: analytics 500'd on a scalar, and event search silently
+  **dropped** an `in` filter that wasn't a `[]string` (a column) or had no case at all
+  (`data.*`), returning unfiltered results.
+- **API key names are at most `MAX_API_KEY_NAME_LENGTH` (255) characters**, checked in
+  `routes/api_keys.go` on create and rename to match `api_keys.name VARCHAR(255)`.
 - **ClickHouse SQL** is built with squirrel then run via the native driver. **All
   caller-controlled `data.*` field names MUST be validated** against
   `structs.SafeIdentifierRegex` before interpolation (`services/analytics.go`,
