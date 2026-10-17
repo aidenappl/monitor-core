@@ -271,6 +271,7 @@ func buildRouter(role env.Role) *mux.Router {
 		// Alert rules
 		v1.HandleFunc("/alert-rules", routes.HandleListAlertRules).Methods(http.MethodGet)
 		v1.HandleFunc("/alert-rules", routes.HandleCreateAlertRule).Methods(http.MethodPost)
+		v1.HandleFunc("/alert-rules/preview-routing", routes.HandlePreviewAlertRuleRouting).Methods(http.MethodPost)
 		v1.HandleFunc("/alert-rules/{id}", routes.HandleGetAlertRule).Methods(http.MethodGet)
 		v1.HandleFunc("/alert-rules/{id}", routes.HandleUpdateAlertRule).Methods(http.MethodPut)
 		v1.HandleFunc("/alert-rules/{id}", routes.HandleDeleteAlertRule).Methods(http.MethodDelete)

@@ -96,6 +96,46 @@ func HandleCreateAlertRule(w http.ResponseWriter, r *http.Request) {
 	responder.New(w, created)
 }
 
+// HandlePreviewAlertRuleRouting answers "if this draft rule fired now, which
+// policies would match and which channels would be notified?" without storing
+// the rule or sending anything.
+//
+// The body is the CREATE body, decoded and validated by the same code
+// (decodeAlertRuleBody, query.BuildAlertRule), so the preview refuses exactly
+// what create refuses, with the same field-level 400s. Routing is
+// alerts.PreviewRouting, which runs the router's own traceRouting — monitor-web
+// previously re-implemented policy matching, and two copies of that drift.
+//
+// A read, so the role gate lets any session that can read rules call it
+// (middleware.readOnlyPOSTPaths).
+func HandlePreviewAlertRuleRouting(w http.ResponseWriter, r *http.Request) {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	var req query.CreateAlertRuleRequest
+	if _, err := decodeAlertRuleBody(r, &req); err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rule, err := query.BuildAlertRule(project, req)
+	if err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	preview, err := alerts.PreviewRouting(r.Context(), rule)
+	if err != nil {
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to preview routing", err, map[string]any{
+			"project":    project,
+			"dependency": "mariadb",
+		})
+		return
+	}
+	responder.New(w, preview)
+}
+
 func HandleGetAlertRule(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	if id == "" {

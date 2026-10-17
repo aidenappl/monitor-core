@@ -248,6 +248,33 @@ type CreateAlertRuleRequest struct {
 // belong to" is decided by the credential, never by the body. The handler takes
 // it from requireProject and passes it here.
 func CreateAlertRule(engine db.Queryable, project string, req CreateAlertRuleRequest) (*structs.AlertRule, error) {
+	rule, err := BuildAlertRule(project, req)
+	if err != nil {
+		return nil, err
+	}
+
+	qStr, args, err := sq.Insert(alertRulesTable).
+		Columns(alertRuleInsertColumns...).
+		Values(rule.ID, rule.Project, rule.Name, rule.Description, rule.Type, rule.Priority,
+			rule.QueryFilters, rule.Metric, rule.Field, rule.Condition, rule.Threshold,
+			rule.EvaluationIntervalSecs, rule.ForSeconds, rule.CooldownSeconds,
+			rule.NotificationChannelIDs, rule.Enabled, rule.CreatedAt, rule.UpdatedAt).
+		ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build sql query: %w", err)
+	}
+
+	if _, err := engine.Exec(qStr, args...); err != nil {
+		return nil, fmt.Errorf("failed to insert alert rule: %w", err)
+	}
+	return rule, nil
+}
+
+// BuildAlertRule is CreateAlertRule without the INSERT: every validation (the
+// same field-level errors) and every default, returning the row that would be
+// written. POST /v1/alert-rules/preview-routing routes a draft through it, so a
+// draft the preview accepts is a draft create would accept.
+func BuildAlertRule(project string, req CreateAlertRuleRequest) (*structs.AlertRule, error) {
 	// Checked before anything else because the column is NOT NULL with no
 	// default (migration 127): an empty project reaches MariaDB as errno 1364
 	// naming the column, where this names the request that had no tenant.
@@ -333,21 +360,6 @@ func CreateAlertRule(engine db.Queryable, project string, req CreateAlertRuleReq
 	}
 	if err := requireJSONText("notification_channel_ids", rule.NotificationChannelIDs); err != nil {
 		return nil, err
-	}
-
-	qStr, args, err := sq.Insert(alertRulesTable).
-		Columns(alertRuleInsertColumns...).
-		Values(rule.ID, rule.Project, rule.Name, rule.Description, rule.Type, rule.Priority,
-			rule.QueryFilters, rule.Metric, rule.Field, rule.Condition, rule.Threshold,
-			rule.EvaluationIntervalSecs, rule.ForSeconds, rule.CooldownSeconds,
-			rule.NotificationChannelIDs, rule.Enabled, rule.CreatedAt, rule.UpdatedAt).
-		ToSql()
-	if err != nil {
-		return nil, fmt.Errorf("failed to build sql query: %w", err)
-	}
-
-	if _, err := engine.Exec(qStr, args...); err != nil {
-		return nil, fmt.Errorf("failed to insert alert rule: %w", err)
 	}
 	return &rule, nil
 }

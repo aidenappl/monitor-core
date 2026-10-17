@@ -252,17 +252,48 @@ func reportInvalidPolicy(policy structs.NotificationPolicy, column string, err e
 // policies named them.
 //
 // PURE, and deliberately so: it is the one description of what "this rule's
-// destinations" means, and both the live dispatch above and the has_destinations
-// badge on GET /v1/alert-rules call it. Two implementations of this would drift
-// into a badge that says a rule is wired up while the router sends nowhere.
+// destinations" means, and the live dispatch above, the has_destinations badge
+// on GET /v1/alert-rules and POST /v1/alert-rules/preview-routing all reach it
+// through traceRouting. Two implementations of this would drift into a badge
+// (or a preview) that says a rule is wired up while the router sends nowhere.
 //
 // ORDER IS PRESERVED rather than collected into a map, so the result is
 // deterministic. The old code iterated a map, which made the dispatch order —
 // and therefore anything asserted about it — random.
 func matchedChannelIDs(alertCtx *AlertContext, rule *structs.AlertRule, policies []structs.NotificationPolicy) []string {
+	return traceRouting(alertCtx, rule, policies).ChannelIDs
+}
+
+// PolicyDecision is one policy's verdict for one alert. Reason is a sentence
+// for a person: why it matched or did not, or why it was never consulted.
+type PolicyDecision struct {
+	Policy  structs.NotificationPolicy
+	Matched bool
+	Reason  string
+}
+
+// RoutingTrace is the whole routing decision for one alert: a verdict for EVERY
+// policy, in routing order (including the ones a stopping match kept the router
+// from reaching), the channel ids that result, and whether those came from the
+// rule's own notification_channel_ids because no policy matched.
+type RoutingTrace struct {
+	Decisions        []PolicyDecision
+	ChannelIDs       []string
+	UsedRuleChannels bool
+}
+
+// traceRouting is THE routing algorithm. Route dispatches its ChannelIDs and the
+// preview renders its Decisions, so what the preview says is what the router
+// does — policy order, enabled, matchers, continue_matching, then the rule-level
+// fallback.
+func traceRouting(alertCtx *AlertContext, rule *structs.AlertRule, policies []structs.NotificationPolicy) RoutingTrace {
+	trace := RoutingTrace{
+		Decisions:  make([]PolicyDecision, 0, len(policies)),
+		ChannelIDs: []string{},
+	}
 	seen := map[string]bool{}
-	ids := []string{}
 	policyMatched := false
+	stoppedBy := ""
 
 	add := func(candidates []string) {
 		for _, id := range candidates {
@@ -270,22 +301,32 @@ func matchedChannelIDs(alertCtx *AlertContext, rule *structs.AlertRule, policies
 				continue
 			}
 			seen[id] = true
-			ids = append(ids, id)
+			trace.ChannelIDs = append(trace.ChannelIDs, id)
 		}
+	}
+	decide := func(policy structs.NotificationPolicy, matched bool, reason string) {
+		trace.Decisions = append(trace.Decisions, PolicyDecision{Policy: policy, Matched: matched, Reason: reason})
 	}
 
 	for _, policy := range policies {
+		if stoppedBy != "" {
+			decide(policy, false, fmt.Sprintf("not reached: %q matched first and does not continue matching", stoppedBy))
+			continue
+		}
 		if !policy.Enabled {
+			decide(policy, false, "disabled")
 			continue
 		}
 
 		var matchers PolicyMatchers
 		if err := json.Unmarshal([]byte(policy.Matchers), &matchers); err != nil {
 			reportInvalidPolicy(policy, "matchers", err)
+			decide(policy, false, "skipped: its matchers are not valid JSON")
 			continue
 		}
 
-		if !matchPolicy(alertCtx, &matchers) {
+		if reason := policyMismatch(alertCtx, &matchers); reason != "" {
+			decide(policy, false, reason)
 			continue
 		}
 
@@ -293,14 +334,23 @@ func matchedChannelIDs(alertCtx *AlertContext, rule *structs.AlertRule, policies
 
 		var channelIDs []string
 		if err := json.Unmarshal([]byte(policy.ChannelIDs), &channelIDs); err != nil {
+			// Still a match — the fallback stays skipped — exactly as before.
 			reportInvalidPolicy(policy, "channel_ids", err)
+			decide(policy, true, "matched, but its channel_ids are not valid JSON, so it routes nowhere")
 			continue
 		}
 		add(channelIDs)
 
-		if !policy.ContinueMatching {
-			break
+		reason := "matched"
+		if len(channelIDs) == 0 {
+			reason = "matched, but it names no channels"
 		}
+		if !policy.ContinueMatching {
+			decide(policy, true, reason+"; continue_matching is off, so later policies are not consulted")
+			stoppedBy = policy.Name
+			continue
+		}
+		decide(policy, true, reason)
 	}
 
 	// Fall back to rule-level channels if no policies matched.
@@ -317,9 +367,10 @@ func matchedChannelIDs(alertCtx *AlertContext, rule *structs.AlertRule, policies
 		if err := json.Unmarshal([]byte(rule.NotificationChannelIDs), &channelIDs); err == nil {
 			add(channelIDs)
 		}
+		trace.UsedRuleChannels = true
 	}
 
-	return ids
+	return trace
 }
 
 // countDestinations reports how many of a rule's matched channel ids resolve to a
@@ -341,8 +392,15 @@ func countDestinations(alertCtx *AlertContext, rule *structs.AlertRule, policies
 }
 
 func matchPolicy(alertCtx *AlertContext, matchers *PolicyMatchers) bool {
+	return policyMismatch(alertCtx, matchers) == ""
+}
+
+// policyMismatch returns why a policy's matchers do not match the alert, or ""
+// when they do. Checked in a fixed order, so the reason names the first matcher
+// that failed.
+func policyMismatch(alertCtx *AlertContext, matchers *PolicyMatchers) string {
 	if matchers.Priority != "" && matchers.Priority != alertCtx.Priority {
-		return false
+		return fmt.Sprintf("priority is %s; this policy matches %s", alertCtx.Priority, matchers.Priority)
 	}
 
 	if len(matchers.Services) > 0 {
@@ -354,7 +412,10 @@ func matchPolicy(alertCtx *AlertContext, matchers *PolicyMatchers) bool {
 			}
 		}
 		if !found {
-			return false
+			if alertCtx.Service == "" {
+				return fmt.Sprintf("the rule filters on no single service (service eq); this policy matches %s", strings.Join(matchers.Services, ", "))
+			}
+			return fmt.Sprintf("service %s is not one of %s", alertCtx.Service, strings.Join(matchers.Services, ", "))
 		}
 	}
 
@@ -367,21 +428,27 @@ func matchPolicy(alertCtx *AlertContext, matchers *PolicyMatchers) bool {
 			}
 		}
 		if !found {
-			return false
+			if alertCtx.Service == "" {
+				return "the rule filters on no single service (service eq), so it is in no service group"
+			}
+			return fmt.Sprintf("service %s is not in this policy's service group", alertCtx.Service)
 		}
 	}
 
 	if matchers.Status != "" && matchers.Status != alertCtx.Status {
-		return false
+		return fmt.Sprintf("status is %s; this policy matches %s", alertCtx.Status, matchers.Status)
 	}
 
 	if matchers.Env != "" && matchers.Env != alertCtx.Env {
-		return false
+		if alertCtx.Env == "" {
+			return fmt.Sprintf("the rule filters on no single env (env eq); this policy matches %s", matchers.Env)
+		}
+		return fmt.Sprintf("env is %s; this policy matches %s", alertCtx.Env, matchers.Env)
 	}
 
 	if matchers.RuleName != "" && !strings.Contains(strings.ToLower(alertCtx.RuleName), strings.ToLower(matchers.RuleName)) {
-		return false
+		return fmt.Sprintf("rule name does not contain %q", matchers.RuleName)
 	}
 
-	return true
+	return ""
 }
