@@ -43,6 +43,26 @@ type QueryParams struct {
 	To      time.Time
 	Limit   int
 	Offset  int
+	// Order is QueryEvents' timestamp direction: "asc", or "desc" (the default,
+	// also used for ""). Only QueryEvents reads it.
+	Order string
+}
+
+const (
+	OrderAsc  = "asc"
+	OrderDesc = "desc"
+)
+
+// ParseOrder validates an `order` query value. Empty means OrderDesc; anything
+// other than asc/desc (case-insensitive) is an error naming the parameter.
+func ParseOrder(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", OrderDesc:
+		return OrderDesc, nil
+	case OrderAsc:
+		return OrderAsc, nil
+	}
+	return "", fmt.Errorf("order must be 'asc' or 'desc'")
 }
 
 type QueryResult struct {
@@ -320,7 +340,17 @@ func hasDataFilter(filters []Filter) bool {
 // Both phases start at selectEvents, so each carries its own project predicate:
 // the inner read decides which rows are on the page, and an unscoped one would
 // let another project's timestamps set the boundary.
+//
+// params.Order flips both phases together. Ascending, the boundary is the
+// NEWEST timestamp on the page and the wide read is bounded `<=` it; an offset
+// past the end gives max() over nothing, 1970-01-01, which bounds the outer read
+// to nothing.
 func buildEventPageQuery(ctx context.Context, params QueryParams) (string, []interface{}, error) {
+	orderBy, boundaryExpr := "timestamp DESC", "timestamp >= (SELECT min(timestamp) FROM (?))"
+	if params.Order == OrderAsc {
+		orderBy, boundaryExpr = "timestamp ASC", "timestamp <= (SELECT max(timestamp) FROM (?))"
+	}
+
 	page, err := selectEvents(ctx, eventPageColumns...)
 	if err != nil {
 		return "", nil, err
@@ -340,14 +370,14 @@ func buildEventPageQuery(ctx context.Context, params QueryParams) (string, []int
 			return "", nil, err
 		}
 		boundary = boundary.
-			OrderBy("timestamp DESC").
+			OrderBy(orderBy).
 			Limit(uint64(params.Limit)).
 			Offset(uint64(params.Offset))
-		page = page.Where(sq.Expr("timestamp >= (SELECT min(timestamp) FROM (?))", boundary))
+		page = page.Where(sq.Expr(boundaryExpr, boundary))
 	}
 
 	page = page.
-		OrderBy("timestamp DESC").
+		OrderBy(orderBy).
 		Limit(uint64(params.Limit)).
 		Offset(uint64(params.Offset))
 

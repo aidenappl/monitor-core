@@ -125,6 +125,7 @@ var reservedParams = map[string]bool{
 	"limit":  true,
 	"offset": true,
 	"key":    true,
+	"order":  true,
 }
 
 // validOperators maps suffix to operator
@@ -205,6 +206,12 @@ func parseQueryParams(r *http.Request) (services.QueryParams, error) {
 			params.Offset = o
 		}
 	}
+
+	order, err := services.ParseOrder(q.Get("order"))
+	if err != nil {
+		return params, err
+	}
+	params.Order = order
 
 	// Parse filters
 	for key, values := range q {
