@@ -1559,11 +1559,13 @@ behind, in code *and* schema, with a green CI history above it.
 
 - A **Lattice deploy token is bound to ONE STACK**, and `?container=` only narrows within it.
   A Lattice **automation** is one webhook whose ordered steps can span stacks: *Redeploy
-  Monitor Core* (automation id 1) redeploys `appleby-core` (stack 32) and then `monitor-core`
-  (stack 30). Its webhook URL is the `LATTICE_DEPLOY_URL` repository secret — the workflow
+  Monitor Core* (automation id 1) redeploys `appleby-core` (stack 32), `hillview-core`
+  (stack 37) and then `monitor-core` (stack 30). Its webhook URL is the `LATTICE_DEPLOY_URL` repository secret — the workflow
   holds no hosts or URLs of its own — and `?commit=<sha>` is recorded on the run.
 - **The automation is the zone list.** Adding a zone is a new step on the automation; nothing
-  in this repo changes.
+  in this repo changes. Forgetting the step is silent: zone `hillview` launched without one
+  and stayed on the previous release while CI reported green, until 2026-10-17's
+  `GET /version` check across zones caught it. After any release, check every zone.
 - **HTTP 200 is not success.** The webhook is synchronous (a 50s run budget under Lattice's 60s
   write timeout), and a *disabled* automation answers **200** with `result: "disabled"` having
   run nothing. The `deploy` job therefore requires `data.result == "succeeded"` and prints each
