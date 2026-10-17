@@ -2,6 +2,7 @@ package query
 
 import (
 	"database/sql/driver"
+	"errors"
 	"testing"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
@@ -42,8 +43,9 @@ func withCryptoKey(t *testing.T) {
 // let one tenant page another tenant's on-call rotation by id alone.
 func TestNotificationChannelReadsAreProjectScoped(t *testing.T) {
 	channelRows := func() *sqlmock.Rows {
-		return sqlmock.NewRows([]string{"id", "project", "name", "type", "config", "config_enc", "created_at"}).
-			AddRow("c-1", "atlas", "ops", "slack", "{}", nil, testTime)
+		return sqlmock.NewRows([]string{"id", "project", "name", "type", "config", "config_enc", "created_at",
+			"last_test_at", "last_test_ok", "last_test_error"}).
+			AddRow("c-1", "atlas", "ops", "slack", "{}", nil, testTime, nil, nil, nil)
 	}
 
 	t.Run("list binds the project", func(t *testing.T) {
@@ -386,5 +388,47 @@ func TestSeedDefaultPoliciesSkipsAProjectThatAlreadyHasSome(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("the seeder wrote into a project that already had policies: %v", err)
+	}
+}
+
+// TestNotificationChannelTestResultIsStoredAndRead (NOTIFICATIONS-04): the test
+// outcome is written project-scoped, a success clears the reason, and the read
+// path surfaces all three columns.
+func TestNotificationChannelTestResultIsStoredAndRead(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	mock.ExpectExec(`^UPDATE monitor.notification_channels SET last_test_at = \?, last_test_ok = \?, last_test_error = \? WHERE id = \? AND project = \?$`).
+		WithArgs(testTime, false, "DNS lookup failed for example.invalid", "c-1", "atlas").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`^UPDATE monitor.notification_channels SET`).
+		WithArgs(testTime, true, nil, "c-1", "atlas").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := RecordNotificationChannelTest(mockDB, "atlas", "c-1", false, "DNS lookup failed for example.invalid", testTime); err != nil {
+		t.Fatalf("record failure: %v", err)
+	}
+	if err := RecordNotificationChannelTest(mockDB, "atlas", "c-1", true, "ignored on success", testTime); err != nil {
+		t.Fatalf("record success: %v", err)
+	}
+	if err := RecordNotificationChannelTest(mockDB, "", "c-1", true, "", testTime); !errors.Is(err, ErrNoAlertingProject) {
+		t.Errorf("empty project: err = %v, want ErrNoAlertingProject", err)
+	}
+
+	mock.ExpectQuery("SELECT .* FROM monitor.notification_channels").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "project", "name", "type", "config", "config_enc", "created_at",
+			"last_test_at", "last_test_ok", "last_test_error"}).
+			AddRow("c-1", "atlas", "ops", "webhook", "{}", nil, testTime, testTime, false, "DNS lookup failed for example.invalid"))
+	ch, err := GetNotificationChannel(mockDB, "atlas", "c-1")
+	if err != nil {
+		t.Fatalf("GetNotificationChannel: %v", err)
+	}
+	if ch.LastTestAt == nil || ch.LastTestOK == nil || *ch.LastTestOK || ch.LastTestError == nil || *ch.LastTestError != "DNS lookup failed for example.invalid" {
+		t.Errorf("last test fields not read back: %+v", ch)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
 	}
 }

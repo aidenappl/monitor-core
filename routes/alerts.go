@@ -15,6 +15,7 @@ import (
 	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
+	"github.com/aidenappl/monitor-core/structs"
 	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/gorilla/mux"
 )
@@ -369,18 +370,70 @@ func HandleTestNotificationChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The cause is an alerts.NotifyError: channel type, stage and the
-	// destination's status — the URL already stripped. It lands on this
-	// request's event, which is the one report of the failure.
-	notifier := alerts.NewNotifier()
-	if err := notifier.SendTest(ch); err != nil {
-		responder.ErrorWithCause(w, http.StatusInternalServerError, "test notification failed", err, map[string]any{
-			"channel_id": ch.ID, "channel_type": ch.Type,
-		})
+	// THE CONTRACT (NOTIFICATIONS-04), which monitor-web codes against:
+	//
+	//   - a config that can never deliver (missing/malformed URL, no recipient,
+	//     no routing key) → 400 naming the config field;
+	//   - a valid config whose delivery FAILED → 200 {ok:false, error:"<reason>"};
+	//   - delivered → 200 {ok:true}.
+	//
+	// It used to be a 500 "test notification failed" for both of the first two:
+	// the user's mistake read as the server's, and the reason — DNS, a 404, a
+	// timeout — never reached the person who could fix it. Every outcome is also
+	// stored on the channel (last_test_*), so a reload no longer forgets it. The
+	// reason comes from alerts.DeliveryReason and never contains the destination.
+	if err := alerts.ValidateChannelConfig(ch); err != nil {
+		recordChannelTest(w, r, ch, false, err.Error())
+		middleware.ExpectedClientError(w)
+		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	responder.New(w, nil, "test notification sent")
+	notifier := alerts.NewNotifier()
+	err = notifier.SendTest(ch)
+	var notifyErr *alerts.NotifyError
+	if errors.As(err, &notifyErr) && notifyErr.Stage == "config" {
+		// The notifier's own config check disagreed with ValidateChannelConfig;
+		// still the caller's to fix, and its text names a key, not a value.
+		reason := alerts.DeliveryReason(ch.Type, err)
+		recordChannelTest(w, r, ch, false, reason)
+		responder.Error(w, http.StatusBadRequest, reason)
+		return
+	}
+	if err != nil {
+		reason := alerts.DeliveryReason(ch.Type, err)
+		recordChannelTest(w, r, ch, false, reason)
+		fields := map[string]any{"channel_test_ok": false}
+		if notifyErr != nil {
+			for k, v := range notifyErr.TelemetryFields() {
+				fields[k] = v
+			}
+		}
+		middleware.Annotate(w, fields)
+		responder.New(w, channelTestResult{OK: false, Error: reason}, "test notification failed")
+		return
+	}
+
+	recordChannelTest(w, r, ch, true, "")
+	middleware.Annotate(w, map[string]any{"channel_test_ok": true})
+	responder.New(w, channelTestResult{OK: true}, "test notification sent")
+}
+
+// channelTestResult is the data of POST /v1/notification-channels/{id}/test.
+type channelTestResult struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+// recordChannelTest stores a test outcome on the channel. Best-effort: the test
+// already happened and its answer is in the response, so a failed write is a
+// warning rather than a failed request.
+func recordChannelTest(w http.ResponseWriter, r *http.Request, ch *structs.NotificationChannel, ok bool, reason string) {
+	if err := query.RecordNotificationChannelTest(db.SQL, ch.Project, ch.ID, ok, reason, time.Now().UTC()); err != nil {
+		telemetry.WarnErr(r.Context(), "notification_channel.test.record.failed", err, map[string]any{
+			"channel_id": ch.ID, "channel_type": ch.Type, "project": ch.Project,
+		})
+	}
 }
 
 // HandleStreamAlerts handles GET /v1/alerts/stream (SSE for alert state changes)
