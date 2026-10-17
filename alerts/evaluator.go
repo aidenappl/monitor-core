@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/aidenappl/monitor-core/db"
@@ -1052,22 +1053,38 @@ func buildFilterCondition(f structs.QueryFilter) (string, []interface{}, error) 
 		if !structs.SafeIdentifierRegex.MatchString(key) {
 			return "", nil, fmt.Errorf("invalid data field name: %s", key)
 		}
-		// Same rule as the services filters (structs.DataOperand): the extract
-		// follows the value, so a numeric rule filter compares numerically
-		// instead of hitting ClickHouse 386 against the String extract.
-		arg, numeric, raw, err := structs.DataOperand(f.Operator, f.Value)
-		if err != nil {
-			return "", nil, err
-		}
-		switch {
-		case numeric:
-			fieldExpr = guardedDataNumber(key)
-		case raw:
-			fieldExpr = guardedDataRaw(key)
-		default:
+		if f.Operator == "in" {
+			// Same rule as services/analytics.go: numeric when every value is
+			// a number, text otherwise.
+			values, err := inValues(f.Value)
+			if err != nil {
+				return "", nil, err
+			}
+			args, numeric := structs.DataInOperands(values)
 			fieldExpr = guardedDataString(key)
+			if numeric {
+				fieldExpr = guardedDataNumber(key)
+			}
+			f.Value = args
+		} else {
+			// Same rule as the services filters (structs.DataOperand): the
+			// extract follows the value, so a numeric rule filter compares
+			// numerically instead of hitting ClickHouse 386 against the
+			// String extract.
+			arg, numeric, raw, err := structs.DataOperand(f.Operator, f.Value)
+			if err != nil {
+				return "", nil, err
+			}
+			switch {
+			case numeric:
+				fieldExpr = guardedDataNumber(key)
+			case raw:
+				fieldExpr = guardedDataRaw(key)
+			default:
+				fieldExpr = guardedDataString(key)
+			}
+			f.Value = arg
 		}
-		f.Value = arg
 	} else if structs.FilterColumns[f.Field] {
 		fieldExpr = f.Field
 	} else {
@@ -1089,9 +1106,47 @@ func buildFilterCondition(f structs.QueryFilter) (string, []interface{}, error) 
 		return fmt.Sprintf("%s >= ?", fieldExpr), []interface{}{f.Value}, nil
 	case "contains":
 		return fmt.Sprintf("%s LIKE ?", fieldExpr), []interface{}{fmt.Sprintf("%%%v%%", f.Value)}, nil
+	case "startswith":
+		return fmt.Sprintf("%s LIKE ?", fieldExpr), []interface{}{fmt.Sprintf("%v%%", f.Value)}, nil
+	case "endswith":
+		return fmt.Sprintf("%s LIKE ?", fieldExpr), []interface{}{fmt.Sprintf("%%%v", f.Value)}, nil
+	case "in":
+		values, err := inValues(f.Value)
+		if err != nil {
+			return "", nil, err
+		}
+		placeholders := make([]string, len(values))
+		for i := range values {
+			placeholders[i] = "?"
+		}
+		return fmt.Sprintf("%s IN (%s)", fieldExpr, strings.Join(placeholders, ", ")), values, nil
 	default:
+		// Kept for rules saved with an operator this switch predates; `in`,
+		// `startswith` and `endswith` used to land here and compare a whole
+		// array (or pattern) with `=`.
 		return fmt.Sprintf("%s = ?", fieldExpr), []interface{}{f.Value}, nil
 	}
+}
+
+// inValues is an `in` filter's value list. Rules store query_filters as JSON,
+// so it arrives as []interface{}; []string covers callers building filters in
+// Go. An empty list is refused: `IN ()` is a ClickHouse syntax error.
+func inValues(v interface{}) ([]interface{}, error) {
+	switch vals := v.(type) {
+	case []interface{}:
+		if len(vals) > 0 {
+			return vals, nil
+		}
+	case []string:
+		if len(vals) > 0 {
+			out := make([]interface{}, len(vals))
+			for i, s := range vals {
+				out[i] = s
+			}
+			return out, nil
+		}
+	}
+	return nil, fmt.Errorf("in operator requires a non-empty array value")
 }
 
 // CheckCondition evaluates whether a value meets the alert condition against the threshold

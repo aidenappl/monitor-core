@@ -144,6 +144,64 @@ func TestBuildFilterCondition(t *testing.T) {
 	}
 }
 
+// TestBuildFilterConditionOperators covers the operators the evaluator once
+// sent to its `=` fallback: `in` compared the whole array (ClickHouse 386,
+// "no supertype for String, Array(String)") and startswith/endswith matched
+// nothing. Each must build the same SQL the services filters do.
+func TestBuildFilterConditionOperators(t *testing.T) {
+	str := guardedDataString("host")
+	num := guardedDataNumber("status")
+	tests := []struct {
+		name     string
+		field    string
+		operator string
+		value    interface{}
+		want     string
+		wantArgs []interface{}
+	}{
+		{"in on a column", "name", "in", []interface{}{"a", "b"}, "name IN (?, ?)", []interface{}{"a", "b"}},
+		{"in on a column from Go", "name", "in", []string{"a"}, "name IN (?)", []interface{}{"a"}},
+		{"in on text data", "data.host", "in", []interface{}{"x.example", "y.example"}, str + " IN (?, ?)", []interface{}{"x.example", "y.example"}},
+		{"in on numeric data", "data.status", "in", []interface{}{float64(502), float64(503)}, num + " IN (?, ?)", []interface{}{float64(502), float64(503)}},
+		{"startswith on a column", "name", "startswith", "proxy.upstream_", "name LIKE ?", []interface{}{"proxy.upstream_%"}},
+		{"endswith on data", "data.host", "endswith", ".appleby.cloud", str + " LIKE ?", []interface{}{"%.appleby.cloud"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, args, err := buildFilterCondition(structs.QueryFilter{Field: tt.field, Operator: tt.operator, Value: tt.value})
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("sql =\n\t%s\nwant\n\t%s", got, tt.want)
+			}
+			if !reflect.DeepEqual(args, tt.wantArgs) {
+				t.Errorf("args = %#v, want %#v", args, tt.wantArgs)
+			}
+		})
+	}
+}
+
+func TestBuildFilterConditionRejectsBadInValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		value interface{}
+	}{
+		{"scalar on a column", "name", "a"},
+		{"empty list on a column", "name", []interface{}{}},
+		{"scalar on data", "data.host", "a"},
+		{"empty list on data", "data.host", []string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, err := buildFilterCondition(structs.QueryFilter{Field: tt.field, Operator: "in", Value: tt.value}); err == nil {
+				t.Fatal("want an error, got none")
+			}
+		})
+	}
+}
+
 // withDefaultProject pins env.DefaultProjectSlug for the duration of a test.
 // env.Load() never runs under `go test`, so the var is empty unless a test sets
 // it, and scope.ProjectPredicate's empty-string transition arm keys off it.
