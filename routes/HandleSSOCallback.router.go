@@ -3,6 +3,7 @@ package routes
 import (
 	"net/http"
 	"net/url"
+	"time"
 
 	oidcsession "github.com/aidenappl/go-oidc-session"
 	"github.com/aidenappl/monitor-core/db"
@@ -127,7 +128,9 @@ func HandleSSOCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := issueSession(w, user.ID, user.Role); err != nil {
+	authTime := ssoAuthTime(*identity, ssoLoginWasSilent(r, state), time.Now())
+	clearSSOSilentCookie(w)
+	if err := issueSession(w, user.ID, user.Role, authTime); err != nil {
 		ssoCallbackBroken(r, slug, "sso_session_failed", err)
 		redirectLoginError(w, r, "sso_session_failed")
 		return

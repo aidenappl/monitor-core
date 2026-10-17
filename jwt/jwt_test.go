@@ -49,10 +49,10 @@ func TestRoundTrip(t *testing.T) {
 	}{
 		{
 			"access",
-			func() (string, time.Time, error) { return NewAccessToken(42, "admin", "") },
+			func() (string, time.Time, error) { return NewAccessToken(42, "admin", "", time.Time{}) },
 			func(tok string) (int64, error) { uid, _, err := ValidateAccessToken(tok); return uid, err },
 		},
-		{"refresh", func() (string, time.Time, error) { return NewRefreshToken(42) }, ValidateRefreshToken},
+		{"refresh", func() (string, time.Time, error) { return NewRefreshToken(42, time.Time{}) }, ValidateRefreshToken},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -83,7 +83,7 @@ func TestExpiredRejected(t *testing.T) {
 
 func TestWrongTypeRejected(t *testing.T) {
 	// An access token must not pass refresh validation and vice-versa.
-	access, _, err := NewAccessToken(42, "admin", "")
+	access, _, err := NewAccessToken(42, "admin", "", time.Time{})
 	if err != nil {
 		t.Fatalf("mint access: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestWrongTypeRejected(t *testing.T) {
 		t.Fatal("access token accepted as refresh token")
 	}
 
-	refresh, _, err := NewRefreshToken(42)
+	refresh, _, err := NewRefreshToken(42, time.Time{})
 	if err != nil {
 		t.Fatalf("mint refresh: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestAlgConfusionRejected(t *testing.T) {
 }
 
 func TestTamperedSignatureRejected(t *testing.T) {
-	tok, _, err := NewAccessToken(42, "admin", "")
+	tok, _, err := NewAccessToken(42, "admin", "", time.Time{})
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -159,11 +159,11 @@ func TestWrongIssuerRejected(t *testing.T) {
 // minted back to back (same second) must differ, or their SHA-256 hashes collide
 // on uq_refresh_tokens_hash and the refresh grace path's sibling insert fails.
 func TestRefreshTokensUnique(t *testing.T) {
-	a, _, err := NewRefreshToken(1)
+	a, _, err := NewRefreshToken(1, time.Time{})
 	if err != nil {
 		t.Fatalf("NewRefreshToken: %v", err)
 	}
-	b, _, err := NewRefreshToken(1)
+	b, _, err := NewRefreshToken(1, time.Time{})
 	if err != nil {
 		t.Fatalf("NewRefreshToken: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestAccessTokenFamilyID(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tok, _, err := NewAccessToken(42, "admin", tt.fid)
+			tok, _, err := NewAccessToken(42, "admin", tt.fid, time.Time{})
 			if err != nil {
 				t.Fatalf("NewAccessToken: %v", err)
 			}
@@ -210,5 +210,36 @@ func TestAccessTokenFamilyID(t *testing.T) {
 	}
 	if claims.FamilyID != "" {
 		t.Errorf("legacy FamilyID = %q, want empty", claims.FamilyID)
+	}
+}
+
+// TestAuthTimeRoundTrips: the authentication time rides on both token types,
+// and a zero one is omitted and reads back as zero (never "recent").
+func TestAuthTimeRoundTrips(t *testing.T) {
+	at := time.Now().Add(-5 * time.Minute).Truncate(time.Second)
+	access, _, err := NewAccessToken(42, "admin", "", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refresh, _, err := NewRefreshToken(42, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ac, err := ValidateAccessTokenClaims(access)
+	if err != nil || !ac.AuthenticatedAt().Equal(at) {
+		t.Errorf("access auth_time = %v, %v; want %v", ac, err, at)
+	}
+	rc, err := ValidateRefreshTokenClaims(refresh)
+	if err != nil || !rc.AuthenticatedAt().Equal(at) {
+		t.Errorf("refresh auth_time = %v, %v; want %v", rc, err, at)
+	}
+
+	none, _, _ := NewAccessToken(42, "admin", "", time.Time{})
+	nc, err := ValidateAccessTokenClaims(none)
+	if err != nil || nc.AuthTime != 0 || !nc.AuthenticatedAt().IsZero() {
+		t.Errorf("zero auth_time: claims %+v, err %v", nc, err)
+	}
+	if _, err := ValidateRefreshTokenClaims(access); err == nil {
+		t.Error("an access token was accepted as a refresh token")
 	}
 }

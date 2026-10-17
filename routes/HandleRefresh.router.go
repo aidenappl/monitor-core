@@ -66,7 +66,11 @@ func HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	raw := cookie.Value
 
-	userID, err := jwt.ValidateRefreshToken(raw)
+	presented, err := jwt.ValidateRefreshTokenClaims(raw)
+	var userID int64
+	if presented != nil {
+		userID = presented.UserID
+	}
 	if err != nil {
 		if errors.Is(err, gojwt.ErrTokenExpired) {
 			middleware.ExpectedClientError(w)
@@ -132,7 +136,9 @@ func HandleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	minted, err := mintSessionTokens(user, row.FamilyID)
+	// The authentication time is carried forward from the presented token:
+	// refreshing is not re-authenticating (ACCOUNT-01).
+	minted, err := mintSessionTokens(user, row.FamilyID, presented.AuthenticatedAt())
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to mint tokens", err)
 		return
@@ -212,13 +218,13 @@ type sessionTokens struct {
 	refreshHash [sha256.Size]byte
 }
 
-func mintSessionTokens(user *structs.User, familyID []byte) (sessionTokens, error) {
+func mintSessionTokens(user *structs.User, familyID []byte, authTime time.Time) (sessionTokens, error) {
 	var t sessionTokens
 	var err error
-	if t.access, t.accessExp, err = jwt.NewAccessToken(user.ID, user.Role, hex.EncodeToString(familyID)); err != nil {
+	if t.access, t.accessExp, err = jwt.NewAccessToken(user.ID, user.Role, hex.EncodeToString(familyID), authTime); err != nil {
 		return t, err
 	}
-	if t.refresh, t.refreshExp, err = jwt.NewRefreshToken(user.ID); err != nil {
+	if t.refresh, t.refreshExp, err = jwt.NewRefreshToken(user.ID, authTime); err != nil {
 		return t, err
 	}
 	t.refreshHash = sha256.Sum256([]byte(t.refresh))

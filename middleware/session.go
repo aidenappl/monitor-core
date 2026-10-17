@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
@@ -272,6 +273,30 @@ func SessionFamilyID(r *http.Request, userID int64) ([]byte, bool) {
 		return decodeFamilyID(claims.FamilyID)
 	}
 	return nil, false
+}
+
+// SessionAuthTime returns when the request's session last AUTHENTICATED
+// (jwt.Claims.AuthTime), read from the same token SessionMiddleware accepted
+// — the first valid access token for userID, Bearer before cookie. ok is false
+// when no such token is present; a zero time means the token carries none
+// (minted before the claim, or not backed by a sign-in), which step-up checks
+// treat as not recent.
+func SessionAuthTime(r *http.Request, userID int64) (time.Time, bool) {
+	candidates := []string{extractBearerToken(r)}
+	if cookie, err := r.Cookie("mon-access-token"); err == nil {
+		candidates = append(candidates, cookie.Value)
+	}
+	for _, tok := range candidates {
+		if tok == "" {
+			continue
+		}
+		claims, err := jwt.ValidateAccessTokenClaims(tok)
+		if err != nil || claims.UserID != userID {
+			continue
+		}
+		return claims.AuthenticatedAt(), true
+	}
+	return time.Time{}, false
 }
 
 // decodeFamilyID turns a fid claim back into the 16-byte family_id column value.

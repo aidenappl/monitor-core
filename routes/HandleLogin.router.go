@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/middleware"
@@ -74,7 +75,7 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := issueSession(w, user.ID, user.Role); err != nil {
+	if err := issueSession(w, user.ID, user.Role, time.Now()); err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to start session", err)
 		return
 	}
