@@ -74,7 +74,7 @@ func TestJSONValidationAppliesOnlyToServerParsedColumns(t *testing.T) {
 		defer mockDB.Close()
 
 		mock.ExpectExec("INSERT INTO monitor.dashboards").
-			WithArgs(sqlmock.AnyArg(), "default", "Overview", "", "", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WithArgs(sqlmock.AnyArg(), "default", "Overview", "", "", 1, sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		d, err := CreateDashboard(mockDB, "default", CreateDashboardRequest{Name: "Overview"})
