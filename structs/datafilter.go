@@ -54,6 +54,35 @@ func DataOperand(op string, value any) (arg any, numeric bool, raw bool, err err
 	}
 }
 
+// InValues is an `in` filter's value list, shared by every filter site
+// (services event search, services analytics, alerts) so `in` means the same
+// thing to all three. JSON bodies and stored rules decode to []any; []string
+// covers callers building filters in Go (query-string parsing). A lone scalar
+// is a one-element list — the MCP and hand-written requests send
+// `"value": "x"` — rather than an error. An empty list is refused because
+// `IN ()` is a ClickHouse syntax error; the error wraps ErrInvalidFilterValue
+// so routes answer 400.
+func InValues(v any) ([]any, error) {
+	switch vals := v.(type) {
+	case []any:
+		if len(vals) > 0 {
+			return vals, nil
+		}
+	case []string:
+		if len(vals) > 0 {
+			out := make([]any, len(vals))
+			for i, s := range vals {
+				out[i] = s
+			}
+			return out, nil
+		}
+	case nil:
+	default:
+		return []any{vals}, nil
+	}
+	return nil, fmt.Errorf("%w: in operator requires a non-empty value", ErrInvalidFilterValue)
+}
+
 // DataInOperands is DataOperand for the `in` operator: numeric when every
 // value is a number, text otherwise (numbers rendered as their JSON text).
 func DataInOperands(values []any) (args []any, numeric bool) {

@@ -163,6 +163,9 @@ func TestBuildFilterConditionOperators(t *testing.T) {
 		{"in on a column from Go", "name", "in", []string{"a"}, "name IN (?)", []interface{}{"a"}},
 		{"in on text data", "data.host", "in", []interface{}{"x.example", "y.example"}, str + " IN (?, ?)", []interface{}{"x.example", "y.example"}},
 		{"in on numeric data", "data.status", "in", []interface{}{float64(502), float64(503)}, num + " IN (?, ?)", []interface{}{float64(502), float64(503)}},
+		// A lone scalar is a one-element list (structs.InValues), as in services.
+		{"in with a scalar on a column", "name", "in", "a", "name IN (?)", []interface{}{"a"}},
+		{"in with a scalar on data", "data.host", "in", "a", str + " IN (?)", []interface{}{"a"}},
 		{"startswith on a column", "name", "startswith", "proxy.upstream_", "name LIKE ?", []interface{}{"proxy.upstream_%"}},
 		{"endswith on data", "data.host", "endswith", ".appleby.cloud", str + " LIKE ?", []interface{}{"%.appleby.cloud"}},
 	}
@@ -188,9 +191,7 @@ func TestBuildFilterConditionRejectsBadInValues(t *testing.T) {
 		field string
 		value interface{}
 	}{
-		{"scalar on a column", "name", "a"},
 		{"empty list on a column", "name", []interface{}{}},
-		{"scalar on data", "data.host", "a"},
 		{"empty list on data", "data.host", []string{}},
 	}
 	for _, tt := range tests {

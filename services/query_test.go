@@ -9,6 +9,7 @@ import (
 	"time"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/aidenappl/monitor-core/structs"
 )
 
 func TestApplyDataFilterRejectsInjection(t *testing.T) {
@@ -126,6 +127,10 @@ func TestApplyDataFilterSQL(t *testing.T) {
 		{"eq with a bool compares the raw JSON", OpEq, true, wantGuardedRaw + " = ?", []any{"true"}},
 		{"gte with a number", OpGte, float64(400), wantGuardedNumber + " >= ?", []any{float64(400)}},
 		{"contains with a number is text", OpContains, float64(50), wantGuardedString + " LIKE ?", []any{"%50%"}},
+		// `in` had no case here and was silently dropped.
+		{"in strings", OpIn, []any{"a", "b"}, wantGuardedString + " IN (?, ?)", []any{"a", "b"}},
+		{"in numbers compares numerically", OpIn, []any{float64(500), float64(502)}, wantGuardedNumber + " IN (?, ?)", []any{float64(500), float64(502)}},
+		{"in a lone scalar", OpIn, "a", wantGuardedString + " IN (?)", []any{"a"}},
 	}
 
 	for _, tt := range tests {
@@ -244,5 +249,47 @@ func TestRunConcurrentlyRunsInParallelAndReturnsTheFirstError(t *testing.T) {
 		func(context.Context) error { return nil },
 	); err != nil {
 		t.Errorf("all succeeded, err = %v", err)
+	}
+}
+
+func TestApplyColumnFilterIn(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    any
+		wantSQL  string
+		wantArgs []any
+		wantErr  bool
+	}{
+		// A JSON []any used to be silently dropped, widening the result.
+		{"json array", []any{"api", "web"}, "service IN (?,?)", []any{"api", "web"}, false},
+		{"string slice", []string{"api"}, "service IN (?)", []any{"api"}, false},
+		{"lone scalar", "api", "service IN (?)", []any{"api"}, false},
+		{"empty list", []any{}, "", nil, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := sq.Select("count()").From("monitor.events").PlaceholderFormat(sq.Question)
+			builder, err := applyColumnFilter(builder, Filter{Field: "service", Operator: OpIn, Value: tt.value})
+			if tt.wantErr {
+				if !errors.Is(err, structs.ErrInvalidFilterValue) {
+					t.Fatalf("err = %v, want ErrInvalidFilterValue", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("applyColumnFilter: %v", err)
+			}
+			sql, args, err := builder.ToSql()
+			if err != nil {
+				t.Fatalf("ToSql: %v", err)
+			}
+			if want := "SELECT count() FROM monitor.events WHERE " + tt.wantSQL; sql != want {
+				t.Errorf("sql =\n\t%s\nwant\n\t%s", sql, want)
+			}
+			if !reflect.DeepEqual(args, tt.wantArgs) {
+				t.Errorf("args = %#v, want %#v", args, tt.wantArgs)
+			}
+		})
 	}
 }

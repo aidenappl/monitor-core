@@ -78,6 +78,13 @@ func TestBuildSingleFilterSQL(t *testing.T) {
 			wantGuardedString + " IN (?, ?)", []any{"a", "b"}},
 		{"column eq", structs.QueryFilter{Field: "service", Operator: "eq", Value: "api"},
 			"service = ?", []any{"api"}},
+		// A lone scalar was a 500 ("in operator requires array value").
+		{"column in scalar", structs.QueryFilter{Field: "service", Operator: "in", Value: "api"},
+			"service IN (?)", []any{"api"}},
+		{"column in array", structs.QueryFilter{Field: "service", Operator: "in", Value: []any{"api", "web"}},
+			"service IN (?, ?)", []any{"api", "web"}},
+		{"data in scalar", structs.QueryFilter{Field: "data.latency_ms", Operator: "in", Value: "a"},
+			wantGuardedString + " IN (?)", []any{"a"}},
 	}
 
 	for _, tt := range tests {

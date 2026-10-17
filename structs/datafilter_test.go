@@ -72,3 +72,38 @@ func TestDataInOperands(t *testing.T) {
 		})
 	}
 }
+
+func TestInValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   any
+		want    []any
+		wantErr bool
+	}{
+		{"json array", []any{"a", float64(1)}, []any{"a", float64(1)}, false},
+		{"string slice", []string{"a", "b"}, []any{"a", "b"}, false},
+		{"scalar string", "a", []any{"a"}, false},
+		{"scalar number", float64(5), []any{float64(5)}, false},
+		{"empty array", []any{}, nil, true},
+		{"empty string slice", []string{}, nil, true},
+		{"nil", nil, nil, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := InValues(tt.value)
+			if tt.wantErr {
+				if !errors.Is(err, ErrInvalidFilterValue) {
+					t.Fatalf("err = %v, want ErrInvalidFilterValue", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("InValues: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("InValues = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
