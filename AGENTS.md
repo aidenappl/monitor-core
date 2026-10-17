@@ -328,7 +328,19 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
     contain the destination, `last_test_*` written); `query/dashboards_query_test.go` +
     `routes/dashboards_conflict_test.go` (version in the WHERE, 409 with the current row);
     `routes/reauth_test.go` + `jwt/jwt_test.go` (`auth_time` survives refresh, 4011 below the
-    window, the existing-password path unchanged).
+    window, the existing-password path unchanged). The follow-up contracts:
+    `GET /v1/events?order=asc|desc` (default `desc`, anything else 400; both page phases flip
+    together); `GET /v1/issues/{id}/events?before=<RFC3339>` (strictly older than, so the issue
+    page can page past the newest 500; a bad value 400) — `routes/issue_events_before_test.go`;
+    issue comment bodies over 10,000 runes (or blank) are a 400 on create and edit —
+    `routes/comment_body_test.go`; and **`POST /v1/alert-rules/preview-routing`**, which takes
+    a CREATE body, validates it with the same `decodeAlertRuleBody` + `query.BuildAlertRule`,
+    and returns which policies match and which channels would be notified using the router's
+    own `alerts.traceRouting` — `alerts/preview_test.go`, `routes/alerts_preview_test.go`.
+    ⚠️ The preview stores and sends nothing, so it is in `middleware.readOnlyPOSTPaths` (any
+    session that can read rules may call it) and excluded from the activity sink. Change
+    routing in `traceRouting` only: `Route`, `has_destinations` and the preview all read it,
+    and monitor-web no longer keeps its own copy.
   - `query/alert_rules_query_test.go` — that `condition` is **backticked** wherever it
     appears unqualified. It is a MariaDB reserved word; the reads all keep working, so the
     first symptom of losing the quotes is a 500 the next time somebody edits a rule. Also
