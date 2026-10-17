@@ -2,9 +2,12 @@ package routes
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aidenappl/monitor-core/alerts"
@@ -68,8 +71,10 @@ func HandleCreateAlertRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req query.CreateAlertRuleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		responder.Error(w, http.StatusBadRequest, "invalid request body")
+	// A cleared threshold on create is the same as an omitted one: nil, which
+	// CreateAlertRule refuses for a rule type that needs one.
+	if _, err := decodeAlertRuleBody(r, &req); err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -125,10 +130,12 @@ func HandleUpdateAlertRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req query.UpdateAlertRuleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		responder.Error(w, http.StatusBadRequest, "invalid request body")
+	cleared, err := decodeAlertRuleBody(r, &req)
+	if err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	req.ClearThreshold = cleared
 
 	updated, err := query.UpdateAlertRule(db.SQL, project, id, req)
 	if err != nil {
@@ -693,4 +700,65 @@ func HandleReorderPolicies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	responder.New(w, nil, "policies reordered")
+}
+
+// maxAlertRuleBodySize bounds an alert-rule body; the largest real one is a
+// few kilobytes of query_filters.
+const maxAlertRuleBodySize = 1 << 20
+
+// decodeAlertRuleBody decodes a create or update body into dst and turns a
+// decode failure into a message that names the field (ALERTS-08). Before it,
+// `cooldown_seconds: 99999999999` — a uint32 overflow — and a threshold sent as
+// text were both "invalid request body", with nothing for the form to attach
+// the error to. Field messages start with the field's JSON name.
+//
+// It also reports whether the threshold was CLEARED — sent as null or "" —
+// which a *float64 cannot distinguish from an omitted field. The key is
+// removed before decoding, so a cleared threshold reaches dst as nil.
+func decodeAlertRuleBody(r *http.Request, dst any) (thresholdCleared bool, err error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxAlertRuleBodySize+1))
+	if err != nil {
+		return false, errors.New("invalid request body")
+	}
+	if len(body) > maxAlertRuleBodySize {
+		return false, errors.New("request body is too large")
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return false, errors.New("invalid request body")
+	}
+	if raw, ok := fields["threshold"]; ok {
+		switch strings.TrimSpace(string(raw)) {
+		case "null", `""`:
+			thresholdCleared = true
+			delete(fields, "threshold")
+			if body, err = json.Marshal(fields); err != nil {
+				return false, errors.New("invalid request body")
+			}
+		}
+	}
+
+	if err := json.Unmarshal(body, dst); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) && typeErr.Field != "" {
+			return false, errors.New(alertRuleFieldTypeMessage(typeErr.Field))
+		}
+		return false, errors.New("invalid request body")
+	}
+	return thresholdCleared, nil
+}
+
+// alertRuleFieldTypeMessage words a wrong-typed field.
+func alertRuleFieldTypeMessage(field string) string {
+	if _, ok := query.AlertRuleSecondsLimits[field]; ok {
+		return query.AlertRuleSecondsMessage(field)
+	}
+	switch field {
+	case "threshold":
+		return "threshold must be a number"
+	case "enabled":
+		return "enabled must be true or false"
+	}
+	return field + " has the wrong type"
 }

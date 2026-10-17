@@ -160,6 +160,54 @@ func requireJSONText(field, value string) error {
 	return nil
 }
 
+// The ranges the three second-valued fields accept. Before they existed an
+// out-of-range value reached the handler as a uint32 decode error and was
+// answered "invalid request body", naming nothing (ALERTS-08). The ceilings sit
+// well above every rule on the live zones (interval ≤ 3600, for ≤ 900,
+// cooldown ≤ 43200 on 2026-10-16) and 0 stays legal on all three: it is the
+// "use the default" value for the interval and cooldown on create, and the
+// evaluator already reads a 0 interval as 60 s.
+const (
+	MAX_EVALUATION_INTERVAL_SECONDS = 86400  // 1 day
+	MAX_FOR_SECONDS                 = 86400  // 1 day
+	MAX_COOLDOWN_SECONDS            = 604800 // 7 days
+)
+
+// AlertRuleSecondsLimits maps each second-valued field to its ceiling. The
+// handler uses it to word a decode error for the same field identically.
+var AlertRuleSecondsLimits = map[string]uint32{
+	"evaluation_interval_seconds": MAX_EVALUATION_INTERVAL_SECONDS,
+	"for_seconds":                 MAX_FOR_SECONDS,
+	"cooldown_seconds":            MAX_COOLDOWN_SECONDS,
+}
+
+// AlertRuleSecondsMessage is the one wording of a second-valued field's range,
+// shared by the range check below and the handler's decode-error mapping.
+// Messages for a field always START with the field's JSON name, so a client can
+// attach the error to its input.
+func AlertRuleSecondsMessage(field string) string {
+	return fmt.Sprintf("%s must be a whole number of seconds between 0 and %d", field, AlertRuleSecondsLimits[field])
+}
+
+func checkAlertRuleSeconds(field string, v uint32) error {
+	if v > AlertRuleSecondsLimits[field] {
+		return errors.New(AlertRuleSecondsMessage(field))
+	}
+	return nil
+}
+
+// alertTypeNeedsThreshold reports whether a rule of type t compares against its
+// threshold. An absence rule fires on "nothing arrived" and ignores it.
+func alertTypeNeedsThreshold(t string) bool {
+	return t == "threshold" || t == "rate_change"
+}
+
+// ErrThresholdRequired is the refusal for a threshold or rate_change rule with
+// no threshold. It used to be impossible to send one: a missing or cleared
+// threshold decoded as 0, so `count > (blank)` saved as `count > 0` and fired on
+// a single event.
+var ErrThresholdRequired = errors.New("threshold is required for threshold and rate_change rules")
+
 // CreateAlertRuleRequest is the POST /v1/alert-rules body.
 //
 // It is a request type rather than a bare structs.AlertRule so that id,
@@ -167,20 +215,23 @@ func requireJSONText(field, value string) error {
 // accepted and then silently overwritten before, which is the kind of thing
 // somebody eventually depends on by accident.
 type CreateAlertRuleRequest struct {
-	Name                   string  `json:"name"`
-	Description            string  `json:"description"`
-	Type                   string  `json:"type"`
-	Priority               string  `json:"priority"`
-	QueryFilters           string  `json:"query_filters"`
-	Metric                 string  `json:"metric"`
-	Field                  string  `json:"field"`
-	Condition              string  `json:"condition"`
-	Threshold              float64 `json:"threshold"`
-	EvaluationIntervalSecs uint32  `json:"evaluation_interval_seconds"`
-	ForSeconds             uint32  `json:"for_seconds"`
-	CooldownSeconds        uint32  `json:"cooldown_seconds"`
-	NotificationChannelIDs string  `json:"notification_channel_ids"`
-	Enabled                bool    `json:"enabled"`
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	Type         string `json:"type"`
+	Priority     string `json:"priority"`
+	QueryFilters string `json:"query_filters"`
+	Metric       string `json:"metric"`
+	Field        string `json:"field"`
+	Condition    string `json:"condition"`
+	// Threshold is a pointer so a missing one is distinguishable from 0: it is
+	// required for threshold and rate_change rules (ErrThresholdRequired) and
+	// defaults to 0 for absence rules, which ignore it.
+	Threshold              *float64 `json:"threshold"`
+	EvaluationIntervalSecs uint32   `json:"evaluation_interval_seconds"`
+	ForSeconds             uint32   `json:"for_seconds"`
+	CooldownSeconds        uint32   `json:"cooldown_seconds"`
+	NotificationChannelIDs string   `json:"notification_channel_ids"`
+	Enabled                bool     `json:"enabled"`
 }
 
 // CreateAlertRule validates, applies defaults and inserts one rule.
@@ -218,6 +269,21 @@ func CreateAlertRule(engine db.Queryable, project string, req CreateAlertRuleReq
 	if !validAlertConditions[req.Condition] {
 		return nil, fmt.Errorf("invalid condition: %s", req.Condition)
 	}
+	var threshold float64
+	if req.Threshold != nil {
+		threshold = *req.Threshold
+	} else if alertTypeNeedsThreshold(req.Type) {
+		return nil, ErrThresholdRequired
+	}
+	if err := checkAlertRuleSeconds("evaluation_interval_seconds", req.EvaluationIntervalSecs); err != nil {
+		return nil, err
+	}
+	if err := checkAlertRuleSeconds("for_seconds", req.ForSeconds); err != nil {
+		return nil, err
+	}
+	if err := checkAlertRuleSeconds("cooldown_seconds", req.CooldownSeconds); err != nil {
+		return nil, err
+	}
 
 	now := time.Now().UTC()
 	rule := structs.AlertRule{
@@ -231,7 +297,7 @@ func CreateAlertRule(engine db.Queryable, project string, req CreateAlertRuleReq
 		Metric:                 req.Metric,
 		Field:                  req.Field,
 		Condition:              req.Condition,
-		Threshold:              req.Threshold,
+		Threshold:              threshold,
 		EvaluationIntervalSecs: req.EvaluationIntervalSecs,
 		ForSeconds:             req.ForSeconds,
 		CooldownSeconds:        req.CooldownSeconds,
@@ -408,6 +474,12 @@ type UpdateAlertRuleRequest struct {
 	CooldownSeconds        *uint32  `json:"cooldown_seconds"`
 	NotificationChannelIDs *string  `json:"notification_channel_ids"`
 	Enabled                *bool    `json:"enabled"`
+
+	// ClearThreshold is set by the handler when the body sent `"threshold":
+	// null` or `""` — a cleared input, which a *float64 alone cannot tell apart
+	// from an omitted field. It is refused for a rule whose (new) type compares
+	// against a threshold, and ignored for an absence rule.
+	ClearThreshold bool `json:"-"`
 }
 
 // IsEmpty reports whether the request would change nothing.
@@ -438,6 +510,15 @@ func UpdateAlertRule(engine db.Queryable, project, id string, req UpdateAlertRul
 	}
 	if existing == nil {
 		return nil, fmt.Errorf("alert rule not found")
+	}
+	// Checked before IsEmpty: a body that only cleared the threshold changes
+	// nothing, and must still be told why.
+	effectiveType := existing.Type
+	if req.Type != nil {
+		effectiveType = *req.Type
+	}
+	if req.ClearThreshold && req.Threshold == nil && alertTypeNeedsThreshold(effectiveType) {
+		return nil, ErrThresholdRequired
 	}
 	if req.IsEmpty() {
 		return existing, nil
@@ -494,12 +575,21 @@ func UpdateAlertRule(engine db.Queryable, project, id string, req UpdateAlertRul
 		u = u.Set("threshold", *req.Threshold)
 	}
 	if req.EvaluationIntervalSecs != nil {
+		if err := checkAlertRuleSeconds("evaluation_interval_seconds", *req.EvaluationIntervalSecs); err != nil {
+			return nil, err
+		}
 		u = u.Set("evaluation_interval_seconds", *req.EvaluationIntervalSecs)
 	}
 	if req.ForSeconds != nil {
+		if err := checkAlertRuleSeconds("for_seconds", *req.ForSeconds); err != nil {
+			return nil, err
+		}
 		u = u.Set("for_seconds", *req.ForSeconds)
 	}
 	if req.CooldownSeconds != nil {
+		if err := checkAlertRuleSeconds("cooldown_seconds", *req.CooldownSeconds); err != nil {
+			return nil, err
+		}
 		u = u.Set("cooldown_seconds", *req.CooldownSeconds)
 	}
 	if req.NotificationChannelIDs != nil {
