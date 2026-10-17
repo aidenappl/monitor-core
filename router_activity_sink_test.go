@@ -28,6 +28,7 @@ var sinkExcluded = map[string]string{
 	"POST /v1/gauge":                           "read",
 	"POST /v1/compare":                         "read",
 	"POST /v1/alert-rules/{id}/test":           "changes nothing",
+	"POST /v1/alert-rules/preview-routing":     "read",
 	"POST /v1/notification-channels/{id}/test": "changes nothing",
 	"POST /admin/zones/{id}/probe":             "health probe",
 }

@@ -68,23 +68,49 @@ type Claims struct {
 	// no family, and logout falls back to RevokeAllForUser — the pre-fid
 	// behaviour — for at most one access lifetime.
 	FamilyID string `json:"fid,omitempty"`
+
+	// AuthTime is when the user last actually AUTHENTICATED (unix seconds, the
+	// OIDC `auth_time` name) — typed a password, or completed an IdP sign-in —
+	// as opposed to when this token was minted. It rides on BOTH token types,
+	// because a refresh mints a new access token and must carry the original
+	// moment forward rather than reset it: refreshing is not re-authenticating.
+	//
+	// It is what step-up checks read (ACCOUNT-01: adding a password to an
+	// SSO-only account requires an authentication younger than
+	// routes.REAUTH_MAX_AGE). Signed like every other claim, so a client cannot
+	// freshen it; the only way to move it is to sign in again.
+	//
+	// Zero (omitted) means "unknown" and is never recent: tokens minted before
+	// this field, and a family re-minted from a live SSO session with no
+	// sign-in behind it, both carry none.
+	AuthTime int64 `json:"auth_time,omitempty"`
+}
+
+// AuthenticatedAt returns AuthTime as a time, zero when unknown.
+func (c *Claims) AuthenticatedAt() time.Time {
+	if c.AuthTime <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(c.AuthTime, 0)
 }
 
 // NewAccessToken mints a 15-minute HS512 access token for userID, carrying the
 // role so a zone can authorise without a users table (see Claims.Role) and the
 // hex refresh-token family so logout can be scoped to this session (see
-// Claims.FamilyID). familyID may be empty.
-func NewAccessToken(userID int64, role string, familyID string) (string, time.Time, error) {
-	return newToken(userID, role, familyID, "access", accessTokenExpiry)
+// Claims.FamilyID). familyID may be empty. authTime is when the user last
+// authenticated (Claims.AuthTime); zero omits it.
+func NewAccessToken(userID int64, role string, familyID string, authTime time.Time) (string, time.Time, error) {
+	return newToken(userID, role, familyID, authTime, "access", accessTokenExpiry)
 }
 
 // NewRefreshToken mints a 7-day HS512 refresh token for userID. No role: it is
-// redeemed at the control plane, which reads the live row.
-func NewRefreshToken(userID int64) (string, time.Time, error) {
-	return newToken(userID, "", "", "refresh", refreshTokenExpiry)
+// redeemed at the control plane, which reads the live row. It carries authTime
+// so the rotation can hand it to the next access token unchanged.
+func NewRefreshToken(userID int64, authTime time.Time) (string, time.Time, error) {
+	return newToken(userID, "", "", authTime, "refresh", refreshTokenExpiry)
 }
 
-func newToken(userID int64, role string, familyID string, typ string, ttl time.Duration) (string, time.Time, error) {
+func newToken(userID int64, role string, familyID string, authTime time.Time, typ string, ttl time.Duration) (string, time.Time, error) {
 	// ⚠️ A random jti makes every minted token unique. Without it the claims are
 	// (issuer, user, type, second-granularity iat/exp), so two refresh tokens for
 	// the same user minted in the same second are BYTE-IDENTICAL — same SHA-256,
@@ -108,6 +134,9 @@ func newToken(userID int64, role string, familyID string, typ string, ttl time.D
 		Type:     typ,
 		Role:     role,
 		FamilyID: familyID,
+	}
+	if !authTime.IsZero() {
+		claims.AuthTime = authTime.Unix()
 	}
 
 	token := jwtlib.NewWithClaims(jwtlib.SigningMethodHS512, claims)
@@ -179,12 +208,22 @@ func ValidateAccessTokenClaims(tokenStr string) (*Claims, error) {
 
 // ValidateRefreshToken validates the token and requires Type == "refresh".
 func ValidateRefreshToken(tokenStr string) (int64, error) {
-	claims, err := ValidateToken(tokenStr)
+	claims, err := ValidateRefreshTokenClaims(tokenStr)
 	if err != nil {
 		return 0, err
 	}
-	if claims.Type != "refresh" {
-		return 0, fmt.Errorf("expected refresh token, got %q", claims.Type)
-	}
 	return claims.UserID, nil
+}
+
+// ValidateRefreshTokenClaims is ValidateRefreshToken returning the full claim
+// set, for the rotation that must carry AuthTime forward.
+func ValidateRefreshTokenClaims(tokenStr string) (*Claims, error) {
+	claims, err := ValidateToken(tokenStr)
+	if err != nil {
+		return nil, err
+	}
+	if claims.Type != "refresh" {
+		return nil, fmt.Errorf("expected refresh token, got %q", claims.Type)
+	}
+	return claims, nil
 }

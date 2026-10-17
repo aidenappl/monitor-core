@@ -77,14 +77,21 @@ func New(w http.ResponseWriter, data interface{}, message ...string) {
 }
 
 func Error(w http.ResponseWriter, statusCode int, message string) {
-	writeError(w, statusCode, message, statusCode, nil, nil)
+	writeError(w, statusCode, message, statusCode, nil, nil, nil)
 }
 
 // ErrorWithCode is Error with an explicit application error_code (distinct from
 // the HTTP status). Used for codes the web clients route on — e.g. 4003
 // (forbidden → /unauthorized) and 4004 (pending → /pending).
 func ErrorWithCode(w http.ResponseWriter, statusCode int, message string, errorCode int) {
-	writeError(w, statusCode, message, errorCode, nil, nil)
+	writeError(w, statusCode, message, errorCode, nil, nil, nil)
+}
+
+// ErrorWithData is Error with a payload in `data`, for refusals that carry
+// state the client needs to recover — a 409 version conflict returns the
+// current row, so the client can offer reload/overwrite without a second read.
+func ErrorWithData(w http.ResponseWriter, statusCode int, message string, data interface{}) {
+	writeError(w, statusCode, message, statusCode, nil, nil, data)
 }
 
 // ErrorWithCause is Error with the underlying error, which goes to the request's
@@ -104,7 +111,7 @@ func ErrorWithCause(w http.ResponseWriter, statusCode int, message string, err e
 			merged[k] = v
 		}
 	}
-	writeError(w, statusCode, message, statusCode, err, merged)
+	writeError(w, statusCode, message, statusCode, err, merged, nil)
 }
 
 // failureRecorder is implemented by the request middleware's response writer.
@@ -130,14 +137,14 @@ func recordFailure(w http.ResponseWriter, status int, message string, err error,
 	}
 }
 
-func writeError(w http.ResponseWriter, statusCode int, message string, errorCode int, cause error, fields map[string]any) {
+func writeError(w http.ResponseWriter, statusCode int, message string, errorCode int, cause error, fields map[string]any, data interface{}) {
 	msg := strings.ToLower(message)
 	recordFailure(w, statusCode, msg, cause, errorCode, fields)
 
 	response := Response{
 		Success:      false,
 		Message:      msg,
-		Data:         nil,
+		Data:         data,
 		Error:        http.StatusText(statusCode),
 		ErrorMessage: msg,
 		ErrorCode:    errorCode,

@@ -17,8 +17,8 @@ import (
 func dashboardRows() *sqlmock.Rows {
 	now := time.Now()
 	return sqlmock.NewRows([]string{
-		"id", "project", "name", "description", "config", "created_at", "updated_at",
-	}).AddRow("d-1", "atlas", "Overview", "", "{}", now, now)
+		"id", "project", "name", "description", "config", "version", "created_at", "updated_at",
+	}).AddRow("d-1", "atlas", "Overview", "", "{}", 3, now, now)
 }
 
 // TestDashboardReadsBindTheProject asserts the tenancy predicate is IN THE SQL
@@ -134,8 +134,8 @@ func TestCreateDashboardWritesTheProject(t *testing.T) {
 	}
 	defer mockDB.Close()
 
-	mock.ExpectExec(`INSERT INTO monitor.dashboards \(id,project,name,description,config,created_at,updated_at\)`).
-		WithArgs(sqlmock.AnyArg(), "atlas", "Overview", "", "{}", sqlmock.AnyArg(), sqlmock.AnyArg()).
+	mock.ExpectExec(`INSERT INTO monitor.dashboards \(id,project,name,description,config,version,created_at,updated_at\)`).
+		WithArgs(sqlmock.AnyArg(), "atlas", "Overview", "", "{}", 1, sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	d, err := CreateDashboard(mockDB, "atlas", CreateDashboardRequest{Name: "Overview", Config: "{}"})
@@ -168,7 +168,7 @@ func TestDashboardMutationsCarryTheProjectInTheirOwnWhere(t *testing.T) {
 		// The pre-read, the write, and the re-read the caller gets back.
 		mock.ExpectQuery(`WHERE monitor.dashboards.id = \? AND monitor.dashboards.project = \?`).
 			WithArgs("d-1", "atlas").WillReturnRows(dashboardRows())
-		mock.ExpectExec(`UPDATE monitor.dashboards SET name = \? WHERE id = \? AND project = \?`).
+		mock.ExpectExec(`UPDATE monitor.dashboards SET name = \?, version = version \+ 1, updated_at = CURRENT_TIMESTAMP\(3\) WHERE id = \? AND project = \?$`).
 			WithArgs("Renamed", "d-1", "atlas").
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectQuery(`WHERE monitor.dashboards.id = \? AND monitor.dashboards.project = \?`).
@@ -198,6 +198,80 @@ func TestDashboardMutationsCarryTheProjectInTheirOwnWhere(t *testing.T) {
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("the DELETE no longer defends itself: %v", err)
+		}
+	})
+}
+
+// TestUpdateDashboardVersion pins DASHBOARD-11's optimistic concurrency: a PUT
+// carrying the stored version is applied with the version in the UPDATE's own
+// WHERE, a stale one is refused before any write with the current row, a race
+// lost after the read (0 rows affected) is refused the same way, and a PUT
+// without a version keeps last-write-wins (asserted by the test above, whose
+// WHERE has no version).
+func TestUpdateDashboardVersion(t *testing.T) {
+	stored := 3
+
+	t.Run("matching version is applied atomically", func(t *testing.T) {
+		mockDB, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock.New: %v", err)
+		}
+		defer mockDB.Close()
+		mock.ExpectQuery(`FROM monitor.dashboards`).WillReturnRows(dashboardRows())
+		mock.ExpectExec(`^UPDATE monitor.dashboards SET config = \?, version = version \+ 1, updated_at = CURRENT_TIMESTAMP\(3\) WHERE id = \? AND project = \? AND version = \?$`).
+			WithArgs("{}", "d-1", "atlas", stored).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery(`FROM monitor.dashboards`).WillReturnRows(dashboardRows())
+		if _, err := UpdateDashboard(mockDB, "atlas", "d-1", UpdateDashboardRequest{Config: "{}", Version: &stored}); err != nil {
+			t.Fatalf("UpdateDashboard: %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	t.Run("stale version is refused before any write", func(t *testing.T) {
+		mockDB, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock.New: %v", err)
+		}
+		defer mockDB.Close()
+		mock.ExpectQuery(`FROM monitor.dashboards`).WillReturnRows(dashboardRows())
+		stale := 2
+		_, err = UpdateDashboard(mockDB, "atlas", "d-1", UpdateDashboardRequest{Config: "{}", Version: &stale})
+		var conflict *DashboardVersionConflict
+		if !errors.As(err, &conflict) || !errors.Is(err, ErrDashboardVersionConflict) || conflict.Current.Version != 3 {
+			t.Fatalf("err = %v, want a conflict carrying version 3", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	t.Run("race lost after the read is a conflict", func(t *testing.T) {
+		mockDB, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock.New: %v", err)
+		}
+		defer mockDB.Close()
+		mock.ExpectQuery(`FROM monitor.dashboards`).WillReturnRows(dashboardRows())
+		mock.ExpectExec(`UPDATE monitor.dashboards`).WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery(`FROM monitor.dashboards`).WillReturnRows(dashboardRows())
+		_, err = UpdateDashboard(mockDB, "atlas", "d-1", UpdateDashboardRequest{Config: "{}", Version: &stored})
+		if !errors.Is(err, ErrDashboardVersionConflict) {
+			t.Fatalf("err = %v, want ErrDashboardVersionConflict", err)
+		}
+	})
+
+	t.Run("missing dashboard is not found", func(t *testing.T) {
+		mockDB, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock.New: %v", err)
+		}
+		defer mockDB.Close()
+		mock.ExpectQuery(`FROM monitor.dashboards`).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+		_, err = UpdateDashboard(mockDB, "atlas", "d-1", UpdateDashboardRequest{Config: "{}", Version: &stored})
+		if !errors.Is(err, ErrDashboardNotFound) {
+			t.Fatalf("err = %v, want ErrDashboardNotFound", err)
 		}
 	})
 }

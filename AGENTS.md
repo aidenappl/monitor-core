@@ -101,7 +101,7 @@ monitor-core/
     clickhouse.go          # ClickHouse connection (db.Connect/db.Close) + batch Writer + ValidateDatabaseName + the per-query max_memory_usage ceiling
     observe.go             # The ClickHouse chokepoint: observedConn (every read/exec gets a query kind + slow-query warning) and QueryError/SQLError (quoted values elided from what reaches Monitor)
     sql.go                 # MariaDB connection (db.SQL), db.Queryable, db.RunMigrations (embeds db/migrations/*.sql)
-    migrations/            # MariaDB DDL: identity + tenancy + issues + alert/dashboard config (100_users … 137_alert_rules_percentile_metrics)
+    migrations/            # MariaDB DDL: identity + tenancy + issues + alert/dashboard config (100_users … 139_dashboards_version)
   jwt/jwt.go               # Monitor-owned HS512 access/refresh JWTs (mint + validate, alg-pinned)
   tools/                   # Password.tool.go (bcrypt 12), Crypto.go (AES-256-GCM), Validate.tool.go (SSRF guard), Slug.tool.go (zone/project slug rule + reserved names)
   bootstrap/               # First-run seeding: admin.go (first admin user), registry.go (the single zone + default project)
@@ -132,8 +132,8 @@ monitor-core/
     ingest_summary.go      # RunIngestSummary: the every-15-min ingest.summary.reported, emitted only when something moved (the loop guard for healthy ingest)
     draining.go            # StartDraining/Draining: the shutdown signal the SSE loops select on, so a stream does not hold server.Shutdown for its whole timeout
     HandleGitHubWebhook.router.go  # POST /webhooks/github — root-mounted, HMAC-authenticated
-  github/                  # GitHub link parsing, live-state client, webhook signature verification
-    parse.go client.go verify.go
+  github/                  # GitHub link parsing, live-state client, webhook signature verification, owner/repo/branch validators
+    parse.go client.go verify.go validate.go
   apikeys/                 # API-key cache (backed by MariaDB, was ClickHouse) + a 30s background refresher
   probe/zone.go            # Zone reachability probe: GET {query_url}/health + /ready, compares the zone the far end REPORTS against the slug the registry expected, returns a structs.ZoneReachability. 3s total budget (probe.ZONE_PROBE_TIMEOUT); writes nothing itself
   registry/registry.go     # Tenancy-registry cache: this install's zone + its active projects, same 30s ticker shape as apikeys — what a session's ?project selector is validated against
@@ -317,6 +317,30 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
     delivers only within a project (via `scope.Matches`, including the empty-stamp
     transition arm) and that the handler refuses a request with no project *before*
     subscribing.
+  - **The tophat-remediation contracts** (2026-10-16), each a 400/409/4011 that monitor-web
+    codes against: `services/analytics_test.go` + `structs/datafilter_test.go` (`in` takes a
+    comma string, any other non-list is the 400 sentinel naming the field);
+    `apikeys/name_test.go` (255-character name rule); `github/validate_test.go` +
+    `routes/service_repos_validate_test.go` (owner/repo/branch, refused before any write);
+    `query/alert_rules_query_test.go` + `routes/alerts_decode_test.go` (seconds ranges,
+    required threshold, field-named decode errors); `alerts/channel_check_test.go` +
+    `routes/channel_test_contract_test.go` (the three channel-test outcomes, reasons that never
+    contain the destination, `last_test_*` written); `query/dashboards_query_test.go` +
+    `routes/dashboards_conflict_test.go` (version in the WHERE, 409 with the current row);
+    `routes/reauth_test.go` + `jwt/jwt_test.go` (`auth_time` survives refresh, 4011 below the
+    window, the existing-password path unchanged). The follow-up contracts:
+    `GET /v1/events?order=asc|desc` (default `desc`, anything else 400; both page phases flip
+    together); `GET /v1/issues/{id}/events?before=<RFC3339>` (strictly older than, so the issue
+    page can page past the newest 500; a bad value 400) — `routes/issue_events_before_test.go`;
+    issue comment bodies over 10,000 runes (or blank) are a 400 on create and edit —
+    `routes/comment_body_test.go`; and **`POST /v1/alert-rules/preview-routing`**, which takes
+    a CREATE body, validates it with the same `decodeAlertRuleBody` + `query.BuildAlertRule`,
+    and returns which policies match and which channels would be notified using the router's
+    own `alerts.traceRouting` — `alerts/preview_test.go`, `routes/alerts_preview_test.go`.
+    ⚠️ The preview stores and sends nothing, so it is in `middleware.readOnlyPOSTPaths` (any
+    session that can read rules may call it) and excluded from the activity sink. Change
+    routing in `traceRouting` only: `Route`, `has_destinations` and the preview all read it,
+    and monitor-web no longer keeps its own copy.
   - `query/alert_rules_query_test.go` — that `condition` is **backticked** wherever it
     appears unqualified. It is a MariaDB reserved word; the reads all keep working, so the
     first symptom of losing the quotes is a 500 the next time somebody edits a rule. Also
@@ -371,7 +395,11 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
   against the numeric extract, text against the String extract, a bool against the raw
   extract (`dataRawExpr` / `guardedDataRaw`); `lt/gt/lte/gte` are always numeric and parse a
   numeric string, and reject anything else with `structs.ErrInvalidFilterValue` — a **400**, never a 500 (analytics routes match its "invalid" text, event search checks `errors.Is` in `isFilterValidationError`). `in` is numeric only when every
-  value is a number. Before this, every filter compared its value against the String
+  value is a number. An `in` value may be an array **or a comma-separated string** (split,
+  trimmed, empties dropped — `structs.InValues`, applied once in analytics' `buildSingleFilter`
+  for column and `data.*` filters alike); anything else, or a list that ends up empty, is
+  `ErrInvalidFilterValue` naming the field → **400**. Before this, monitor-web's `name in a,b`
+  500'd every analytics panel on the page. Before this, every filter compared its value against the String
   extract, so a numeric value was ClickHouse error 386 ("no supertype for String,
   UInt16") — and `JSONExtractString` returns `''` for a JSON number, so even the text
   `"500"` never matched a numeric field.
@@ -400,14 +428,22 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
   - Success: `{ "success": true, "message": <lowercased>, "data": <payload>, "pagination"?: {count,next,previous} }`
   - Error: `{ "success": false, "message": <lowercased>, "data": null, "error": <StatusText>, "error_message": <lowercased msg>, "error_code": <int> }` — via
     `responder.Error(w, status, msg)`, `responder.ErrorWithCause(w, status, msg, err)`, or
-    `responder.ErrorWithCode(w, status, msg, code)` for an explicit application code.
+    `responder.ErrorWithCode(w, status, msg, code)` for an explicit application code, or
+    `responder.ErrorWithData(w, status, msg, data)` for a refusal that carries recovery state
+    (the dashboard 409 returns the current dashboard in `data`).
   - Errors carry BOTH `message` (back-compat for the dashboard's fetch layer) and the
     standard `error`/`error_message`/`error_code` fields (added additively). `error_code`
     defaults to the HTTP status unless set explicitly.
   - Application `error_code`s the web clients route on: **`4003`** (forbidden — `RequireAdmin`/
     `RequireEditor` role denial → web redirects to `/unauthorized`), **`4004`** (`RejectPending`
     — pending account → web redirects to `/pending`), and CSRF **`4030`** (missing cookie) /
-    **`4031`** (token mismatch).
+    **`4031`** (token mismatch), and **`4011`** (`reauth_required` — adding a first password
+    to an SSO-only account needs a sign-in within 10 minutes; web starts an SSO sign-in with
+    `prompt=login` and `return_url=/settings/security`, see §6 *Step-up authentication*).
+  - **Field-level 400s start with the field's JSON name** where a body has fields a form can
+    highlight: alert rules (`cooldown_seconds must be …`, `threshold is required for …`),
+    service repos (`owner "…" must be …`, `default_branch must not contain spaces`), API keys
+    (`name must be at most 255 characters`), channel tests (`url is required`).
   - Three endpoints bypass `responder`: `GET /health`
     (`{status,enqueued,dropped,pending,clickhouse_ok,mariadb_ok,last_flush_at,role,zone,alerting_ok,telemetry}`
     — `telemetry` is the self-telemetry shipper's own counters, §6),
@@ -574,7 +610,28 @@ into `access_logs` was RESTRICT and a secret that had ever been read could never
 7d. `Claims` carries `user_id` + `type` (`access`\|`refresh`); the parser is **pinned to
 HS512** via `WithValidMethods` and the keyfunc re-checks the method (defeats
 `alg:none`/confusion), and the issuer (`monitor`) is verified. Signed with
-`MON_JWT_SIGNING_KEY`.
+`MON_JWT_SIGNING_KEY`. Both token types also carry **`auth_time`** (unix seconds) — when the
+user last actually *authenticated*, not when the token was minted; see *Step-up
+authentication* below.
+
+**Step-up authentication (ACCOUNT-01, `routes/reauth.go`).** Adding a password to an SSO-only
+account creates a sign-in method that outlives the SSO grant, so `PUT /auth/self` refuses it
+unless the session authenticated within **`REAUTH_MAX_AGE` (10 min)**: **403, `error_code`
+4011, message `reauth_required`**. Accounts that already have a password keep the
+current-password check instead (and the check now runs *before* the bcrypt hash).
+
+| Session issued by | `auth_time` |
+|---|---|
+| `POST /auth/login` | now |
+| SSO callback | the IdP's `auth_time` claim when it sends one (Forta does — so a `prompt=none` bounce reports the ORIGINAL login), clamped to now; else the callback time; else, for a `prompt=none` login (marked by the `mon_sso_silent` cookie, bound to that login's state), **unknown** |
+| `/auth/refresh` rotation / grace sibling | carried forward from the presented refresh token — refreshing is not re-authenticating |
+| a family re-minted from a live SSO session (`issueFromSSOSession`) | **unknown** — no sign-in happened |
+
+Unknown (zero, omitted) is never recent; tokens minted before the claim carry none, so the first
+step-up after deploy always asks. The web's re-auth path is `GET
+/auth/sso/{slug}/login?prompt=login&return_url=/settings/security`. **Known limits:** a provider
+with no `auth_time` claim is trusted to have honoured `prompt=login`; linking an SSO identity
+(`POST /auth/self/identities/{slug}`) is not step-up-gated; no email notice is sent.
 
 **Cookies (`routes/cookies.go`), `SameSite=Lax`, `Secure` unless `MON_COOKIE_INSECURE`:**
 
@@ -648,7 +705,7 @@ POST   /auth/register                       self-provision (role=pending)       
 POST   /auth/refresh                        rotating refresh + reuse detection    [public, CSRF-exempt, reads mon-refresh-token]
 POST   /auth/logout                         revoke refresh family + clear cookies [Protected]
 GET    /auth/self                           current user + its identities         [Protected]
-PUT    /auth/self                           update name / set-or-change password  [Protected]
+PUT    /auth/self                           update name / set-or-change password  [Protected] — a FIRST password needs a sign-in ≤10 min old, else 403 4011 reauth_required
 GET    /auth/self/identities                list linked sign-in methods           [Protected]
 POST   /auth/self/identities/{slug}         begin an authenticated LINK flow      [Protected] → {authorize_url}
 DELETE /auth/self/identities/{slug}         unlink (refuses the last identity)    [Protected]
@@ -684,9 +741,11 @@ POST   /v1/issues/{id}/links                link a url, owner/repo#n, or #n     
 DELETE /v1/issues/{id}/links/{linkID}       remove a link                         [QueryAuthMiddleware]
 GET    /v1/service-repos                    this project's service → repo mappings [QueryAuthMiddleware]
 GET    /v1/service-repos/{service}          one mapping (404 when unmapped here)   [QueryAuthMiddleware]
-PUT    /v1/service-repos/{service}          create/replace this project's mapping  [QueryAuthMiddleware]
+PUT    /v1/service-repos/{service}          create/replace this project's mapping  [QueryAuthMiddleware] — owner/repo/default_branch validated (GitHub + git ref rules) → 400 naming the field
 DELETE /v1/service-repos/{service}          remove this project's mapping          [QueryAuthMiddleware]
-PUT    /v1/api-keys/{id}                    rename ({name}) — scope & project are immutable; 409 on a duplicate name  [QueryAuthMiddleware]
+PUT    /v1/api-keys/{id}                    rename ({name}) — scope & project are immutable; 409 on a duplicate name; 400 over 255 characters (create too)  [QueryAuthMiddleware]
+PUT    /v1/dashboards/{id}                  {name?, description?, config?, version?} — with version: 409 + the CURRENT dashboard in data when stale; without: last-write-wins  [QueryAuthMiddleware]
+POST   /v1/notification-channels/{id}/test  invalid config → 400 naming the key; delivery failed → 200 {ok:false,error}; delivered → 200 {ok:true}; outcome stored in last_test_*  [QueryAuthMiddleware]
 PUT    /v1/views/{id}                       {name?, query_params?} — omitted fields are left alone  [QueryAuthMiddleware]
 PUT    /v1/notification-channels/{id}       {name?, type?, config?} — OMITTED config KEEPS the stored credential; a type change requires a config  [QueryAuthMiddleware]
 ```
@@ -1549,7 +1608,7 @@ migrations 119-124 — every alerting and dashboard setting.
 | `monitor.issues`, `issue_timeline`, `issue_links` | MariaDB | triage state, uniqueness, FKs (111-114) |
 | `monitor.service_repos` | MariaDB | explicit mapping (115), keyed `(project, service)` since 133 |
 | `monitor.alert_rules`, `notification_channels`, `notification_policies`, `service_groups` | MariaDB | alerting configuration (119-122), project-scoped (127-130); channel config is **encrypted at rest and never served** (126) |
-| `monitor.dashboards`, `monitor.saved_views` | MariaDB | saved UI state (123-124), project-scoped (131-132); `saved_views`' page index became `(project, page)` |
+| `monitor.dashboards`, `monitor.saved_views` | MariaDB | saved UI state (123-124), project-scoped (131-132); `saved_views`' page index became `(project, page)`; dashboards carry an optimistic-concurrency `version` (139) |
 | `monitor_auth.*` | MariaDB | identity + tenancy (100-109, 116-117) |
 
 **CI redeploys every zone by firing one Lattice automation.** It began as a single curl with
@@ -1600,6 +1659,21 @@ migration moved zero rows.
 - ⚠️ **This makes `MON_CRYPTO_KEY` genuinely required on a zone.** It was already demanded by
   `env.RequireProductionSecrets` in every role while being consumed only by control-plane SSO
   code; a zone now actually uses it. The requirement stopped being a wart by becoming true.
+- **The last test result is stored on the row** (migration 138: `last_test_at`,
+  `last_test_ok`, `last_test_error`, all NULL until first tested) and served beside
+  `config_summary`. `last_test_error` is `alerts.DeliveryReason` — built from the failure's
+  CLASS ("DNS lookup failed for example.invalid", "the webhook destination answered HTTP 404",
+  "the destination did not answer within 10 seconds"), with any URL or address stripped from
+  a fallback — because this column is served to every reader of the project and the config is
+  the credential. `alerts.ValidateChannelConfig` is the pre-send check that turns a config
+  which can never deliver into a 400 naming the key, never echoing the value.
+
+**Dashboards carry an optimistic-concurrency `version`** (migration 139, `INT UNSIGNED NOT NULL
+DEFAULT 1`). Every update sets `version = version + 1` and `updated_at = CURRENT_TIMESTAMP(3)`
+in the same statement. A `PUT` that sends `version` puts it in the UPDATE's own `WHERE`: a
+mismatch seen on the pre-read, or 0 rows affected (lost the race after it), answers **409**
+with the current dashboard in `data` via `responder.ErrorWithData`. A `PUT` without `version`
+is last-write-wins, exactly as before, so older clients keep working.
 
 **What getting it wrong cost, both times.** Eight tables were originally created by ad-hoc
 `CREATE TABLE IF NOT EXISTS` inside package `Init()` functions at boot, with no migration
@@ -2034,6 +2108,7 @@ past-tense verb (`issue.created`, `alert.fired`).
 | `alert.notify.sent` | debug | delivery succeeded | channel_id, channel_type, rule_id |
 | `alert_rule.created`/`.updated`/`.deleted`, `alert_rule.state.cleanup.failed` | info / warn | a rule changed | rule_id, project, rule_type |
 | `notification_channel.created`/`.deleted` | info | a channel changed (id and type only) | channel_id, channel_type, project |
+| `notification_channel.test.record.failed` | warn | a channel test ran but its outcome could not be stored in `last_test_*` | channel_id, channel_type, project |
 | `api_key.created`/`.deleted` | info | a key minted / revoked | key_id, scope, project |
 | `auth.login.succeeded` | info | a session was issued | user_id, method, provider |
 | `auth.login.failed` | warn, coalesced per client IP | a login refused (neutral 401) | reason, method, user_id, client_ip |
@@ -2457,6 +2532,14 @@ are listed in §4.
 ## 9. Rules & guardrails
 
 - Never add an ORM; keep squirrel + native ClickHouse driver + `db.Queryable` for MariaDB.
+- **Wrap every time bound compared against `events.timestamp` in `db.Millis(t)`.**
+  clickhouse-go formats a positional `time.Time` at SECOND precision (`bindPositional`
+  → `format(tz, Seconds, v)`) regardless of the column, while `timestamp` is
+  `DateTime64(3, 'UTC')`. A raw `time.Time` silently drops the milliseconds: a ±1 ms
+  window (event deep links) matches nothing, the issue-events `before` cursor skips the
+  rest of its second, and every range edge is cut to the second. `db.Millis` is a
+  `driver.Valuer` that renders a UTC millisecond literal (squirrel and the driver both
+  unwrap it). Found by the 2026-10-16 tophat re-verification.
 - **Always validate `data.*` field names** with `structs.SafeIdentifierRegex` before
   putting them into ClickHouse SQL. That is the injection boundary.
 - **Never re-declare the identifier regex or a column allowlist outside

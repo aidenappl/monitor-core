@@ -65,6 +65,13 @@ func HandleSSOLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setSSOStateCookie(w, state)
+	// A silent sign-in proves no fresh authentication; the callback must know
+	// so it does not stamp one (ACCOUNT-01, routes/reauth.go).
+	if prompt == "none" {
+		setSSOSilentCookie(w, state)
+	} else {
+		clearSSOSilentCookie(w)
+	}
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 

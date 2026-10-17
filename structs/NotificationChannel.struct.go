@@ -50,6 +50,13 @@ type NotificationChannel struct {
 	// SummariseChannelConfig, never stored.
 	ConfigSummary string `json:"config_summary"`
 
+	// The last POST /v1/notification-channels/{id}/test outcome (migration
+	// 138); all three are null until the channel is first tested.
+	// LastTestError is alerts.DeliveryReason's text — never the destination.
+	LastTestAt    *time.Time `json:"last_test_at"`
+	LastTestOK    *bool      `json:"last_test_ok"`
+	LastTestError *string    `json:"last_test_error"`
+
 	CreatedAt time.Time `json:"created_at"`
 }
 

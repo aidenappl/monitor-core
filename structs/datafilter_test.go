@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -70,5 +71,34 @@ func TestDataInOperands(t *testing.T) {
 				t.Fatalf("DataInOperands = (%#v, %v), want (%#v, %v)", args, numeric, tt.wantArgs, tt.wantNumeric)
 			}
 		})
+	}
+}
+
+func TestInValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		value any
+		want  []any
+	}{
+		{"array", []any{"a", float64(5)}, []any{"a", float64(5)}},
+		{"string slice", []string{"a", "b"}, []any{"a", "b"}},
+		{"comma string trimmed", " a , b ,, c ", []any{"a", "b", "c"}},
+		{"single value", "a", []any{"a"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := InValues("name", tt.value)
+			if err != nil || !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("InValues = (%#v, %v), want %#v", got, err, tt.want)
+			}
+		})
+	}
+
+	for _, bad := range []any{nil, float64(5), true, "", " , ", []any{}, []string{}, map[string]any{}} {
+		if _, err := InValues("data.code", bad); !errors.Is(err, ErrInvalidFilterValue) {
+			t.Errorf("InValues(%#v) err = %v, want ErrInvalidFilterValue", bad, err)
+		} else if !strings.Contains(err.Error(), "data.code") {
+			t.Errorf("InValues(%#v) error %q does not name the field", bad, err)
+		}
 	}
 }

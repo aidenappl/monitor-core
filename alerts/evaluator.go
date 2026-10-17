@@ -897,7 +897,7 @@ func buildAggQuery(ctx context.Context, rule *structs.AlertRule, aggExpr string,
 	}
 
 	sql := fmt.Sprintf("SELECT %s AS value FROM %s.events WHERE timestamp >= ? AND timestamp < ?", aggExpr, db.Database)
-	args := []interface{}{from, to}
+	args := []interface{}{db.Millis(from), db.Millis(to)}
 
 	// UNCONDITIONAL. There used to be an `errors.Is(err, scope.ErrNoProject)`
 	// arm here that swallowed the error and continued zone-wide, because the

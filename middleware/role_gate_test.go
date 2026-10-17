@@ -26,6 +26,8 @@ func TestIsWriteRequest(t *testing.T) {
 		{http.MethodPost, "/v1/compare", false},
 		{http.MethodPost, "/v1/api-keys", true},
 		{http.MethodPost, "/v1/alert-rules/abc/test", false},
+		{http.MethodPost, "/v1/alert-rules/preview-routing", false},
+		{http.MethodPost, "/v1/alert-rules", true},
 		{http.MethodPost, "/v1/notification-channels/abc/test", true},
 		{http.MethodPost, "/v1/issues/bulk", true},
 		{http.MethodPut, "/v1/alert-rules/abc", true},

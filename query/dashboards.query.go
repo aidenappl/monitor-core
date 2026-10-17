@@ -20,6 +20,7 @@ var dashboardColumns = []string{
 	"monitor.dashboards.name",
 	"monitor.dashboards.description",
 	"monitor.dashboards.config",
+	"monitor.dashboards.version",
 	"monitor.dashboards.created_at",
 	"monitor.dashboards.updated_at",
 }
@@ -57,7 +58,7 @@ type dashboardScanner interface {
 
 func scanDashboard(row dashboardScanner) (*structs.Dashboard, error) {
 	var d structs.Dashboard
-	if err := row.Scan(&d.ID, &d.Project, &d.Name, &d.Description, &d.Config, &d.CreatedAt, &d.UpdatedAt); err != nil {
+	if err := row.Scan(&d.ID, &d.Project, &d.Name, &d.Description, &d.Config, &d.Version, &d.CreatedAt, &d.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &d, nil
@@ -100,13 +101,14 @@ func CreateDashboard(engine db.Queryable, project string, req CreateDashboardReq
 		Name:        req.Name,
 		Description: req.Description,
 		Config:      req.Config,
+		Version:     1,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
 
 	qStr, args, err := sq.Insert(dashboardsTable).
-		Columns("id", "project", "name", "description", "config", "created_at", "updated_at").
-		Values(d.ID, d.Project, d.Name, d.Description, d.Config, d.CreatedAt, d.UpdatedAt).
+		Columns("id", "project", "name", "description", "config", "version", "created_at", "updated_at").
+		Values(d.ID, d.Project, d.Name, d.Description, d.Config, d.Version, d.CreatedAt, d.UpdatedAt).
 		ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build sql query: %w", err)
@@ -192,7 +194,30 @@ type UpdateDashboardRequest struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Config      string `json:"config"`
+	// Version, when sent, is the version the client last read: the update
+	// applies only if it is still current, else ErrDashboardVersionConflict.
+	// Omitted keeps last-write-wins, for clients that predate migration 139.
+	Version *int `json:"version"`
 }
+
+// ErrDashboardNotFound means no dashboard with that id exists in the project.
+var ErrDashboardNotFound = errors.New("dashboard not found")
+
+// ErrDashboardVersionConflict means the PUT's version is no longer the stored
+// one — someone else saved in between. Returned wrapped in a
+// *DashboardVersionConflict carrying the current row.
+var ErrDashboardVersionConflict = errors.New("dashboard was changed by someone else")
+
+// DashboardVersionConflict is the refusal of a stale write, carrying the
+// dashboard as it is now so the caller can offer reload or overwrite.
+type DashboardVersionConflict struct {
+	Current *structs.Dashboard
+}
+
+func (e *DashboardVersionConflict) Error() string {
+	return fmt.Sprintf("%s: it is now at version %d", ErrDashboardVersionConflict, e.Current.Version)
+}
+func (e *DashboardVersionConflict) Unwrap() error { return ErrDashboardVersionConflict }
 
 // UpdateDashboard applies the request to one of a project's dashboards and
 // returns it.
@@ -206,7 +231,12 @@ func UpdateDashboard(engine db.Queryable, project, id string, req UpdateDashboar
 		return nil, err
 	}
 	if existing == nil {
-		return nil, fmt.Errorf("dashboard not found")
+		return nil, ErrDashboardNotFound
+	}
+	// A stale version is refused even when the body would change nothing: the
+	// caller's view is out of date either way, and saying so is the point.
+	if req.Version != nil && *req.Version != existing.Version {
+		return nil, &DashboardVersionConflict{Current: existing}
 	}
 
 	u := sq.Update(dashboardsTable)
@@ -232,13 +262,41 @@ func UpdateDashboard(engine db.Queryable, project, id string, req UpdateDashboar
 	// caller that skips the read — or reorders it — would otherwise rewrite
 	// another tenant's dashboard with nothing in this function to stop it. Same
 	// reasoning DeleteAPIKey records for its own scoping.
-	qStr, args, err := u.Where(sq.Eq{"id": id, "project": project}).ToSql()
+	//
+	// The version is bumped in the same statement, and updated_at set
+	// explicitly rather than left to ON UPDATE (which fires only when a value
+	// changed — the version bump guarantees one did, but the intent belongs in
+	// the statement). When the caller sent a version it is part of the WHERE:
+	// that, not the read above, is the check, because the read-then-write pair
+	// is not atomic and two saves can both pass the read.
+	where := sq.Eq{"id": id, "project": project}
+	if req.Version != nil {
+		where["version"] = *req.Version
+	}
+	qStr, args, err := u.
+		Set("version", sq.Expr("version + 1")).
+		Set("updated_at", sq.Expr("CURRENT_TIMESTAMP(3)")).
+		Where(where).ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build sql query: %w", err)
 	}
 
-	if _, err := engine.Exec(qStr, args...); err != nil {
+	res, err := engine.Exec(qStr, args...)
+	if err != nil {
 		return nil, fmt.Errorf("failed to update dashboard: %w", err)
+	}
+	if req.Version != nil {
+		if affected, err := res.RowsAffected(); err == nil && affected == 0 {
+			// Lost the race after the read: report what is there now.
+			current, err := GetDashboard(engine, project, id)
+			if err != nil {
+				return nil, err
+			}
+			if current == nil {
+				return nil, ErrDashboardNotFound
+			}
+			return nil, &DashboardVersionConflict{Current: current}
+		}
 	}
 	return GetDashboard(engine, project, id)
 }

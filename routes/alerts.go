@@ -2,9 +2,12 @@ package routes
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aidenappl/monitor-core/alerts"
@@ -12,6 +15,7 @@ import (
 	"github.com/aidenappl/monitor-core/middleware"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
+	"github.com/aidenappl/monitor-core/structs"
 	"github.com/aidenappl/monitor-core/telemetry"
 	"github.com/gorilla/mux"
 )
@@ -68,8 +72,10 @@ func HandleCreateAlertRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req query.CreateAlertRuleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		responder.Error(w, http.StatusBadRequest, "invalid request body")
+	// A cleared threshold on create is the same as an omitted one: nil, which
+	// CreateAlertRule refuses for a rule type that needs one.
+	if _, err := decodeAlertRuleBody(r, &req); err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -88,6 +94,46 @@ func HandleCreateAlertRule(w http.ResponseWriter, r *http.Request) {
 		"rule_type": created.Type,
 	})
 	responder.New(w, created)
+}
+
+// HandlePreviewAlertRuleRouting answers "if this draft rule fired now, which
+// policies would match and which channels would be notified?" without storing
+// the rule or sending anything.
+//
+// The body is the CREATE body, decoded and validated by the same code
+// (decodeAlertRuleBody, query.BuildAlertRule), so the preview refuses exactly
+// what create refuses, with the same field-level 400s. Routing is
+// alerts.PreviewRouting, which runs the router's own traceRouting — monitor-web
+// previously re-implemented policy matching, and two copies of that drift.
+//
+// A read, so the role gate lets any session that can read rules call it
+// (middleware.readOnlyPOSTPaths).
+func HandlePreviewAlertRuleRouting(w http.ResponseWriter, r *http.Request) {
+	project, ok := requireProject(w, r)
+	if !ok {
+		return
+	}
+
+	var req query.CreateAlertRuleRequest
+	if _, err := decodeAlertRuleBody(r, &req); err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rule, err := query.BuildAlertRule(project, req)
+	if err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	preview, err := alerts.PreviewRouting(r.Context(), rule)
+	if err != nil {
+		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to preview routing", err, map[string]any{
+			"project":    project,
+			"dependency": "mariadb",
+		})
+		return
+	}
+	responder.New(w, preview)
 }
 
 func HandleGetAlertRule(w http.ResponseWriter, r *http.Request) {
@@ -125,10 +171,12 @@ func HandleUpdateAlertRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req query.UpdateAlertRuleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		responder.Error(w, http.StatusBadRequest, "invalid request body")
+	cleared, err := decodeAlertRuleBody(r, &req)
+	if err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	req.ClearThreshold = cleared
 
 	updated, err := query.UpdateAlertRule(db.SQL, project, id, req)
 	if err != nil {
@@ -362,18 +410,70 @@ func HandleTestNotificationChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The cause is an alerts.NotifyError: channel type, stage and the
-	// destination's status — the URL already stripped. It lands on this
-	// request's event, which is the one report of the failure.
-	notifier := alerts.NewNotifier()
-	if err := notifier.SendTest(ch); err != nil {
-		responder.ErrorWithCause(w, http.StatusInternalServerError, "test notification failed", err, map[string]any{
-			"channel_id": ch.ID, "channel_type": ch.Type,
-		})
+	// THE CONTRACT (NOTIFICATIONS-04), which monitor-web codes against:
+	//
+	//   - a config that can never deliver (missing/malformed URL, no recipient,
+	//     no routing key) → 400 naming the config field;
+	//   - a valid config whose delivery FAILED → 200 {ok:false, error:"<reason>"};
+	//   - delivered → 200 {ok:true}.
+	//
+	// It used to be a 500 "test notification failed" for both of the first two:
+	// the user's mistake read as the server's, and the reason — DNS, a 404, a
+	// timeout — never reached the person who could fix it. Every outcome is also
+	// stored on the channel (last_test_*), so a reload no longer forgets it. The
+	// reason comes from alerts.DeliveryReason and never contains the destination.
+	if err := alerts.ValidateChannelConfig(ch); err != nil {
+		recordChannelTest(w, r, ch, false, err.Error())
+		middleware.ExpectedClientError(w)
+		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	responder.New(w, nil, "test notification sent")
+	notifier := alerts.NewNotifier()
+	err = notifier.SendTest(ch)
+	var notifyErr *alerts.NotifyError
+	if errors.As(err, &notifyErr) && notifyErr.Stage == "config" {
+		// The notifier's own config check disagreed with ValidateChannelConfig;
+		// still the caller's to fix, and its text names a key, not a value.
+		reason := alerts.DeliveryReason(ch.Type, err)
+		recordChannelTest(w, r, ch, false, reason)
+		responder.Error(w, http.StatusBadRequest, reason)
+		return
+	}
+	if err != nil {
+		reason := alerts.DeliveryReason(ch.Type, err)
+		recordChannelTest(w, r, ch, false, reason)
+		fields := map[string]any{"channel_test_ok": false}
+		if notifyErr != nil {
+			for k, v := range notifyErr.TelemetryFields() {
+				fields[k] = v
+			}
+		}
+		middleware.Annotate(w, fields)
+		responder.New(w, channelTestResult{OK: false, Error: reason}, "test notification failed")
+		return
+	}
+
+	recordChannelTest(w, r, ch, true, "")
+	middleware.Annotate(w, map[string]any{"channel_test_ok": true})
+	responder.New(w, channelTestResult{OK: true}, "test notification sent")
+}
+
+// channelTestResult is the data of POST /v1/notification-channels/{id}/test.
+type channelTestResult struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+// recordChannelTest stores a test outcome on the channel. Best-effort: the test
+// already happened and its answer is in the response, so a failed write is a
+// warning rather than a failed request.
+func recordChannelTest(w http.ResponseWriter, r *http.Request, ch *structs.NotificationChannel, ok bool, reason string) {
+	if err := query.RecordNotificationChannelTest(db.SQL, ch.Project, ch.ID, ok, reason, time.Now().UTC()); err != nil {
+		telemetry.WarnErr(r.Context(), "notification_channel.test.record.failed", err, map[string]any{
+			"channel_id": ch.ID, "channel_type": ch.Type, "project": ch.Project,
+		})
+	}
 }
 
 // HandleStreamAlerts handles GET /v1/alerts/stream (SSE for alert state changes)
@@ -693,4 +793,65 @@ func HandleReorderPolicies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	responder.New(w, nil, "policies reordered")
+}
+
+// maxAlertRuleBodySize bounds an alert-rule body; the largest real one is a
+// few kilobytes of query_filters.
+const maxAlertRuleBodySize = 1 << 20
+
+// decodeAlertRuleBody decodes a create or update body into dst and turns a
+// decode failure into a message that names the field (ALERTS-08). Before it,
+// `cooldown_seconds: 99999999999` — a uint32 overflow — and a threshold sent as
+// text were both "invalid request body", with nothing for the form to attach
+// the error to. Field messages start with the field's JSON name.
+//
+// It also reports whether the threshold was CLEARED — sent as null or "" —
+// which a *float64 cannot distinguish from an omitted field. The key is
+// removed before decoding, so a cleared threshold reaches dst as nil.
+func decodeAlertRuleBody(r *http.Request, dst any) (thresholdCleared bool, err error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxAlertRuleBodySize+1))
+	if err != nil {
+		return false, errors.New("invalid request body")
+	}
+	if len(body) > maxAlertRuleBodySize {
+		return false, errors.New("request body is too large")
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return false, errors.New("invalid request body")
+	}
+	if raw, ok := fields["threshold"]; ok {
+		switch strings.TrimSpace(string(raw)) {
+		case "null", `""`:
+			thresholdCleared = true
+			delete(fields, "threshold")
+			if body, err = json.Marshal(fields); err != nil {
+				return false, errors.New("invalid request body")
+			}
+		}
+	}
+
+	if err := json.Unmarshal(body, dst); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) && typeErr.Field != "" {
+			return false, errors.New(alertRuleFieldTypeMessage(typeErr.Field))
+		}
+		return false, errors.New("invalid request body")
+	}
+	return thresholdCleared, nil
+}
+
+// alertRuleFieldTypeMessage words a wrong-typed field.
+func alertRuleFieldTypeMessage(field string) string {
+	if _, ok := query.AlertRuleSecondsLimits[field]; ok {
+		return query.AlertRuleSecondsMessage(field)
+	}
+	switch field {
+	case "threshold":
+		return "threshold must be a number"
+	case "enabled":
+		return "enabled must be true or false"
+	}
+	return field + " has the wrong type"
 }

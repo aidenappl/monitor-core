@@ -3,6 +3,7 @@ package routes
 import (
 	"errors"
 	"net/http"
+	"time"
 
 	oidcsession "github.com/aidenappl/go-oidc-session"
 	"github.com/aidenappl/monitor-core/db"
@@ -99,7 +100,10 @@ func issueFromSSOSession(w http.ResponseWriter, r *http.Request, s *oidcsession.
 		responder.Error(w, http.StatusUnauthorized, "user not found or inactive")
 		return
 	}
-	if err := issueSession(w, user.ID, user.Role); err != nil {
+	// No sign-in happened here — the family is re-minted from an SSO session
+	// that already existed — so the authentication time is unknown (zero), and
+	// a step-up (ACCOUNT-01) still needs a real sign-in.
+	if err := issueSession(w, user.ID, user.Role, time.Time{}); err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to mint tokens", err)
 		return
 	}

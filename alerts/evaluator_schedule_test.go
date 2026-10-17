@@ -1564,7 +1564,7 @@ func TestTimerAndTestEndpointEvaluateTheSameHalfOpenWindow(t *testing.T) {
 		t.Fatalf("EvaluateRuleNow issued %d statements, want 1", len(conn.queries))
 	}
 	endpoint := conn.queries[0]
-	from, to := endpoint.args[0].(time.Time), endpoint.args[1].(time.Time)
+	from, to := time.Time(endpoint.args[0].(db.Millis)), time.Time(endpoint.args[1].(db.Millis))
 	if to.Sub(from) != defaultEvaluationInterval {
 		t.Errorf("test endpoint window is %s, want the effective %s", to.Sub(from), defaultEvaluationInterval)
 	}
@@ -1585,7 +1585,7 @@ func TestTimerAndTestEndpointEvaluateTheSameHalfOpenWindow(t *testing.T) {
 	if !strings.Contains(timer.sql, "timestamp >= ? AND timestamp < ?") {
 		t.Errorf("the window is not half-open:\n\t%s", timer.sql)
 	}
-	tf, tt := timer.args[0].(time.Time), timer.args[1].(time.Time)
+	tf, tt := time.Time(timer.args[0].(db.Millis)), time.Time(timer.args[1].(db.Millis))
 	if tt.Sub(tf) != defaultEvaluationInterval {
 		t.Errorf("timer window is %s, want %s", tt.Sub(tf), defaultEvaluationInterval)
 	}

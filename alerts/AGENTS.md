@@ -49,9 +49,14 @@ non-empty and `Init` seeds nothing.
   `threshold`, `field` (required for non-count metrics; must be a `data.*` key),
   `query_filters` (JSON array), `evaluation_interval_seconds`, `for_seconds` (must
   stay firing this long before notifying), `cooldown_seconds` (re-notify throttle),
-  `priority`, `enabled`.
+  `priority`, `enabled`. (`metric` also takes `p50`/`p95`/`p99` since 137.) The three
+  second fields are bounded — interval and `for` ≤ 86400, cooldown ≤ 604800, 0 allowed —
+  and `threshold` is **required** for `threshold`/`rate_change` rules (a missing or cleared
+  one used to save as 0, so `count > (blank)` fired on one event); absence rules ignore it.
 - **Notification channel** — `type` ∈ {`webhook`,`slack`,`email`,`pagerduty`} + a
-  JSON `config`.
+  JSON `config`, plus the last test outcome (`last_test_*`, 138).
+  `channel_check.go` holds `ValidateChannelConfig` (can this config ever deliver?) and
+  `DeliveryReason` (a failure as one safe sentence — never the destination).
 - **Notification policy** — routing rule with a `position` (evaluated in order) that
   maps matching alerts (by service group / priority / etc.) to channels.
 - **Service group** — named set of services referenced by policies.
