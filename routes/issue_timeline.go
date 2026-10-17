@@ -2,12 +2,14 @@ package routes
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/github"
@@ -236,8 +238,8 @@ func HandleAddIssueComment(w http.ResponseWriter, r *http.Request) {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if strings.TrimSpace(body.Body) == "" {
-		responder.Error(w, http.StatusBadRequest, "body is required")
+	if err := validateCommentBody(body.Body); err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -253,6 +255,24 @@ func HandleAddIssueComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	responder.New(w, entry, "comment added")
+}
+
+// MAX_COMMENT_RUNES caps a comment body, counted in characters (runes) rather
+// than bytes so the limit monitor-web shows matches what a person typed. Well
+// inside issue_timeline.body's TEXT column even at four bytes a rune.
+const MAX_COMMENT_RUNES = 10000
+
+// validateCommentBody is the create and edit rule for a comment body: not blank,
+// at most MAX_COMMENT_RUNES characters. The body is stored as sent; only the
+// blank check trims.
+func validateCommentBody(body string) error {
+	if strings.TrimSpace(body) == "" {
+		return errors.New("body is required")
+	}
+	if utf8.RuneCountInString(body) > MAX_COMMENT_RUNES {
+		return fmt.Errorf("body must be at most %d characters", MAX_COMMENT_RUNES)
+	}
+	return nil
 }
 
 // HandleEditIssueComment replaces a comment's body.
@@ -285,8 +305,8 @@ func HandleEditIssueComment(w http.ResponseWriter, r *http.Request) {
 		responder.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if strings.TrimSpace(body.Body) == "" {
-		responder.Error(w, http.StatusBadRequest, "body is required")
+	if err := validateCommentBody(body.Body); err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
