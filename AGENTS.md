@@ -2532,6 +2532,14 @@ are listed in §4.
 ## 9. Rules & guardrails
 
 - Never add an ORM; keep squirrel + native ClickHouse driver + `db.Queryable` for MariaDB.
+- **Wrap every time bound compared against `events.timestamp` in `db.Millis(t)`.**
+  clickhouse-go formats a positional `time.Time` at SECOND precision (`bindPositional`
+  → `format(tz, Seconds, v)`) regardless of the column, while `timestamp` is
+  `DateTime64(3, 'UTC')`. A raw `time.Time` silently drops the milliseconds: a ±1 ms
+  window (event deep links) matches nothing, the issue-events `before` cursor skips the
+  rest of its second, and every range edge is cut to the second. `db.Millis` is a
+  `driver.Valuer` that renders a UTC millisecond literal (squirrel and the driver both
+  unwrap it). Found by the 2026-10-16 tophat re-verification.
 - **Always validate `data.*` field names** with `structs.SafeIdentifierRegex` before
   putting them into ClickHouse SQL. That is the injection boundary.
 - **Never re-declare the identifier regex or a column allowlist outside

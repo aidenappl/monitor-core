@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/scope"
 )
 
@@ -56,7 +57,7 @@ func TestIssueEventsByIDQueryAppliesBeforeToBothPhases(t *testing.T) {
 	if query != want {
 		t.Errorf("sql =\n\t%s\nwant\n\t%s", query, want)
 	}
-	wantArgs := []interface{}{"atlas", "issue-1", before, "atlas", "issue-1", before, 50, 50}
+	wantArgs := []interface{}{"atlas", "issue-1", db.Millis(before), "atlas", "issue-1", db.Millis(before), 50, 50}
 	if !reflect.DeepEqual(args, wantArgs) {
 		t.Errorf("args = %v, want %v", args, wantArgs)
 	}

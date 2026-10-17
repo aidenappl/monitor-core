@@ -783,7 +783,7 @@ func issueEventsByIDQuery(ctx context.Context, issueID string, limit int, before
 	condArgs := []interface{}{issueID}
 	if !before.IsZero() {
 		cond += " AND timestamp < ?"
-		condArgs = append(condArgs, before)
+		condArgs = append(condArgs, db.Millis(before))
 	}
 
 	inner, innerArgs, err := selectIssueEventColumns(ctx, "timestamp", cond+" ORDER BY timestamp DESC LIMIT ?", append(append([]interface{}{}, condArgs...), limit)...)

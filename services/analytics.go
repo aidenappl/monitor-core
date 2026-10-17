@@ -321,11 +321,11 @@ func buildEventWhere(ctx context.Context, from, to time.Time, filters []structs.
 
 	if !from.IsZero() {
 		whereParts = append(whereParts, "timestamp >= ?")
-		args = append(args, from)
+		args = append(args, db.Millis(from))
 	}
 	if !to.IsZero() {
 		whereParts = append(whereParts, "timestamp <= ?")
-		args = append(args, to)
+		args = append(args, db.Millis(to))
 	}
 
 	if len(filters) > 0 {

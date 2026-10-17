@@ -481,7 +481,7 @@ func TestQueryEventsPageIsTwoPhaseWithoutDataFilters(t *testing.T) {
 	if page != wantPage {
 		t.Errorf("page sql =\n\t%s\nwant\n\t%s", page, wantPage)
 	}
-	wantPageArgs := []any{"atlas", "api", from, to, "atlas", "api", from, to}
+	wantPageArgs := []any{"atlas", "api", millisArg(from), millisArg(to), "atlas", "api", millisArg(from), millisArg(to)}
 	if !reflect.DeepEqual(pageArgs, wantPageArgs) {
 		t.Errorf("page args = %v, want %v", pageArgs, wantPageArgs)
 	}
@@ -491,7 +491,7 @@ func TestQueryEventsPageIsTwoPhaseWithoutDataFilters(t *testing.T) {
 	if count != wantCount {
 		t.Errorf("count sql =\n\t%s\nwant\n\t%s", count, wantCount)
 	}
-	if want := []any{"atlas", "api", from, to}; !reflect.DeepEqual(countArgs, want) {
+	if want := []any{"atlas", "api", millisArg(from), millisArg(to)}; !reflect.DeepEqual(countArgs, want) {
 		t.Errorf("count args = %v, want %v", countArgs, want)
 	}
 }
@@ -557,7 +557,14 @@ func TestGetLabelValuesGroupsInsteadOfDistinct(t *testing.T) {
 	if recorder.statements[0] != want {
 		t.Errorf("sql =\n\t%s\nwant\n\t%s", recorder.statements[0], want)
 	}
-	if wantArgs := []any{"atlas", "error", from}; !reflect.DeepEqual(recorder.args[0], wantArgs) {
+	if wantArgs := []any{"atlas", "error", millisArg(from)}; !reflect.DeepEqual(recorder.args[0], wantArgs) {
 		t.Errorf("args = %v, want %v", recorder.args[0], wantArgs)
 	}
+}
+
+// millisArg is how squirrel hands a db.Millis time bound to the driver: its
+// Value(), the UTC millisecond literal.
+func millisArg(t time.Time) string {
+	v, _ := db.Millis(t).Value()
+	return v.(string)
 }

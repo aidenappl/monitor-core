@@ -124,10 +124,10 @@ func applyFilters(builder sq.SelectBuilder, params QueryParams) (sq.SelectBuilde
 	}
 
 	if !params.From.IsZero() {
-		builder = builder.Where(sq.GtOrEq{"timestamp": params.From})
+		builder = builder.Where(sq.GtOrEq{"timestamp": db.Millis(params.From)})
 	}
 	if !params.To.IsZero() {
-		builder = builder.Where(sq.LtOrEq{"timestamp": params.To})
+		builder = builder.Where(sq.LtOrEq{"timestamp": db.Millis(params.To)})
 	}
 
 	return builder, nil
@@ -531,10 +531,10 @@ func GetLabelValues(ctx context.Context, label string, params QueryParams) (*Lab
 	}
 
 	if !params.From.IsZero() {
-		builder = builder.Where(sq.GtOrEq{"timestamp": params.From})
+		builder = builder.Where(sq.GtOrEq{"timestamp": db.Millis(params.From)})
 	}
 	if !params.To.IsZero() {
-		builder = builder.Where(sq.LtOrEq{"timestamp": params.To})
+		builder = builder.Where(sq.LtOrEq{"timestamp": db.Millis(params.To)})
 	}
 
 	querySQL, queryArgs, err := builder.ToSql()
