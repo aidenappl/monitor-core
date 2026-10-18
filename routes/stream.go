@@ -97,6 +97,15 @@ func StreamEventsHandler(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 	_ = rc.SetWriteDeadline(time.Time{})
 
+	// ⚠️ A BODY BYTE NOW, not just headers. Flushing headers alone is not
+	// enough: a buffering hop (the edge proxy, the web app's SSE bridge) holds
+	// the response until the first body byte, which used to be the 15 s
+	// keepalive — so a quiet stream sat on "Connecting" for 11–18 s. An SSE
+	// comment is ignored by EventSource and opens the stream at once.
+	if _, err := fmt.Fprint(w, ": connected\n\n"); err != nil {
+		reportStreamWriteFailure(r.Context(), "events", 0, err)
+		return
+	}
 	flusher.Flush()
 
 	ctx := r.Context()

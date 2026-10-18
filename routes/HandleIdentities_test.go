@@ -2,8 +2,10 @@ package routes
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,5 +88,32 @@ func TestUnlinkAllowedWhenMultiple(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// The raw OIDC claim envelope is stored for audit only; it must never reach a
+// client, whichever handler serialises an Identity.
+func TestIdentityJSONOmitsSecrets(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+	}{
+		{"identity data", "identity_data"},
+		{"password hash", "password_hash"},
+	}
+	b, err := json.Marshal(structs.Identity{
+		Provider:     "forta",
+		PasswordHash: []byte("hash"),
+		IdentityData: json.RawMessage(`{"nonce":"n","sid":"s"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if strings.Contains(string(b), tt.key) {
+				t.Errorf("Identity JSON contains %q: %s", tt.key, b)
+			}
+		})
 	}
 }

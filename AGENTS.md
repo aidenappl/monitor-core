@@ -27,7 +27,10 @@ It **owns**:
 - **Identity & authentication** — native accounts (email+password), Monitor-owned
   session tokens, and a pluggable, config-driven SSO subsystem — all owned here
   (see §6 Auth).
-- Two Server-Sent-Events (SSE) streams: a live event tail and a live alert feed.
+- Two Server-Sent-Events (SSE) streams: a live event tail and a live alert feed. ⚠️ Each
+  writes an SSE comment (`: connected`) straight after its headers: a buffering hop holds a
+  response until its first BODY byte, and before this that was the 15 s keepalive — a quiet
+  stream showed "Connecting" for 11–18 s.
 
 It **does not** own: the UI (that's `monitor-web`) or the client SDKs (`go-monitor`,
 `monitor-js`).
@@ -614,7 +617,7 @@ into `access_logs` was RESTRICT and a secret that had ever been read could never
 | Table | Purpose |
 |---|---|
 | `users` | **Managed at `/admin/users`** (monitor-web *Admin → Users*): SSO auto-provisioned accounts arrive `pending` and an admin approves them by setting a role; `admin.user.updated` (info) records old/new role and active and who changed it. The account: `email` (`UNIQUE`), `email_verified`, `name`, `display_name`, `role` (`admin`\|`editor`\|`viewer`\|`pending`), `active`. |
-| `identities` | One sign-in method per row, `UNIQUE(provider, provider_user_id)`. `provider="password"` stores a bcrypt hash in `password_hash`; SSO rows store the claim envelope in `identity_data`. **`(provider, provider_user_id)` is the ONLY identity key — never email.** `FK → users ON DELETE CASCADE`. |
+| `identities` | One sign-in method per row, `UNIQUE(provider, provider_user_id)`. `provider="password"` stores a bcrypt hash in `password_hash`; SSO rows store the claim envelope in `identity_data` — stored for audit, **never serialised** (`json:"-"`, like `password_hash`; `TestIdentityJSONOmitsSecrets`). **`(provider, provider_user_id)` is the ONLY identity key — never email.** `FK → users ON DELETE CASCADE`. |
 | `refresh_tokens` | Rotating-refresh store. Only the SHA-256 `token_hash` (`BINARY(32)`) is persisted; tokens minted from one login share a `family_id`; rotation stamps `replaced_by` and `used_at` (migration 134 — the clock for the 30s reuse grace window). |
 | `sso_providers` | One configured IdP per row (see below). |
 | `oidc_sessions` | One row per signed-in browser for SSO (migration 135, go-oidc-session `sqlstore` shape), keyed by the SHA-256 of the `mon_sso_session` cookie, holding the provider's tokens AES-256-GCM-encrypted (`MON_CRYPTO_KEY`) plus `subject` and `sid` for back-channel logout. `/auth/refresh` refreshes them against the provider and deletes the row when the provider refuses. Replaced `sso_sessions`, which migration 136 dropped along with `sso_providers.introspect_url` (the admin SSO API no longer has that field). |
