@@ -27,7 +27,6 @@ import (
 	"github.com/aidenappl/monitor-core/routes"
 	"github.com/aidenappl/monitor-core/services"
 	"github.com/aidenappl/monitor-core/telemetry"
-	"github.com/rs/cors"
 )
 
 // subcommands are the one-off operator actions this binary accepts instead of
@@ -669,29 +668,9 @@ func main() {
 	// buildRouter in router.go.
 	r := buildRouter(env.MonRole)
 
-	// CORS Middleware
-	corsMiddleware := cors.New(cors.Options{
-		AllowedOrigins: []string{
-			"https://monitor.local.appleby.cloud:3020",
-			"https://monitor.appleby.cloud",
-			"https://trailblaze.to",
-			"https://*.trailblaze.to",
-			"https://*.appleby.cloud",
-			"http://localhost:*",
-		},
-		AllowCredentials: true,
-		AllowedHeaders:   []string{"X-Requested-With", "Content-Type", "Origin", "Authorization", "Accept", "Referer", "Dnt", "User-Agent", "X-Api-Key", "X-CSRF-Token"},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		// Let browsers cache a preflight for 2h (Chromium's cap) instead of the
-		// 5s default. Without it monitor-js pays a preflight before nearly every
-		// ingest flush. The one cost: a change to AllowedHeaders/AllowedMethods
-		// can take up to 2h to reach an already-open browser.
-		MaxAge: 7200,
-	})
-
 	server := &http.Server{
 		Addr:         ":" + env.Port,
-		Handler:      corsMiddleware.Handler(r),
+		Handler:      corsHandler(r),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
