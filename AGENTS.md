@@ -66,7 +66,12 @@ what is deliberately **not** built yet.
     `db.SQL` (`db/sql.go`); this is the standard-shape `db.Queryable` +
     squirrel-against-`database/sql` stack. **Which store owns what, and why, is §6
     *Stores — configuration vs facts*.**
-- **CORS:** `github.com/rs/cors` (`main.go`). `MaxAge: 7200` caches a preflight for 2h
+- **CORS:** `github.com/rs/cors` (`cors.go`), two policies picked by Origin. Credentialed CORS is
+  only for the dashboards (`monitor.appleby.cloud`, its local origin, `localhost`). Every other
+  allowed origin (`*.appleby.cloud`, `*.trailblaze.to`) gets CORS **without** credentials: a fetch
+  from any `*.appleby.cloud` page is same-site and carries the mon-* cookies, so a credentialed
+  wildcard would let any subdomain (every appleby.cloud Site included) read Monitor as its visitor.
+  monitor-js ingest uses `X-Api-Key` and never needs credentials. `MaxAge: 7200` caches a preflight for 2h
   (Chromium's cap) so monitor-js does not pay one before nearly every ingest flush; the cost is
   that an `AllowedHeaders`/`AllowedMethods` change takes up to 2h to reach an open browser.
 - **Sessions/JWT:** `github.com/golang-jwt/jwt/v5` (Monitor-owned HS512 tokens).
