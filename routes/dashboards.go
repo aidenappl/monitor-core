@@ -2,6 +2,7 @@ package routes
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/aidenappl/monitor-core/db"
@@ -110,7 +111,19 @@ func HandleUpdateDashboard(w http.ResponseWriter, r *http.Request) {
 
 	dashboard, err := query.UpdateDashboard(db.SQL, project, id, body)
 	if err != nil {
-		responder.Error(w, http.StatusNotFound, "dashboard not found")
+		// 409 carries the CURRENT dashboard in data, so monitor-web can offer
+		// reload or overwrite (resend with the returned version) without a
+		// second read (DASHBOARD-11).
+		var conflict *query.DashboardVersionConflict
+		switch {
+		case errors.As(err, &conflict):
+			responder.ErrorWithData(w, http.StatusConflict,
+				"this dashboard was changed by someone else since you loaded it; reload it, or save again to overwrite", conflict.Current)
+		case errors.Is(err, query.ErrDashboardNotFound):
+			responder.Error(w, http.StatusNotFound, "dashboard not found")
+		default:
+			responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to update dashboard", err)
+		}
 		return
 	}
 

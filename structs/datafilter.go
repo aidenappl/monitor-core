@@ -54,33 +54,45 @@ func DataOperand(op string, value any) (arg any, numeric bool, raw bool, err err
 	}
 }
 
-// InValues is an `in` filter's value list, shared by every filter site
-// (services event search, services analytics, alerts) so `in` means the same
-// thing to all three. JSON bodies and stored rules decode to []any; []string
-// covers callers building filters in Go (query-string parsing). A lone scalar
-// is a one-element list — the MCP and hand-written requests send
-// `"value": "x"` — rather than an error. An empty list is refused because
-// `IN ()` is a ClickHouse syntax error; the error wraps ErrInvalidFilterValue
-// so routes answer 400.
-func InValues(v any) ([]any, error) {
-	switch vals := v.(type) {
+// InValues normalises the value of an `in` filter on field into a list, shared
+// by every filter site (services event search, services analytics, alerts) so
+// `in` means the same thing to all three. An array is taken as is; []string
+// covers callers building filters in Go (query-string parsing). A string is
+// split on commas, each part trimmed and empties dropped — monitor-web's filter
+// bar, and anyone typing into a query tool, sends `a,b` rather than ["a","b"],
+// and a plain "x" is the one-element list. Any other scalar (the MCP and
+// hand-written requests send `"value": 5`) is a one-element list too. nil, a
+// map, and a list that ends up empty (`IN ()` is a ClickHouse syntax error) are
+// ErrInvalidFilterValue naming the field, which every route answers with a 400.
+func InValues(field string, value any) ([]any, error) {
+	switch v := value.(type) {
 	case []any:
-		if len(vals) > 0 {
-			return vals, nil
+		if len(v) > 0 {
+			return v, nil
 		}
 	case []string:
-		if len(vals) > 0 {
-			out := make([]any, len(vals))
-			for i, s := range vals {
+		if len(v) > 0 {
+			out := make([]any, len(v))
+			for i, s := range v {
 				out[i] = s
 			}
 			return out, nil
 		}
-	case nil:
+	case string:
+		var out []any
+		for _, part := range strings.Split(v, ",") {
+			if p := strings.TrimSpace(part); p != "" {
+				out = append(out, p)
+			}
+		}
+		if len(out) > 0 {
+			return out, nil
+		}
+	case nil, map[string]any:
 	default:
-		return []any{vals}, nil
+		return []any{v}, nil
 	}
-	return nil, fmt.Errorf("%w: in operator requires a non-empty value", ErrInvalidFilterValue)
+	return nil, fmt.Errorf("%w: filter on %s with operator in needs a non-empty list of values (an array, a comma-separated string, or a single value)", ErrInvalidFilterValue, field)
 }
 
 // DataInOperands is DataOperand for the `in` operator: numeric when every

@@ -67,7 +67,9 @@ func HandleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, apikeys.ErrDuplicateKeyName):
 			responder.Error(w, http.StatusConflict, err.Error())
-		case errors.Is(err, apikeys.ErrUnknownProject):
+		case errors.Is(err, apikeys.ErrUnknownProject),
+			errors.Is(err, apikeys.ErrInvalidKeyName),
+			errors.Is(err, apikeys.ErrInvalidScope):
 			responder.Error(w, http.StatusBadRequest, err.Error())
 		default:
 			responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to create api key", err)
@@ -136,6 +138,8 @@ func HandleUpdateAPIKey(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, apikeys.ErrKeyNotFound):
 			responder.Error(w, http.StatusNotFound, "api key not found")
+		case errors.Is(err, apikeys.ErrInvalidKeyName):
+			responder.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, apikeys.ErrDuplicateKeyName):
 			responder.Error(w, http.StatusConflict, err.Error())
 		default:

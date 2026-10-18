@@ -141,6 +141,7 @@ var deployedSurface = []string{
 	"POST /auth/self/identities/{slug}",
 	"POST /auth/sso/{slug}/backchannel-logout", // one per provider; the registered /auth/sso/forta/… still resolves here
 	"POST /v1/alert-rules",
+	"POST /v1/alert-rules/preview-routing",
 	"POST /v1/alert-rules/{id}/test",
 	"POST /v1/analytics",
 	"POST /v1/api-keys",

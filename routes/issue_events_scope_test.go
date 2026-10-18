@@ -166,7 +166,7 @@ func TestIssueEventsByIDQueryIsTwoPhaseAndScopedTwice(t *testing.T) {
 	withDefaultProject(t, "default")
 	withDatabaseName(t, "monitor")
 
-	query, args, err := issueEventsByIDQuery(scope.WithProject(context.Background(), "atlas"), "issue-1", 50)
+	query, args, err := issueEventsByIDQuery(scope.WithProject(context.Background(), "atlas"), "issue-1", 50, time.Time{})
 	if err != nil {
 		t.Fatalf("issueEventsByIDQuery: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestIssueEventsByIDQueryIsTwoPhaseAndScopedTwice(t *testing.T) {
 	}
 
 	// The default project's transition arm reaches both phases too.
-	query, _, err = issueEventsByIDQuery(scope.WithProject(context.Background(), "default"), "issue-1", 50)
+	query, _, err = issueEventsByIDQuery(scope.WithProject(context.Background(), "default"), "issue-1", 50, time.Time{})
 	if err != nil {
 		t.Fatalf("issueEventsByIDQuery(default): %v", err)
 	}
@@ -193,7 +193,7 @@ func TestIssueEventsByIDQueryIsTwoPhaseAndScopedTwice(t *testing.T) {
 	}
 
 	// And an unscoped context builds nothing.
-	query, args, err = issueEventsByIDQuery(context.Background(), "issue-1", 50)
+	query, args, err = issueEventsByIDQuery(context.Background(), "issue-1", 50, time.Time{})
 	if !errors.Is(err, scope.ErrNoProject) || query != "" || args != nil {
 		t.Errorf("unscoped context: (%q, %v, %v), want ErrNoProject and no query", query, args, err)
 	}

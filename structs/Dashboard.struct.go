@@ -17,11 +17,14 @@ import "time"
 // — and so the wire payload says which project a layout is filed under, which is
 // the only way monitor-web can tell two same-named dashboards apart.
 type Dashboard struct {
-	ID          string    `json:"id"`
-	Project     string    `json:"project"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	Config      string    `json:"config"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID          string `json:"id"`
+	Project     string `json:"project"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Config      string `json:"config"`
+	// Version is the optimistic-concurrency counter (migration 139): 1 on
+	// create, +1 on every update. Send it back on PUT to refuse a stale write.
+	Version   int       `json:"version"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }

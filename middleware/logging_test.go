@@ -95,7 +95,7 @@ func TestSuccessfulAuthenticatedReadEmitsOneEvent(t *testing.T) {
 	withRole(t, env.RoleZone) // a zone trusts the token and never touches MariaDB
 	rec := record(t)
 
-	token, _, err := jwt.NewAccessToken(42, "viewer", "0a0b0c0d")
+	token, _, err := jwt.NewAccessToken(42, "viewer", "0a0b0c0d", time.Time{})
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}

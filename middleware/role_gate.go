@@ -17,6 +17,9 @@ var readOnlyPOSTPaths = map[string]bool{
 	"/v1/topn":       true,
 	"/v1/gauge":      true,
 	"/v1/compare":    true,
+	// Routes a draft rule against the project's policies; stores and sends
+	// nothing.
+	"/v1/alert-rules/preview-routing": true,
 }
 
 // isWriteRequest reports whether r changes state on the /v1 surface.

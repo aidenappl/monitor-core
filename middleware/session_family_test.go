@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/aidenappl/monitor-core/jwt"
 )
@@ -39,7 +40,7 @@ func TestSessionFamilyID(t *testing.T) {
 	want := []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}
 
 	mint := func(uid int64, fid string) string {
-		tok, _, err := jwt.NewAccessToken(uid, "editor", fid)
+		tok, _, err := jwt.NewAccessToken(uid, "editor", fid, time.Time{})
 		if err != nil {
 			t.Fatalf("mint: %v", err)
 		}

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/aidenappl/monitor-core/db"
+	"github.com/aidenappl/monitor-core/github"
 	"github.com/aidenappl/monitor-core/query"
 	"github.com/aidenappl/monitor-core/responder"
 	"github.com/gorilla/mux"
@@ -109,6 +110,29 @@ func HandleUpsertServiceRepo(w http.ResponseWriter, r *http.Request) {
 	if owner == "" || repo == "" {
 		responder.Error(w, http.StatusBadRequest, "repository (or owner and repo) is required")
 		return
+	}
+	// Validated whichever way they arrived — the parsed `repository` and the
+	// explicit owner/repo fields alike. `../..` once saved here and rendered a
+	// link to https://github.com/ (ZONE-SETTINGS-02).
+	if err := github.ValidateOwner(owner); err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := github.ValidateRepoName(repo); err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// A blank branch clears it (NULL) rather than storing "".
+	if body.DefaultBranch != nil {
+		branch := strings.TrimSpace(*body.DefaultBranch)
+		if branch == "" {
+			body.DefaultBranch = nil
+		} else if err := github.ValidateBranch(branch); err != nil {
+			responder.Error(w, http.StatusBadRequest, err.Error())
+			return
+		} else {
+			body.DefaultBranch = &branch
+		}
 	}
 
 	saved, err := query.UpsertServiceRepo(db.SQL, project, query.UpsertServiceRepoRequest{

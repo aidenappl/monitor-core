@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/scope"
 	"github.com/aidenappl/monitor-core/structs"
@@ -242,7 +243,7 @@ func TestAggQueryScopesWhenContextCarriesAProject(t *testing.T) {
 	// Order is the whole reason the predicate is appended before the filter loop:
 	// these are positional placeholders, so from, to, project is the only vector
 	// that lines up with the text.
-	want := []interface{}{time.Unix(0, 0), time.Unix(60, 0), "atlas"}
+	want := []interface{}{db.Millis(time.Unix(0, 0)), db.Millis(time.Unix(60, 0)), "atlas"}
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("args = %v, want %v", args, want)
 	}
@@ -302,7 +303,7 @@ func TestTimerAndTestEndpointBuildTheSameStatement(t *testing.T) {
 	if !strings.Contains(timerSQL, "timestamp >= ? AND timestamp < ?") {
 		t.Errorf("the window is not half-open [from, to):\n\t%s", timerSQL)
 	}
-	want := []interface{}{from, to, "atlas", "atlas-api"}
+	want := []interface{}{db.Millis(from), db.Millis(to), "atlas", "atlas-api"}
 	if !reflect.DeepEqual(timerArgs, want) {
 		t.Errorf("args = %v, want %v", timerArgs, want)
 	}
@@ -356,7 +357,7 @@ func TestAggQueryBindsFiltersAfterTheProject(t *testing.T) {
 		t.Errorf("project predicate appears after the rule's filter; the bound args no longer line up:\n\t%s", sql)
 	}
 
-	want := []interface{}{time.Unix(0, 0), time.Unix(60, 0), "atlas", "atlas-api"}
+	want := []interface{}{db.Millis(time.Unix(0, 0)), db.Millis(time.Unix(60, 0)), "atlas", "atlas-api"}
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("args = %v, want %v", args, want)
 	}

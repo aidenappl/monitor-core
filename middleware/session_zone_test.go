@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"testing"
+	"time"
 
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/jwt"
@@ -31,7 +32,7 @@ func withRole(t *testing.T, role env.Role) {
 func TestZoneBuildsUserFromAccessTokenClaims(t *testing.T) {
 	withRole(t, env.RoleZone)
 
-	token, _, err := jwt.NewAccessToken(42, "editor", "")
+	token, _, err := jwt.NewAccessToken(42, "editor", "", time.Time{})
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -59,7 +60,7 @@ func TestZoneRoleAbsentFailsClosed(t *testing.T) {
 	// A token minted before Claims.Role existed. It must still authenticate —
 	// otherwise deploying this change logs every live session out — but it must
 	// not carry privilege it never asserted.
-	token, _, err := jwt.NewAccessToken(7, "", "")
+	token, _, err := jwt.NewAccessToken(7, "", "", time.Time{})
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -79,7 +80,7 @@ func TestZoneRejectsRefreshTokenAsAccess(t *testing.T) {
 	// The zone trusts a signature, so the type pin is what stops a 7-day refresh
 	// token being spent as a 15-minute access token — which would extend the
 	// revocation gap this design accepts from minutes to a week.
-	refresh, _, err := jwt.NewRefreshToken(42)
+	refresh, _, err := jwt.NewRefreshToken(42, time.Time{})
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}

@@ -30,6 +30,9 @@ var notificationChannelColumns = []string{
 	"monitor.notification_channels.config",
 	"monitor.notification_channels.config_enc",
 	"monitor.notification_channels.created_at",
+	"monitor.notification_channels.last_test_at",
+	"monitor.notification_channels.last_test_ok",
+	"monitor.notification_channels.last_test_error",
 }
 
 type notificationChannelScanner interface {
@@ -54,9 +57,22 @@ func scanNotificationChannel(row notificationChannelScanner) (*structs.Notificat
 	var c structs.NotificationChannel
 	var legacy sql.NullString
 	var encrypted sql.NullString
+	var testAt sql.NullTime
+	var testOK sql.NullBool
+	var testErr sql.NullString
 
-	if err := row.Scan(&c.ID, &c.Project, &c.Name, &c.Type, &legacy, &encrypted, &c.CreatedAt); err != nil {
+	if err := row.Scan(&c.ID, &c.Project, &c.Name, &c.Type, &legacy, &encrypted, &c.CreatedAt,
+		&testAt, &testOK, &testErr); err != nil {
 		return nil, err
+	}
+	if testAt.Valid {
+		c.LastTestAt = &testAt.Time
+	}
+	if testOK.Valid {
+		c.LastTestOK = &testOK.Bool
+	}
+	if testErr.Valid {
+		c.LastTestError = &testErr.String
 	}
 
 	switch {
@@ -215,6 +231,35 @@ func GetNotificationChannel(engine db.Queryable, project, id string) (*structs.N
 		return nil, fmt.Errorf("failed to scan notification channel: %w", err)
 	}
 	return ch, nil
+}
+
+// RecordNotificationChannelTest stores the outcome of a channel test
+// (migration 138). reason is cleared on success. Scoped like every other
+// mutation here: the project is in the UPDATE's own WHERE.
+//
+// reason must already be safe to serve — alerts.DeliveryReason's output — since
+// the list endpoint returns it to every reader of the project.
+func RecordNotificationChannelTest(engine db.Queryable, project, id string, ok bool, reason string, at time.Time) error {
+	if project == "" {
+		return ErrNoAlertingProject
+	}
+	var errText any
+	if !ok {
+		errText = reason
+	}
+	qStr, args, err := sq.Update(notificationChannelsTable).
+		Set("last_test_at", at).
+		Set("last_test_ok", ok).
+		Set("last_test_error", errText).
+		Where(sq.Eq{"id": id, "project": project}).
+		ToSql()
+	if err != nil {
+		return fmt.Errorf("failed to build sql query: %w", err)
+	}
+	if _, err := engine.Exec(qStr, args...); err != nil {
+		return fmt.Errorf("failed to record notification channel test: %w", err)
+	}
+	return nil
 }
 
 // DeleteNotificationChannel removes one channel and reports whether it existed.

@@ -140,7 +140,8 @@ func TestUpdateAlertRuleLeavesUpdatedAtToTheColumn(t *testing.T) {
 // Go-side maps survived the move: this produces a 400 naming the field, while the
 // column produces errno 1265 ("Data truncated for column 'condition'") and a 500.
 func TestCreateAlertRuleRejectsBadInputBeforeSQL(t *testing.T) {
-	base := CreateAlertRuleRequest{Name: "spike", Type: "threshold", Condition: "gt"}
+	zero := 0.0
+	base := CreateAlertRuleRequest{Name: "spike", Type: "threshold", Condition: "gt", Threshold: &zero}
 
 	tests := []struct {
 		name    string
@@ -155,6 +156,15 @@ func TestCreateAlertRuleRejectsBadInputBeforeSQL(t *testing.T) {
 		{"unknown metric", func(r *CreateAlertRuleRequest) { r.Metric = "median" }, "invalid metric"},
 		{"malformed query_filters", func(r *CreateAlertRuleRequest) { r.QueryFilters = "not json" }, "query_filters must be valid JSON"},
 		{"malformed channel ids", func(r *CreateAlertRuleRequest) { r.NotificationChannelIDs = "{" }, "notification_channel_ids must be valid JSON"},
+		// ALERTS-08: a missing threshold used to save as 0 and fire on one event.
+		{"missing threshold", func(r *CreateAlertRuleRequest) { r.Threshold = nil }, "threshold is required"},
+		{"missing threshold rate_change", func(r *CreateAlertRuleRequest) { r.Threshold = nil; r.Type = "rate_change" }, "threshold is required"},
+		{"interval over range", func(r *CreateAlertRuleRequest) { r.EvaluationIntervalSecs = MAX_EVALUATION_INTERVAL_SECONDS + 1 },
+			"evaluation_interval_seconds must be a whole number of seconds between 0 and 86400"},
+		{"for over range", func(r *CreateAlertRuleRequest) { r.ForSeconds = MAX_FOR_SECONDS + 1 },
+			"for_seconds must be a whole number of seconds between 0 and 86400"},
+		{"cooldown over range", func(r *CreateAlertRuleRequest) { r.CooldownSeconds = MAX_COOLDOWN_SECONDS + 1 },
+			"cooldown_seconds must be a whole number of seconds between 0 and 604800"},
 	}
 
 	for _, tt := range tests {
@@ -193,8 +203,9 @@ func TestCreateAlertRuleAppliesDefaults(t *testing.T) {
 
 	mock.ExpectExec("INSERT INTO monitor.alert_rules").WillReturnResult(sqlmock.NewResult(0, 1))
 
+	zero := 0.0
 	rule, err := CreateAlertRule(mockDB, "atlas", CreateAlertRuleRequest{
-		Name: "spike", Type: "threshold", Condition: "gt", Priority: "P9",
+		Name: "spike", Type: "threshold", Condition: "gt", Priority: "P9", Threshold: &zero,
 	})
 	if err != nil {
 		t.Fatalf("CreateAlertRule: %v", err)
@@ -416,8 +427,9 @@ func TestAlertRuleMutationsCarryTheProjectThemselves(t *testing.T) {
 				sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
+		zero := 0.0
 		rule, err := CreateAlertRule(mockDB, "atlas", CreateAlertRuleRequest{
-			Name: "spike", Type: "threshold", Condition: "gt",
+			Name: "spike", Type: "threshold", Condition: "gt", Threshold: &zero,
 		})
 		if err != nil {
 			t.Fatalf("CreateAlertRule: %v", err)
@@ -515,5 +527,74 @@ func TestAlertingBuildersRefuseAnEmptyProject(t *testing.T) {
 				t.Errorf("a statement reached the database before the guard: %v", err)
 			}
 		})
+	}
+}
+
+// TestUpdateAlertRuleRefusesOutOfRangeAndClearedThreshold (ALERTS-08). Only the
+// existing-row read is expected: a refused update must issue no UPDATE.
+func TestUpdateAlertRuleRefusesOutOfRangeAndClearedThreshold(t *testing.T) {
+	over := uint32(MAX_COOLDOWN_SECONDS + 1)
+	absence := "absence"
+	tests := []struct {
+		name    string
+		req     UpdateAlertRuleRequest
+		wantMsg string
+	}{
+		{"cooldown over range", UpdateAlertRuleRequest{CooldownSeconds: &over}, "cooldown_seconds must be a whole number of seconds between 0 and 604800"},
+		{"cleared threshold on a threshold rule", UpdateAlertRuleRequest{ClearThreshold: true}, "threshold is required"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockDB, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock.New: %v", err)
+			}
+			defer mockDB.Close()
+			mock.ExpectQuery("SELECT .* FROM monitor.alert_rules WHERE").WillReturnRows(alertRuleRows())
+
+			_, err = UpdateAlertRule(mockDB, "atlas", "r-1", tt.req)
+			if err == nil || !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Fatalf("err = %v, want %q", err, tt.wantMsg)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+
+	// Switching the rule to absence makes a cleared threshold irrelevant: the
+	// type change is written and the threshold column is left alone.
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+	mock.ExpectQuery("SELECT .* FROM monitor.alert_rules WHERE").WillReturnRows(alertRuleRows())
+	mock.ExpectExec("^UPDATE monitor.alert_rules SET type = \\? WHERE id = \\? AND project = \\?$").
+		WithArgs("absence", "r-1", "atlas").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT .* FROM monitor.alert_rules WHERE").WillReturnRows(alertRuleRows())
+	if _, err := UpdateAlertRule(mockDB, "atlas", "r-1", UpdateAlertRuleRequest{Type: &absence, ClearThreshold: true}); err != nil {
+		t.Fatalf("UpdateAlertRule: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestCreateAbsenceRuleNeedsNoThreshold: absence rules ignore the threshold, so
+// omitting it still creates the rule (with 0, as before).
+func TestCreateAbsenceRuleNeedsNoThreshold(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+	mock.ExpectExec("INSERT INTO monitor.alert_rules").WillReturnResult(sqlmock.NewResult(0, 1))
+	rule, err := CreateAlertRule(mockDB, "atlas", CreateAlertRuleRequest{Name: "silent", Type: "absence", Condition: "lt"})
+	if err != nil {
+		t.Fatalf("CreateAlertRule: %v", err)
+	}
+	if rule.Threshold != 0 {
+		t.Errorf("Threshold = %v, want 0", rule.Threshold)
 	}
 }

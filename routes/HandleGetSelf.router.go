@@ -3,6 +3,7 @@ package routes
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/middleware"
@@ -69,11 +70,6 @@ func HandleUpdateSelf(w http.ResponseWriter, r *http.Request) {
 			responder.Error(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		hash, err := tools.HashPassword(*body.Password)
-		if err != nil {
-			responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to hash password", err)
-			return
-		}
 		existing, err := query.GetIdentityByUserAndProvider(db.SQL, user.ID, "password")
 		if err != nil {
 			responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to load password identity", err)
@@ -86,6 +82,23 @@ func HandleUpdateSelf(w http.ResponseWriter, r *http.Request) {
 				responder.Error(w, http.StatusUnauthorized, "current password is incorrect")
 				return
 			}
+		} else if !recentlyAuthenticated(r, user.ID, time.Now()) {
+			// ADDING a password to an SSO-only account has no current password
+			// to check, so it requires a recent sign-in instead (ACCOUNT-01,
+			// routes/reauth.go): a stolen session must not be convertible into a
+			// credential that survives revoking the SSO grant. monitor-web
+			// routes error_code 4011 to an SSO sign-in with prompt=login.
+			// Left a warning, not an expected client error: usually the step-up
+			// prompt, but it is also exactly what a hijacked session looks like.
+			responder.ErrorWithCode(w, http.StatusForbidden, "reauth_required", ERROR_CODE_REAUTH_REQUIRED)
+			return
+		}
+		hash, err := tools.HashPassword(*body.Password)
+		if err != nil {
+			responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to hash password", err)
+			return
+		}
+		if existing != nil {
 			if err := query.UpdateIdentityPassword(db.SQL, existing.ID, hash); err != nil {
 				responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to update password", err)
 				return

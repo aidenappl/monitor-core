@@ -588,10 +588,18 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 		limit = 500
 	}
 
+	// before pages past the newest 500: the client passes the oldest timestamp
+	// it already holds and gets the occurrences strictly older than it.
+	before, err := parseIssueEventsBefore(r.URL.Query().Get("before"))
+	if err != nil {
+		responder.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	// Fast path: events ingested since 004_events_issue_id.sql carry the issue id
 	// on the row, so membership is an indexed equality match — exact, and not
 	// bounded by any scan window.
-	events, err := queryEventsByIssueID(r.Context(), issue.ID, limit)
+	events, err := queryEventsByIssueID(r.Context(), issue.ID, limit, before)
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to query events", err)
 		return
@@ -628,16 +636,23 @@ func HandleGetIssueEvents(w http.ResponseWriter, r *http.Request) {
 	// It is also bounded to timestamp < legacyIssueScanCutoff, so partition
 	// pruning skips every day written after stamping began and the scan reads
 	// next to nothing (see the constant for how the cutoff was chosen).
+	//
+	// A `before` earlier than the cutoff replaces it, which is the same strict
+	// bound the fast path applies.
+	cutoff := legacyIssueScanCutoff
+	if !before.IsZero() && before.Before(cutoff) {
+		cutoff = before
+	}
 	var query string
 	var args []interface{}
 	if issue.Path != nil && *issue.Path != "" {
 		query, args, err = selectIssueEvents(r.Context(),
 			"issue_id = '' AND timestamp < ? AND service = ? AND name = ? AND level IN ('error', 'fatal') AND (JSONExtractString(data, 'path') = ? OR JSONExtractString(data, 'uri') = ?) ORDER BY timestamp DESC LIMIT ?",
-			legacyIssueScanCutoff, issue.Service, issue.Name, *issue.Path, *issue.Path, candidateScanLimit(limit))
+			cutoff, issue.Service, issue.Name, *issue.Path, *issue.Path, candidateScanLimit(limit))
 	} else {
 		query, args, err = selectIssueEvents(r.Context(),
 			"issue_id = '' AND timestamp < ? AND service = ? AND name = ? AND level IN ('error', 'fatal') ORDER BY timestamp DESC LIMIT ?",
-			legacyIssueScanCutoff, issue.Service, issue.Name, candidateScanLimit(limit))
+			cutoff, issue.Service, issue.Name, candidateScanLimit(limit))
 	}
 	if err != nil {
 		responder.ErrorWithCause(w, http.StatusInternalServerError, "failed to build event query", err)
@@ -758,19 +773,46 @@ func selectIssueEventColumns(ctx context.Context, columns, where string, args ..
 // inner read would let another project's rows under a legacy id set the
 // boundary. The args follow the placeholders: project, issue id, then the inner
 // read's project, issue id and limit, then the outer limit.
-func issueEventsByIDQuery(ctx context.Context, issueID string, limit int) (string, []interface{}, error) {
-	inner, innerArgs, err := selectIssueEventColumns(ctx, "timestamp", "issue_id = ? ORDER BY timestamp DESC LIMIT ?", issueID, limit)
+//
+// A non-zero before adds `timestamp < ?` to both phases (after the issue id in
+// each), so the page is the newest `limit` occurrences strictly older than it.
+// The inner phase needs it to choose the right rows; the outer one needs it
+// because the min() boundary alone would let newer rows back in.
+func issueEventsByIDQuery(ctx context.Context, issueID string, limit int, before time.Time) (string, []interface{}, error) {
+	cond := "issue_id = ?"
+	condArgs := []interface{}{issueID}
+	if !before.IsZero() {
+		cond += " AND timestamp < ?"
+		condArgs = append(condArgs, db.Millis(before))
+	}
+
+	inner, innerArgs, err := selectIssueEventColumns(ctx, "timestamp", cond+" ORDER BY timestamp DESC LIMIT ?", append(append([]interface{}{}, condArgs...), limit)...)
 	if err != nil {
 		return "", nil, err
 	}
 
-	args := make([]interface{}, 0, len(innerArgs)+2)
-	args = append(args, issueID)
+	args := make([]interface{}, 0, len(condArgs)+len(innerArgs)+1)
+	args = append(args, condArgs...)
 	args = append(args, innerArgs...)
 	args = append(args, limit)
 	return selectIssueEvents(ctx,
-		"issue_id = ? AND timestamp >= (SELECT min(timestamp) FROM ("+inner+")) ORDER BY timestamp DESC LIMIT ?",
+		cond+" AND timestamp >= (SELECT min(timestamp) FROM ("+inner+")) ORDER BY timestamp DESC LIMIT ?",
 		args...)
+}
+
+// parseIssueEventsBefore reads GET /v1/issues/{id}/events' `before` cursor: an
+// RFC 3339 timestamp (fractional seconds allowed). Empty means no cursor and
+// returns the zero time; anything unparseable is an error naming the parameter.
+func parseIssueEventsBefore(raw string) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("before must be an RFC 3339 timestamp, e.g. 2026-10-16T12:00:00Z")
+	}
+	return t.UTC(), nil
 }
 
 // queryEventsByIssueID returns an issue's events by indexed equality on the
@@ -787,8 +829,8 @@ func issueEventsByIDQuery(ctx context.Context, issueID string, limit int) (strin
 // and why it keeps doing so after those rows age out: an id travels into
 // monitor-web URLs, alert payloads and comments, so it is a value a caller can
 // hold without being entitled to what it selects.
-func queryEventsByIssueID(ctx context.Context, issueID string, limit int) ([]*structs.Event, error) {
-	query, args, err := issueEventsByIDQuery(ctx, issueID, limit)
+func queryEventsByIssueID(ctx context.Context, issueID string, limit int, before time.Time) ([]*structs.Event, error) {
+	query, args, err := issueEventsByIDQuery(ctx, issueID, limit, before)
 	if err != nil {
 		return nil, err
 	}

@@ -74,7 +74,7 @@ func TestJSONValidationAppliesOnlyToServerParsedColumns(t *testing.T) {
 		defer mockDB.Close()
 
 		mock.ExpectExec("INSERT INTO monitor.dashboards").
-			WithArgs(sqlmock.AnyArg(), "default", "Overview", "", "", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WithArgs(sqlmock.AnyArg(), "default", "Overview", "", "", 1, sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		d, err := CreateDashboard(mockDB, "default", CreateDashboardRequest{Name: "Overview"})
@@ -182,7 +182,8 @@ func TestListsReturnEmptySlicesNotNil(t *testing.T) {
 	defer mockDB.Close()
 
 	mock.ExpectQuery("FROM monitor.notification_channels").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "project", "name", "type", "config", "config_enc", "created_at"}))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "project", "name", "type", "config", "config_enc", "created_at",
+			"last_test_at", "last_test_ok", "last_test_error"}))
 	channels, err := ListNotificationChannels(mockDB, "default")
 	if err != nil {
 		t.Fatalf("ListNotificationChannels: %v", err)

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"time"
 
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/query"
@@ -20,7 +21,12 @@ import (
 // scratch — SSO callback (Phase 3) and native login/register (Phase 3.5). The
 // rotating-refresh flow (HandleRefresh) does NOT use this; it mints successors
 // inside its own rotation transaction.
-func issueSession(w http.ResponseWriter, userID int64, role string) error {
+//
+// authTime is when the user actually authenticated (jwt.Claims.AuthTime): now
+// for a password login, the IdP's auth_time for an SSO callback, and zero when
+// the new family is not backed by a sign-in at all (a family re-minted from a
+// live SSO session) — zero is never "recent", so it cannot pass a step-up.
+func issueSession(w http.ResponseWriter, userID int64, role string, authTime time.Time) error {
 	// The family is generated FIRST so the access token can carry it (fid) —
 	// that is what lets logout revoke this session rather than all of them.
 	family := make([]byte, 16)
@@ -28,7 +34,7 @@ func issueSession(w http.ResponseWriter, userID int64, role string) error {
 		return err
 	}
 
-	rawRefresh, refreshExpiry, err := setTokenCookies(w, userID, role, hex.EncodeToString(family))
+	rawRefresh, refreshExpiry, err := setTokenCookies(w, userID, role, hex.EncodeToString(family), authTime)
 	if err != nil {
 		return err
 	}

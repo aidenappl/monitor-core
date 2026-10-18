@@ -188,6 +188,17 @@ func buildFilterClause(filters []structs.QueryFilter) (string, []interface{}, er
 func buildSingleFilter(f structs.QueryFilter) (string, []interface{}, error) {
 	var fieldExpr string
 
+	// An `in` value is normalised once, here, for both the data.* and the
+	// column path: a comma-separated string becomes a list, anything else that
+	// is not a list is a 400-class ErrInvalidFilterValue naming the field.
+	if f.Operator == "in" {
+		values, err := structs.InValues(f.Field, f.Value)
+		if err != nil {
+			return "", nil, err
+		}
+		f.Value = values
+	}
+
 	if strings.HasPrefix(f.Field, "data.") {
 		key := strings.TrimPrefix(f.Field, "data.")
 		if !structs.SafeIdentifierRegex.MatchString(key) {
@@ -198,7 +209,7 @@ func buildSingleFilter(f structs.QueryFilter) (string, []interface{}, error) {
 		// Comparing a number against the String extract is ClickHouse 386.
 		cf := f
 		if f.Operator == "in" {
-			values, err := structs.InValues(f.Value)
+			values, err := structs.InValues(f.Field, f.Value)
 			if err != nil {
 				return "", nil, err
 			}
@@ -265,7 +276,7 @@ func buildComparison(fieldExpr string, f structs.QueryFilter) (string, []interfa
 	case "endswith":
 		return fmt.Sprintf("%s LIKE ?", fieldExpr), []interface{}{fmt.Sprintf("%%%v", f.Value)}, nil
 	case "in":
-		values, err := structs.InValues(f.Value)
+		values, err := structs.InValues(f.Field, f.Value)
 		if err != nil {
 			return "", nil, err
 		}
@@ -306,11 +317,11 @@ func buildEventWhere(ctx context.Context, from, to time.Time, filters []structs.
 
 	if !from.IsZero() {
 		whereParts = append(whereParts, "timestamp >= ?")
-		args = append(args, from)
+		args = append(args, db.Millis(from))
 	}
 	if !to.IsZero() {
 		whereParts = append(whereParts, "timestamp <= ?")
-		args = append(args, to)
+		args = append(args, db.Millis(to))
 	}
 
 	if len(filters) > 0 {

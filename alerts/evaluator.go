@@ -898,7 +898,7 @@ func buildAggQuery(ctx context.Context, rule *structs.AlertRule, aggExpr string,
 	}
 
 	sql := fmt.Sprintf("SELECT %s AS value FROM %s.events WHERE timestamp >= ? AND timestamp < ?", aggExpr, db.Database)
-	args := []interface{}{from, to}
+	args := []interface{}{db.Millis(from), db.Millis(to)}
 
 	// UNCONDITIONAL. There used to be an `errors.Is(err, scope.ErrNoProject)`
 	// arm here that swallowed the error and continued zone-wide, because the
@@ -1056,7 +1056,7 @@ func buildFilterCondition(f structs.QueryFilter) (string, []interface{}, error) 
 		if f.Operator == "in" {
 			// Same rule as services/analytics.go: numeric when every value is
 			// a number, text otherwise.
-			values, err := structs.InValues(f.Value)
+			values, err := structs.InValues(f.Field, f.Value)
 			if err != nil {
 				return "", nil, err
 			}
@@ -1111,7 +1111,7 @@ func buildFilterCondition(f structs.QueryFilter) (string, []interface{}, error) 
 	case "endswith":
 		return fmt.Sprintf("%s LIKE ?", fieldExpr), []interface{}{fmt.Sprintf("%%%v", f.Value)}, nil
 	case "in":
-		values, err := structs.InValues(f.Value)
+		values, err := structs.InValues(f.Field, f.Value)
 		if err != nil {
 			return "", nil, err
 		}
