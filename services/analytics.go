@@ -209,7 +209,11 @@ func buildSingleFilter(f structs.QueryFilter) (string, []interface{}, error) {
 		// Comparing a number against the String extract is ClickHouse 386.
 		cf := f
 		if f.Operator == "in" {
-			args, numeric := structs.DataInOperands(f.Value.([]interface{}))
+			values, err := structs.InValues(f.Field, f.Value)
+			if err != nil {
+				return "", nil, err
+			}
+			args, numeric := structs.DataInOperands(values)
 			fieldExpr = dataStringExpr(key)
 			if numeric {
 				fieldExpr = dataNumberExpr(key)
@@ -272,23 +276,15 @@ func buildComparison(fieldExpr string, f structs.QueryFilter) (string, []interfa
 	case "endswith":
 		return fmt.Sprintf("%s LIKE ?", fieldExpr), []interface{}{fmt.Sprintf("%%%v", f.Value)}, nil
 	case "in":
-		if values, ok := f.Value.([]interface{}); ok {
-			placeholders := make([]string, len(values))
-			for i := range values {
-				placeholders[i] = "?"
-			}
-			return fmt.Sprintf("%s IN (%s)", fieldExpr, strings.Join(placeholders, ", ")), values, nil
+		values, err := structs.InValues(f.Field, f.Value)
+		if err != nil {
+			return "", nil, err
 		}
-		if values, ok := f.Value.([]string); ok {
-			placeholders := make([]string, len(values))
-			args := make([]interface{}, len(values))
-			for i, v := range values {
-				placeholders[i] = "?"
-				args[i] = v
-			}
-			return fmt.Sprintf("%s IN (%s)", fieldExpr, strings.Join(placeholders, ", ")), args, nil
+		placeholders := make([]string, len(values))
+		for i := range values {
+			placeholders[i] = "?"
 		}
-		return "", nil, fmt.Errorf("in operator requires array value")
+		return fmt.Sprintf("%s IN (%s)", fieldExpr, strings.Join(placeholders, ", ")), values, nil
 	default:
 		return "", nil, fmt.Errorf("unsupported operator: %s", f.Operator)
 	}

@@ -86,6 +86,11 @@ func TestBuildSingleFilterSQL(t *testing.T) {
 			"name IN (?, ?)", []any{"a", "b"}},
 		{"data in comma string", structs.QueryFilter{Field: "data.latency_ms", Operator: "in", Value: "a,b"},
 			wantGuardedString + " IN (?, ?)", []any{"a", "b"}},
+		// A lone scalar was a 500 ("in operator requires array value").
+		{"column in scalar", structs.QueryFilter{Field: "service", Operator: "in", Value: "api"},
+			"service IN (?)", []any{"api"}},
+		{"data in scalar", structs.QueryFilter{Field: "data.latency_ms", Operator: "in", Value: "a"},
+			wantGuardedString + " IN (?)", []any{"a"}},
 	}
 
 	for _, tt := range tests {
@@ -112,9 +117,10 @@ func TestBuildSingleFilterSQL(t *testing.T) {
 	if _, _, err := buildSingleFilter(structs.QueryFilter{Field: "data.latency_ms", Operator: "bogus", Value: "v"}); err == nil {
 		t.Error("an unsupported operator was accepted")
 	}
-	// An `in` value that is not a list must be the 400-class sentinel, naming
-	// the field, so the analytics routes answer 400 rather than 500.
-	for _, bad := range []any{float64(5), " , ", []any{}, map[string]any{"a": 1}, nil} {
+	// An `in` value with nothing in it must be the 400-class sentinel, naming
+	// the field, so the analytics routes answer 400 rather than 500. (A lone
+	// scalar is a one-element list — see structs.InValues.)
+	for _, bad := range []any{" , ", []any{}, map[string]any{"a": 1}, nil} {
 		_, _, err := buildSingleFilter(structs.QueryFilter{Field: "name", Operator: "in", Value: bad})
 		if !errors.Is(err, structs.ErrInvalidFilterValue) || !strings.Contains(err.Error(), "name") {
 			t.Errorf("in %#v: err = %v, want ErrInvalidFilterValue naming the field", bad, err)

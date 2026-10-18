@@ -83,7 +83,8 @@ func TestInValues(t *testing.T) {
 		{"array", []any{"a", float64(5)}, []any{"a", float64(5)}},
 		{"string slice", []string{"a", "b"}, []any{"a", "b"}},
 		{"comma string trimmed", " a , b ,, c ", []any{"a", "b", "c"}},
-		{"single value", "a", []any{"a"}},
+		{"scalar string", "a", []any{"a"}},
+		{"scalar number", float64(5), []any{float64(5)}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -94,7 +95,7 @@ func TestInValues(t *testing.T) {
 		})
 	}
 
-	for _, bad := range []any{nil, float64(5), true, "", " , ", []any{}, []string{}, map[string]any{}} {
+	for _, bad := range []any{nil, "", " , ", []any{}, []string{}, map[string]any{}} {
 		if _, err := InValues("data.code", bad); !errors.Is(err, ErrInvalidFilterValue) {
 			t.Errorf("InValues(%#v) err = %v, want ErrInvalidFilterValue", bad, err)
 		} else if !strings.Contains(err.Error(), "data.code") {

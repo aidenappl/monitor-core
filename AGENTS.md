@@ -319,7 +319,7 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
     subscribing.
   - **The tophat-remediation contracts** (2026-10-16), each a 400/409/4011 that monitor-web
     codes against: `services/analytics_test.go` + `structs/datafilter_test.go` (`in` takes a
-    comma string, any other non-list is the 400 sentinel naming the field);
+    comma string or a lone scalar; nil, a map or an empty list is the 400 sentinel naming the field);
     `apikeys/name_test.go` (255-character name rule); `github/validate_test.go` +
     `routes/service_repos_validate_test.go` (owner/repo/branch, refused before any write);
     `query/alert_rules_query_test.go` + `routes/alerts_decode_test.go` (seconds ranges,
@@ -396,13 +396,23 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
   extract (`dataRawExpr` / `guardedDataRaw`); `lt/gt/lte/gte` are always numeric and parse a
   numeric string, and reject anything else with `structs.ErrInvalidFilterValue` — a **400**, never a 500 (analytics routes match its "invalid" text, event search checks `errors.Is` in `isFilterValidationError`). `in` is numeric only when every
   value is a number. An `in` value may be an array **or a comma-separated string** (split,
-  trimmed, empties dropped — `structs.InValues`, applied once in analytics' `buildSingleFilter`
-  for column and `data.*` filters alike); anything else, or a list that ends up empty, is
-  `ErrInvalidFilterValue` naming the field → **400**. Before this, monitor-web's `name in a,b`
+  trimmed, empties dropped — `structs.InValues`, see the next bullet); nil, a map, or a list
+  that ends up empty is `ErrInvalidFilterValue` naming the field → **400**. Before this, monitor-web's `name in a,b`
   500'd every analytics panel on the page. Before this, every filter compared its value against the String
   extract, so a numeric value was ClickHouse error 386 ("no supertype for String,
   UInt16") — and `JSONExtractString` returns `''` for a JSON number, so even the text
   `"500"` never matched a numeric field.
+- **An `in` filter's value goes through `structs.InValues`** at all three filter sites, for
+  columns and `data.*` alike: a JSON `[]any` or Go `[]string` is the list, a string is split
+  on commas (so `"x"` is `["x"]`), any other lone scalar is a one-element list, and `nil`, a
+  map, or a list that ends up empty is `ErrInvalidFilterValue` naming the field (400). It
+  takes the field as its first argument for that message. (#17 and #20 each wrote one half
+  of this; the merge kept both.) Before this,
+  each site had its own rule: analytics 500'd on a scalar, and event search silently
+  **dropped** an `in` filter that wasn't a `[]string` (a column) or had no case at all
+  (`data.*`), returning unfiltered results.
+- **API key names are at most `MAX_API_KEY_NAME_LENGTH` (255) characters**, checked in
+  `routes/api_keys.go` on create and rename to match `api_keys.name VARCHAR(255)`.
 - **ClickHouse SQL** is built with squirrel then run via the native driver. **All
   caller-controlled `data.*` field names MUST be validated** against
   `structs.SafeIdentifierRegex` before interpolation (`services/analytics.go`,
@@ -1618,11 +1628,13 @@ behind, in code *and* schema, with a green CI history above it.
 
 - A **Lattice deploy token is bound to ONE STACK**, and `?container=` only narrows within it.
   A Lattice **automation** is one webhook whose ordered steps can span stacks: *Redeploy
-  Monitor Core* (automation id 1) redeploys `appleby-core` (stack 32) and then `monitor-core`
-  (stack 30). Its webhook URL is the `LATTICE_DEPLOY_URL` repository secret — the workflow
+  Monitor Core* (automation id 1) redeploys `appleby-core` (stack 32), `hillview-core`
+  (stack 37) and then `monitor-core` (stack 30). Its webhook URL is the `LATTICE_DEPLOY_URL` repository secret — the workflow
   holds no hosts or URLs of its own — and `?commit=<sha>` is recorded on the run.
 - **The automation is the zone list.** Adding a zone is a new step on the automation; nothing
-  in this repo changes.
+  in this repo changes. Forgetting the step is silent: zone `hillview` launched without one
+  and stayed on the previous release while CI reported green, until 2026-10-17's
+  `GET /version` check across zones caught it. After any release, check every zone.
 - **HTTP 200 is not success.** The webhook is synchronous (a 50s run budget under Lattice's 60s
   write timeout), and a *disabled* automation answers **200** with `result: "disabled"` having
   run nothing. The `deploy` job therefore requires `data.result == "succeeded"` and prints each
