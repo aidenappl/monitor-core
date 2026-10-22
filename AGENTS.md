@@ -106,7 +106,7 @@ monitor-core/
   env/env.go               # Env config (getEnv/getEnvInt/getEnvDuration) + RequireProductionSecrets fail-fast guard
   env/role.go              # MON_ROLE: the Role type (app/zone/both), ParseRole, RunsControlPlane/RunsDataPlane, RequireValidRole
   db/
-    clickhouse.go          # ClickHouse connection (db.Connect/db.Close) + batch Writer + ValidateDatabaseName + the per-query max_memory_usage ceiling
+    clickhouse.go          # ClickHouse connection (db.Connect/db.Close): TWO pools — db.Conn (reads, 10 conns, 10s DialTimeout) and db.WriterConn (the batcher's, 2 conns; WriteBatch falls back to Conn when nil) — + batch Writer + ValidateDatabaseName + the per-query max_memory_usage ceiling
     observe.go             # The ClickHouse chokepoint: observedConn (every read/exec gets a query kind + slow-query warning) and QueryError/SQLError (quoted values elided from what reaches Monitor)
     sql.go                 # MariaDB connection (db.SQL), db.Queryable, db.RunMigrations (embeds db/migrations/*.sql)
     migrations/            # MariaDB DDL: identity + tenancy + issues + alert/dashboard config (100_users … 139_dashboards_version)
@@ -363,6 +363,14 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
   - `db/clickhouse_test.go`'s `TestEventInsertColumnsMatchRowOrder` — that
     `eventInsertColumns` and `eventInsertRow` stay paired position-for-position. Every event
     column is a string, so a transposition inserts cleanly and shows up only as wrong data.
+  - **The split ClickHouse pools** — `db/clickhouse_test.go`'s
+    `TestWriteBatchRoutesToTheWriterPool` (WriteBatch takes `db.WriterConn`, and falls back
+    to `db.Conn` when it is nil), `TestCloseClosesBothPools`, `TestPoolOptions` (the pools
+    differ only in sizing: reads 10/5 with a 10s `DialTimeout`, the writer 2/1 on the
+    driver's 30s default; no `max_memory_usage_for_user`) and
+    `TestConnectWriterFallsBackWhenTheWriterCannotConnect`; `routes/health_test.go`'s
+    `TestHealthReportsTheWriterPool` (`clickhouse_writer_ok` and `failing` on both probes).
+    A regression here is invisible until a dashboard burst starves ingest again.
   - `query/issues_query_test.go` — the issue upsert's bound-parameter count and that
     `project` is in the INSERT but **not** in the `ON DUPLICATE KEY UPDATE` set list: a
     project is part of an issue's identity, so a fold that could rewrite it would be a fold
@@ -463,9 +471,9 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
     service repos (`owner "…" must be …`, `default_branch must not contain spaces`), API keys
     (`name must be at most 255 characters`), channel tests (`url is required`).
   - Three endpoints bypass `responder`: `GET /health`
-    (`{status,enqueued,dropped,pending,clickhouse_ok,mariadb_ok,last_flush_at,role,zone,alerting_ok,telemetry}`
+    (`{status,enqueued,dropped,pending,clickhouse_ok,clickhouse_writer_ok,mariadb_ok,last_flush_at,role,zone,alerting_ok,telemetry}`
     — `telemetry` is the self-telemetry shipper's own counters, §6),
-    `GET /ready` (`{status,clickhouse_ok,mariadb_ok,role[,failing]}`) and `POST /v1/events`
+    `GET /ready` (`{status,clickhouse_ok,clickhouse_writer_ok,mariadb_ok,role[,failing]}`) and `POST /v1/events`
     (`{accepted:<int>}`). Ingest errors are plain text.
   - **`/health` is liveness, `/ready` is readiness — do not merge them.** `/health` always
     returns **200**, even with both stores dead, because the container HEALTHCHECK points at
@@ -480,16 +488,21 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
     configured to do. `clickhouse_ok` still reports `false` there — it is the true answer —
     which is why `role` is on this response too. The condition is written as "unless the
     role is exactly `app`" so it fails **closed**: any other value keeps ClickHouse
-    required. Both ping with a 2s timeout
+    required. **The batcher's writer pool (`db.WriterConn`) counts wherever ClickHouse
+    does**, reported as `clickhouse_writer_ok` and named `clickhouse_writer` in `failing`:
+    reads answering while the writer does not is a replica that accepts events only to
+    drop them. With no dedicated writer the flag mirrors `clickhouse_ok` (WriteBatch then
+    uses the read pool) and that pool is not pinged twice — so a ClickHouse outage names
+    both. Every store is pinged with a 2s timeout
     (`routes.DEPENDENCY_PING_TIMEOUT`), concurrently, so a total outage costs one timeout.
     The first four `/health` keys are frozen — monitor-web's transport and the container
     healthcheck read that exact shape; extend it additively.
   - **Both probes are memoised for 5s (`routes.DEPENDENCY_PING_TTL`), and must stay that
     way.** `/health` and `/ready` sit on the root router ahead of every auth middleware and
     nothing in the stack rate-limits, so an unmemoised ping would take one connection from
-    the ClickHouse pool (`MaxOpenConns=10`, shared with the batcher's write path) and one
-    from MariaDB on *every* request — letting anyone who can reach the port starve
-    ingestion by polling a liveness endpoint. The TTL sits well under the container
+    each ClickHouse pool and one from MariaDB on *every* request — and the batcher's writer
+    pool holds only **two** — letting anyone who can reach the port starve ingestion by
+    polling a liveness endpoint. The TTL sits well under the container
     HEALTHCHECK's 30s interval, so the memo never costs an orchestrator freshness. Before
     the first probe returns, both stores report **down**: a readiness probe answering 200
     because it has not looked yet is the one wrong answer it can give.
@@ -1831,6 +1844,8 @@ go-monitor / monitor-js SDK
       then services.Queue.Enqueue (only Enqueue==true counts toward `accepted`)
   → services.Batcher (goroutine) flushes on BATCH_SIZE or FLUSH_INTERVAL
   → db.Writer batch-inserts into ClickHouse <CLICKHOUSE_DATABASE>.events
+      through its own 2-connection pool, db.WriterConn (db.Conn if that is nil),
+      so dashboard reads cannot hold the connections a flush needs
       (5 retries, then the batch is abandoned — and counted into `dropped`)
   → (in parallel) publishes to the SSE hub + issues.TrackError for error/fatal
 ```
@@ -2087,7 +2102,8 @@ past-tense verb (`issue.created`, `alert.fired`).
 | `preflight.check.failed` / `.warned` / `.noted` | warn / warn / info | each preflight finding while serving | check, detail, remedy |
 | `config.preflight.failed`, `config.role.invalid`, `config.zone.unset`, `config.ingest_key.missing`, `config.secrets.insecure` | fatal | refused boot (reported, flushed, exit 1) | reason, message, error, failed_checks |
 | `clickhouse.connect.retrying`, `mariadb.connect.retrying`, `clickhouse.schema.probe.retrying` | warn | a boot connect/probe attempt failed | attempt, max_attempts, stage, outcome |
-| `clickhouse.connect.succeeded`, `mariadb.connect.succeeded` | info | connected | addr, database, attempts |
+| `clickhouse.connect.succeeded`, `mariadb.connect.succeeded` | info | connected | addr, database, attempts; ClickHouse adds writer_pool (`dedicated` / `shared`) |
+| `clickhouse.writer.connect.failed` | warn | the batcher's writer pool could not be opened or pinged at boot — batch writes share the read pool until restart | addr, database, stage, reason, outcome |
 | `clickhouse.migrations.applied`, `mariadb.migrations.applied` | info | migration runners finished | statements, files, database / applied |
 | `clickhouse.connect.failed`, `clickhouse.migrate.failed`, `clickhouse.schema.unreadable`, `mariadb.connect.failed`, `mariadb.schema.unusable`, `mariadb.migrate.failed`, `tenancy.bootstrap.failed`, `admin.bootstrap.failed`, `http.listen.failed` | fatal | a fail-fast boot step failed | reason, message, error, database / zone |
 | `keyring.inject.failed` | error | Keyring injection failed | error, outcome |
@@ -2406,7 +2422,7 @@ are listed in §4.
   | `HTTP_PORT` | `8080` | |
   | `MON_ROLE` | `both` | which plane this process runs: `app` (control), `zone` (data) or `both`. **Unset must stay `both`** — that is the deployed configuration and the default exists so a deploy of this feature changes nothing. Case and surrounding whitespace are normalised; anything else **refuses to boot** rather than falling back, because a typo that degraded to the default would run the control plane on a host meant to be a zone. Gates the ClickHouse connect, the bootstrap seeders, `sso.Install`, the ingest/alerting goroutines **and route registration** — see §6 *Roles* |
   | `CLICKHOUSE_ADDR` / `_DATABASE` / `_USERNAME` / `_PASSWORD` | `localhost:9000` / `monitor` / `default` / `` | events store. `_DATABASE` must match `^[a-z][a-z0-9_]{2,62}$` (`db.ValidateDatabaseName`) — it is interpolated into SQL, never bound, so a name outside that shape refuses to boot |
-  | `CLICKHOUSE_MAX_MEMORY_USAGE` | `2147483648` (2 GiB) | per-**query** memory ceiling in bytes, sent as the `max_memory_usage` setting. Sized for the ~8 GB host; ClickHouse's own default (10 GiB) exceeds the machine, so unset it is no limit and one high-cardinality `GROUP BY` OOM-kills the server and ingest with it. Over the limit, that single query fails with `MEMORY_LIMIT_EXCEEDED` and nothing else is affected |
+  | `CLICKHOUSE_MAX_MEMORY_USAGE` | `2147483648` (2 GiB) | per-**query** memory ceiling in bytes, sent as the `max_memory_usage` setting on both pools. Sized for the ~7.75 GiB hosts ClickHouse runs on (workers 8 and 9, stacks 32 and 30). ClickHouse 24.3's own per-query default is 0 (unlimited), so unset the only bound is `max_server_memory_usage` — 0.9 × the container's cgroup memory limit, or host RAM when it has none (today) — and one high-cardinality `GROUP BY` can take every query, the batcher's INSERT included, to `MEMORY_LIMIT_EXCEEDED`, or the shared host to the OOM killer. Over the limit, that single query fails and nothing else is affected. **Do not add `max_memory_usage_for_user`**: reads and the batcher share one ClickHouse user, so a per-user cap fails ingest during a dashboard burst |
   | `MONITOR_API_KEY` | *(required)* | env master ingest/query key (`X-Api-Key`); refuses to boot without it |
   | `MON_DB_DSN` | `monitor:monitor@tcp(127.0.0.1:3336)/monitor_auth` | MariaDB DSN; from Keyring in prod |
   | `MON_JWT_SIGNING_KEY` | *(dev default)* | HS512 session key; **prod must override** (else fail-fast) |

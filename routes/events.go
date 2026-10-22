@@ -78,7 +78,7 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	if Queue != nil {
 		enqueued, dropped, pending = Queue.Stats()
 	}
-	clickhouseOK, mariadbOK := cachedPingDependencies(r.Context())
+	deps := cachedPingDependencies(r.Context())
 
 	// interface{} so "never flushed" serialises as null rather than the zero
 	// time, which would read as a flush in year 1.
@@ -99,7 +99,7 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	// would turn a MariaDB blip into a restart loop. /ready is the endpoint that
 	// gets to be 503, because taking a replica out of rotation is recoverable
 	// and killing the process is not.
-	failing := failingDependencies(clickhouseOK, mariadbOK)
+	failing := failingDependencies(deps)
 	health := "ok"
 	if len(failing) > 0 {
 		health = "degraded"
@@ -117,10 +117,16 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 		"enqueued":      enqueued,
 		"dropped":       dropped,
 		"pending":       pending,
-		"clickhouse_ok": clickhouseOK,
-		"mariadb_ok":    mariadbOK,
-		"last_flush_at": lastFlushAt,
-		"role":          string(env.MonRole),
+		"clickhouse_ok": deps.clickhouseOK,
+		// Additive: the batcher's own ClickHouse pool (db.WriterConn), pinged
+		// beside the read pool. False with clickhouse_ok true is the state the
+		// split pools make visible — reads answer, ingest flushes cannot — and
+		// `failing` then names "clickhouse_writer". With no dedicated writer it
+		// mirrors clickhouse_ok, the pool the writes then use.
+		"clickhouse_writer_ok": deps.clickhouseWriterOK,
+		"mariadb_ok":           deps.mariadbOK,
+		"last_flush_at":        lastFlushAt,
+		"role":                 string(env.MonRole),
 		// `zone` is THIS PROCESS'S IDENTITY, and it is here so that a caller can
 		// tell "a monitor-core answered" apart from "the monitor-core I meant
 		// answered". Every zone runs this same binary and every one of them

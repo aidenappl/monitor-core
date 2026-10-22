@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/aidenappl/monitor-core/db"
 	"github.com/aidenappl/monitor-core/env"
 	"github.com/aidenappl/monitor-core/telemetry"
@@ -29,7 +30,7 @@ const DEPENDENCY_PING_TIMEOUT = 2 * time.Second
 // accept events only to shred them, and so a deploy that comes up without
 // ClickHouse is visibly not-ready instead of quietly lossy.
 func ReadyHandler(w http.ResponseWriter, r *http.Request) {
-	clickhouseOK, mariadbOK := cachedPingDependencies(r.Context())
+	deps := cachedPingDependencies(r.Context())
 
 	// Which stores count depends on the role, and why it fails closed, is
 	// documented on failingDependencies — shared with /health so the two cannot
@@ -40,15 +41,18 @@ func ReadyHandler(w http.ResponseWriter, r *http.Request) {
 	// ClickHouse from here. The `role` key beside it is what makes that readable
 	// rather than alarming — and is why it is reported here as well as on
 	// /health, which an operator chasing a 503 may not think to call.
-	failing := failingDependencies(clickhouseOK, mariadbOK)
+	failing := failingDependencies(deps)
 
 	status := http.StatusOK
 	body := map[string]interface{}{
 		"status":        "ready",
-		"clickhouse_ok": clickhouseOK,
-		"mariadb_ok":    mariadbOK,
-		"role":          string(env.MonRole),
-		"alerting_ok":   AlertingDisabledReason == "",
+		"clickhouse_ok": deps.clickhouseOK,
+		// Additive, beside clickhouse_ok for the same reason: `failing` can name
+		// "clickhouse_writer", and this is the flag that explains it.
+		"clickhouse_writer_ok": deps.clickhouseWriterOK,
+		"mariadb_ok":           deps.mariadbOK,
+		"role":                 string(env.MonRole),
+		"alerting_ok":          AlertingDisabledReason == "",
 	}
 	if AlertingDisabledReason != "" {
 		body["alerting_disabled_reason"] = AlertingDisabledReason
@@ -84,12 +88,21 @@ func ReadyHandler(w http.ResponseWriter, r *http.Request) {
 // later — keeps ClickHouse as a hard dependency. The direction of that default
 // matters: being wrongly un-ready costs a routing decision, while being wrongly
 // ready hands traffic to a replica that shreds what it accepts.
-func failingDependencies(clickhouseOK, mariadbOK bool) []string {
+//
+// THE WRITER POOL COUNTS WHEREVER CLICKHOUSE DOES, as "clickhouse_writer". It is
+// the pool ingest flushes through (db.WriterConn), so a replica whose reads
+// answer but whose writer does not is exactly the one that accepts events only to
+// shred them. With no dedicated writer the flag mirrors the read pool — that is
+// the pool the writes use — so a ClickHouse outage names both.
+func failingDependencies(deps dependencyStatus) []string {
 	var failing []string
-	if env.MonRole != env.RoleApp && !clickhouseOK {
+	if env.MonRole != env.RoleApp && !deps.clickhouseOK {
 		failing = append(failing, "clickhouse")
 	}
-	if !mariadbOK {
+	if env.MonRole != env.RoleApp && !deps.clickhouseWriterOK {
+		failing = append(failing, "clickhouse_writer")
+	}
+	if !deps.mariadbOK {
 		failing = append(failing, "mariadb")
 	}
 	// A process ingesting fine but not evaluating alerts IS running, so /health
@@ -101,75 +114,118 @@ func failingDependencies(clickhouseOK, mariadbOK bool) []string {
 	return failing
 }
 
-// DEPENDENCY_PING_TTL is how long a probe result is reused before both stores
-// are asked again.
+// DEPENDENCY_PING_TTL is how long a probe result is reused before every store
+// is asked again.
 //
 // /health and /ready are registered on the root router ahead of every auth
 // middleware, and there is no rate limiter anywhere in the stack. Without this
-// cache each unauthenticated request would take one connection from the
-// ClickHouse pool (MaxOpenConns=10 — the SAME pool the batcher's PrepareBatch
-// write path draws from) and one from MariaDB, so anyone able to reach the port
-// could starve ingestion by polling a liveness endpoint in a loop.
+// cache each unauthenticated request would take one connection from each
+// ClickHouse pool and one from MariaDB. The batcher no longer shares the read
+// pool (MaxOpenConns=10) — it has its own, db.WriterConn — but that makes the
+// cache MORE necessary, not less: the writer holds only TWO connections, and the
+// probe pings it, so anyone able to reach the port could still starve ingestion
+// by polling a liveness endpoint in a loop.
 //
 // Five seconds is well under the container HEALTHCHECK's 30s interval, so the
 // signal an orchestrator sees is never stale in practice, while a burst of any
 // size costs at most one probe per store per five seconds.
 const DEPENDENCY_PING_TTL = 5 * time.Second
 
+// dependencyStatus is one probe's answer for every store.
+type dependencyStatus struct {
+	clickhouseOK bool
+	// clickhouseWriterOK is the batcher's pool (db.WriterConn). With no
+	// dedicated writer it is the read pool's answer, since that is the pool
+	// WriteBatch then uses.
+	clickhouseWriterOK bool
+	mariadbOK          bool
+}
+
 // dependencyProbe memoises the last ping result. checking is the single-flight
 // latch: concurrent callers arriving during an in-progress probe serve the
 // previous answer rather than queueing more connections behind it, which is the
 // whole point — a stampede must not cost more than one probe.
 var dependencyProbe struct {
-	mu           sync.Mutex
-	checking     bool
-	checkedAt    time.Time
-	clickhouseOK bool
-	mariadbOK    bool
+	mu                 sync.Mutex
+	checking           bool
+	checkedAt          time.Time
+	clickhouseOK       bool
+	clickhouseWriterOK bool
+	mariadbOK          bool
 }
 
 // cachedPingDependencies returns the memoised store state, refreshing it at most
 // once per DEPENDENCY_PING_TTL. Both handlers use it; neither needs a fresher
 // answer than the poll intervals that consume them.
-func cachedPingDependencies(ctx context.Context) (clickhouseOK, mariadbOK bool) {
+func cachedPingDependencies(ctx context.Context) dependencyStatus {
 	dependencyProbe.mu.Lock()
 	fresh := time.Since(dependencyProbe.checkedAt) < DEPENDENCY_PING_TTL
 	if fresh || dependencyProbe.checking {
-		ch, my := dependencyProbe.clickhouseOK, dependencyProbe.mariadbOK
+		deps := dependencyStatus{
+			clickhouseOK:       dependencyProbe.clickhouseOK,
+			clickhouseWriterOK: dependencyProbe.clickhouseWriterOK,
+			mariadbOK:          dependencyProbe.mariadbOK,
+		}
 		// Before the first probe completes there is no result to serve. Report
 		// the stores as down rather than up: /ready answering 200 because it has
 		// not looked yet is the one wrong answer a readiness probe can give.
 		if dependencyProbe.checkedAt.IsZero() && !dependencyProbe.checking {
-			ch, my = false, false
+			deps = dependencyStatus{}
 		}
 		dependencyProbe.mu.Unlock()
-		return ch, my
+		return deps
 	}
 	dependencyProbe.checking = true
 	dependencyProbe.mu.Unlock()
 
-	ch, my := pingDependencies(ctx)
+	deps := pingDependencies(ctx)
 
 	dependencyProbe.mu.Lock()
-	dependencyProbe.clickhouseOK, dependencyProbe.mariadbOK = ch, my
+	dependencyProbe.clickhouseOK = deps.clickhouseOK
+	dependencyProbe.clickhouseWriterOK = deps.clickhouseWriterOK
+	dependencyProbe.mariadbOK = deps.mariadbOK
 	dependencyProbe.checkedAt = time.Now()
 	dependencyProbe.checking = false
 	dependencyProbe.mu.Unlock()
-	return ch, my
+	return deps
 }
 
-// pingDependencies checks both stores concurrently, so a total outage costs one
-// timeout rather than two stacked back to back.
-func pingDependencies(ctx context.Context) (clickhouseOK, mariadbOK bool) {
-	done := make(chan struct{})
+// pingDependencies checks every store concurrently, so a total outage costs one
+// timeout rather than several stacked back to back.
+//
+// The writer pool is pinged only when it exists. Without one, WriteBatch writes
+// through the read pool, so the read pool's answer IS the writer's — and pinging
+// the same pool twice would cost a second connection for no information.
+func pingDependencies(ctx context.Context) dependencyStatus {
+	writer := db.WriterConn
+
+	var clickhouseOK, writerOK bool
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		defer close(done)
+		defer wg.Done()
 		defer telemetry.Recover(ctx, "dependency-ping", "ClickHouse reported down for this probe")
 		clickhouseOK = pingClickHouse(ctx)
 	}()
-	mariadbOK = pingMariaDB(ctx)
-	<-done
-	return clickhouseOK, mariadbOK
+	if writer != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer telemetry.Recover(ctx, "dependency-ping", "the ClickHouse writer pool reported down for this probe")
+			writerOK = pingClickHouseConn(ctx, writer)
+		}()
+	}
+	mariadbOK := pingMariaDB(ctx)
+	wg.Wait()
+
+	if writer == nil {
+		writerOK = clickhouseOK
+	}
+	return dependencyStatus{
+		clickhouseOK:       clickhouseOK,
+		clickhouseWriterOK: writerOK,
+		mariadbOK:          mariadbOK,
+	}
 }
 
 // pingClickHouse reports whether the event store is reachable. A nil Conn means
@@ -181,9 +237,14 @@ func pingClickHouse(ctx context.Context) bool {
 	if db.Conn == nil {
 		return false
 	}
+	return pingClickHouseConn(ctx, db.Conn)
+}
+
+// pingClickHouseConn pings one ClickHouse pool under DEPENDENCY_PING_TIMEOUT.
+func pingClickHouseConn(ctx context.Context, conn driver.Conn) bool {
 	ctx, cancel := context.WithTimeout(ctx, DEPENDENCY_PING_TIMEOUT)
 	defer cancel()
-	return db.Conn.Ping(ctx) == nil
+	return conn.Ping(ctx) == nil
 }
 
 // pingMariaDB reports whether the relational auth store is reachable. PingContext

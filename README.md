@@ -139,6 +139,7 @@ answers 503.
   "dropped": 0,
   "pending": 0,
   "clickhouse_ok": true,
+  "clickhouse_writer_ok": true,
   "mariadb_ok": true,
   "last_flush_at": "2026-09-06T12:00:00Z",
   "role": "both",
@@ -155,6 +156,12 @@ answers 503.
   }
 }
 ```
+
+`clickhouse_writer_ok` is the batcher's own ClickHouse pool (2 connections, separate from the
+10-connection read pool so dashboard reads cannot starve ingest flushes). `false` beside a
+`true` `clickhouse_ok` means reads answer but ingest cannot write; `failing` then names
+`clickhouse_writer`. If that pool could not be opened at boot, writes share the read pool and
+this flag mirrors `clickhouse_ok`.
 
 `telemetry` is monitor-core's **own** telemetry shipper — the events it reports about itself
 to the appleby zone (see [Self-telemetry](#self-telemetry)). `flushed` rising is healthy;
@@ -179,10 +186,11 @@ it — a control plane carries a zone slug too and serves no events at all.
 curl -i http://localhost:8080/ready
 ```
 
-`200` when ClickHouse and MariaDB both answer a 2s ping, otherwise `503`:
+`200` when ClickHouse (both its read pool and the batcher's writer pool) and MariaDB all
+answer a 2s ping, otherwise `503`:
 
 ```json
-{ "status": "not_ready", "clickhouse_ok": false, "mariadb_ok": true, "role": "both", "failing": ["clickhouse"] }
+{ "status": "not_ready", "clickhouse_ok": false, "clickhouse_writer_ok": false, "mariadb_ok": true, "role": "both", "failing": ["clickhouse", "clickhouse_writer"] }
 ```
 
 Under `MON_ROLE=app` there is no ClickHouse connection at all, so it is not counted as a
@@ -647,7 +655,7 @@ verified. Full details in [AGENTS.md](./AGENTS.md) §6.
 | `CLICKHOUSE_DATABASE` | `monitor`        | ClickHouse database name; must match `^[a-z][a-z0-9_]{2,62}$` (it is interpolated into SQL, and the migrations are rewritten to it) |
 | `CLICKHOUSE_USERNAME` | `default`        | ClickHouse username                           |
 | `CLICKHOUSE_PASSWORD` | ``               | ClickHouse password                           |
-| `CLICKHOUSE_MAX_MEMORY_USAGE` | `2147483648` | Per-**query** memory ceiling in bytes (2 GiB), sent as the `max_memory_usage` setting. Unset, the effective limit is ~90% of host RAM, so one high-cardinality `GROUP BY` can OOM-kill the server and take ingest with it |
+| `CLICKHOUSE_MAX_MEMORY_USAGE` | `2147483648` | Per-**query** memory ceiling in bytes (2 GiB), sent as the `max_memory_usage` setting. ClickHouse 24.3's own default is unlimited, so unset, the only bound is the server-wide `max_server_memory_usage` (0.9 × the container's memory limit, or host RAM without one), and one high-cardinality `GROUP BY` can fail every query — ingest included — or push a shared host into the OOM killer |
 | `MONITOR_API_KEY`     | *(required)*     | Master API key (header `X-Api-Key`); server refuses to start if unset |
 | `BATCH_SIZE`          | `1000`           | Number of events per batch insert             |
 | `ACTIVITY_REPORT_URL` / `ACTIVITY_REPORT_PROVIDER` | `` | Activity sink (both required): changes by users of SSO provider `<slug>` are mirrored to the URL. Prod: `https://auth.appleby.cloud/internal/activity` + `forta`. Empty: off |
