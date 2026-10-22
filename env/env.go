@@ -178,9 +178,13 @@ func Load() {
 	ClickHousePassword = getEnv("CLICKHOUSE_PASSWORD", "")
 	IngestKey = getEnv("MONITOR_API_KEY", "")
 
-	// 2 GiB. Sized against the deployed host (worker-6, ~8 GB shared with other
-	// containers), not against ClickHouse's own 10 GiB default — which is larger
-	// than the whole machine and therefore no limit at all here.
+	// 2 GiB. Sized against the deployed hosts: ClickHouse runs on workers 8
+	// (stack 32) and 9 (stack 30), ~7.75 GiB each, shared with other
+	// containers. ClickHouse 24.3's own per-query default is 0 — unlimited — so
+	// unset, the only bound is the server-wide max_server_memory_usage, which it
+	// sizes at 0.9 × its cgroup memory limit (host RAM when, as today, the
+	// container has none). See the Settings comment in db/clickhouse.go, including
+	// why this is not paired with max_memory_usage_for_user.
 	ClickHouseMaxMemoryUsage = getEnvInt("CLICKHOUSE_MAX_MEMORY_USAGE", 2147483648)
 
 	// MariaDB DSN — sourced from Keyring (MON_DB_DSN) in production, injected
