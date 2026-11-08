@@ -138,6 +138,7 @@ monitor-core/
     HandleAdminProjects.router.go  # POST /admin/zones/{id}/projects, PUT /admin/projects/{id}, POST .../retire
     health.go              # GET /ready (readiness) + the 2s dependency pings /health also reports
     ingest_summary.go      # RunIngestSummary: the every-15-min ingest.summary.reported, emitted only when something moved (the loop guard for healthy ingest)
+    clickhouse_disk.go     # RunClickHouseDiskCheck: reads system.disks every 5 min (data plane), caches it for /health's clickhouse_disk, emits clickhouse.disk.low (warn) every check while a disk is under 10% free
     draining.go            # StartDraining/Draining: the shutdown signal the SSE loops select on, so a stream does not hold server.Shutdown for its whole timeout
     HandleGitHubWebhook.router.go  # POST /webhooks/github — root-mounted, HMAC-authenticated
   github/                  # GitHub link parsing, live-state client, webhook signature verification, owner/repo/branch validators
@@ -497,6 +498,16 @@ go run . backfill-config   # legacy ClickHouse config  → monitor.alert_rules,
     (`routes.DEPENDENCY_PING_TIMEOUT`), concurrently, so a total outage costs one timeout.
     The first four `/health` keys are frozen — monitor-web's transport and the container
     healthcheck read that exact shape; extend it additively.
+  - **`dropped` is a lifetime counter — never read it as "dropping now".** It never goes
+    down, so after the 2026-11-06 full-disk incident (39,026 trailblaze events lost in
+    eleven hours) monitor-web said "dropping events" for the rest of the process's life.
+    `/health` also reports **`last_drop_at`** (null if none since boot), **`dropped_recent`**
+    (both drop paths, last `dropped_window_minutes` = 15, `services.DROP_WINDOW`, counted in
+    one-minute buckets so the overflow hot path stays O(1)) — "dropping" means
+    `dropped_recent > 0`. **`clickhouse_disk`** is the last `system.disks` reading
+    (`{disks:[{name,free_bytes,total_bytes,free_pct,low}],low,low_below_pct,checked_at}`, null
+    until the first check and in an app process); `/health` never queries ClickHouse for it.
+    Point an alert rule at `clickhouse.disk.low` (warn, one per low disk per 5-min check).
   - **Both probes are memoised for 5s (`routes.DEPENDENCY_PING_TTL`), and must stay that
     way.** `/health` and `/ready` sit on the root router ahead of every auth middleware and
     nothing in the stack rate-limits, so an unmemoised ping would take one connection from

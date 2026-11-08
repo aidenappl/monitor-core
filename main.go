@@ -645,6 +645,7 @@ func main() {
 		// The periodic ingest summary — the ONLY way healthy ingest shows up in
 		// Monitor, since a successful POST /v1/events emits no request event.
 		telemetry.Go(ctx, "ingest-summary", routes.RunIngestSummary)
+		telemetry.Go(ctx, "clickhouse-disk-check", routes.RunClickHouseDiskCheck)
 
 		// Create alert notification hub for SSE streaming
 		alertHub := alerts.NewAlertHub(env.MaxSSESubscribers)

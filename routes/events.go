@@ -73,10 +73,17 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	// Stats() on the nil pointer would panic and take out the endpoint the
 	// container HEALTHCHECK polls, turning a role that is working perfectly into
 	// a restart loop.
-	var enqueued, dropped int64
+	var enqueued, dropped, droppedRecent int64
 	var pending int
+	// null when nothing has been dropped since boot, like last_flush_at.
+	var lastDropAt interface{}
 	if Queue != nil {
 		enqueued, dropped, pending = Queue.Stats()
+		var at time.Time
+		droppedRecent, at = Queue.RecentDrops()
+		if !at.IsZero() {
+			lastDropAt = at.UTC().Format(time.RFC3339)
+		}
 	}
 	deps := cachedPingDependencies(r.Context())
 
@@ -112,12 +119,23 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 		// has stopped reporting on itself can be seen from outside the process.
 		// `dropped` rising here is loss; `pending` rising with `flushed` still is
 		// the destination zone being down.
-		"telemetry":     telemetry.Stats(),
-		"status":        health,
-		"enqueued":      enqueued,
-		"dropped":       dropped,
-		"pending":       pending,
-		"clickhouse_ok": deps.clickhouseOK,
+		"telemetry": telemetry.Stats(),
+		"status":    health,
+		"enqueued":  enqueued,
+		"dropped":   dropped,
+		"pending":   pending,
+		// Additive: `dropped` is a lifetime counter and never goes down, so on
+		// its own it cannot say whether loss is happening NOW. These can.
+		// "Dropping" means dropped_recent > 0; a non-zero `dropped` with a
+		// last_drop_at hours old is history. Same idea as telemetry.last_drop_at.
+		"last_drop_at":           lastDropAt,
+		"dropped_recent":         droppedRecent,
+		"dropped_window_minutes": int(services.DROP_WINDOW / time.Minute),
+		// Additive: system.disks as of the last 5-minute check (null until the
+		// first one, and in an app process). `low` is any disk under
+		// low_below_pct free; clickhouse.disk.low fires at warn while it is.
+		"clickhouse_disk": clickhouseDiskHealth(),
+		"clickhouse_ok":   deps.clickhouseOK,
 		// Additive: the batcher's own ClickHouse pool (db.WriterConn), pinged
 		// beside the read pool. False with clickhouse_ok true is the state the
 		// split pools make visible — reads answer, ingest flushes cannot — and
