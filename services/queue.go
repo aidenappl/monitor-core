@@ -2,6 +2,7 @@ package services
 
 import (
 	"sync/atomic"
+	"time"
 
 	"github.com/aidenappl/monitor-core/structs"
 )
@@ -11,6 +12,7 @@ type Queue struct {
 	events   chan *structs.Event
 	dropped  atomic.Int64
 	enqueued atomic.Int64
+	window   dropWindow
 }
 
 // NewQueue creates a new event queue with the specified buffer size
@@ -34,6 +36,7 @@ func (q *Queue) Enqueue(event *structs.Event) bool {
 		return true
 	default:
 		q.dropped.Add(1)
+		q.window.record(time.Now(), 1)
 		return false
 	}
 }
@@ -57,6 +60,14 @@ func (q *Queue) RecordDropped(n int64) {
 		return
 	}
 	q.dropped.Add(n)
+	q.window.record(time.Now(), n)
+}
+
+// RecentDrops returns how many events were dropped (either path) in the last
+// DROP_WINDOW, and when the last one was. lastAt is zero when nothing has been
+// dropped since boot.
+func (q *Queue) RecentDrops() (count int64, lastAt time.Time) {
+	return q.window.recent(time.Now())
 }
 
 // Events returns the channel for consuming events
